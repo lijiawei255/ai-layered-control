@@ -122,7 +122,7 @@ add_line(model, 'Mux_x/1', 'Scope_states/1', 'autorouting', 'on');
 add_line(model, 'Mux_u/1', 'Scope_commands/1', 'autorouting', 'on');
 
 % ------------------------------------------------------------------------
-% Privacy: never leak the local Windows user name into the .slx metadata
+% Stamp the generated model with the project name instead of the local account name
 % ------------------------------------------------------------------------
 try
     set_param(model, 'Creator', 'ai-layered-control', ...
@@ -142,7 +142,7 @@ if bdIsLoaded(model)
     close_system(model, 0);
 end
 
-% Simulink writes the local Windows account name into the OPC package metadata
+% Simulink records the saving account in the OPC package core properties
 % (dc:creator / cp:lastModifiedBy) regardless of set_param.  Rewrite those two
 % fields inside the .slx (it is a plain zip container) so the committed model
 % carries no local personal data.

@@ -13,7 +13,7 @@
  *     beyond -std=c99 -pedantic -Wall -Wextra ;
  *   - fixed, statically-sized state (LayeredState_t), safe for 1 kHz ISRs;
  *   - sticky black-box fault audit bitmask for post-incident forensics
- *     (IEC 61508 / IEC 62304 style evidence trail).
+ *     (a defensive-programming structure reference for later engineering work).
  *
  * Architecture (see README.md for the full picture):
  *

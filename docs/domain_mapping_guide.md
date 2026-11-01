@@ -22,6 +22,26 @@ files, the code wins — those files are the ground truth (see `AGENTS.md` §2).
 
 ---
 
+## Scope and disclaimer / 适用范围与免责声明
+
+**Scope and disclaimer.** This document is a conceptual mapping guide for a **reference implementation and
+proof-of-concept benchmark**. Every number quoted here comes from a **parameterised synthetic nonlinear
+plant** (second-order drive, Stribeck friction, sensor noise, drift, edge-compute latency, injected OOD
+mode); the three domains reuse that same skeleton with different units and magnitudes. No clinical patient
+data and no production-machine data are used, and nothing here has been validated on hardware. The C core
+borrows defensive embedded-programming principles (zero dynamic allocation, bounded execution steps,
+input sanitisation, fault-bit logging) as a structure reference; the code in this repository is **not**
+certified functional-safety or medical-device firmware. Before applying this mapping to a real
+industrial, robotic or neuromodulation system, run your own FMEA/STPA, hardware-in-the-loop testing and
+the regulatory certification your domain requires.
+
+**适用范围与免责声明。** 本文件是**参考实现与概念验证基准**的概念映射指南。文中所有数字都来自**参数化合成非线性
+被控对象**（二阶传动、Stribeck 摩擦、传感器噪声、漂移、边缘算力时延、注入式 OOD 模态）；三个目标域只是同一骨架在
+不同单位与量级下的复用。不含任何真实患者临床数据或产线机台数据，也没有在硬件上验证。C 核心借鉴防御式嵌入式编程
+原则（零动态分配、有界执行步数、输入清洗、故障位记录）作为结构参考，但本仓库代码**不是**经过认证的功能安全或医疗
+器械固件。把本映射用于真实工业/机器人/神经调控系统之前，必须自行完成 FMEA/STPA、硬件在环测试以及所在领域的法规认证。
+
+---
 ## Part 0 — One skeleton, three parameter sets / 同一副骨架，三套参数
 
 ### 0.1 English
@@ -40,7 +60,7 @@ F_friction(ẋ) = f_visc·ẋ + f_c·tanh(ẋ/v_ε) + (f_s − f_c)·exp(−|ẋ
 | Residual probe | `r(t) = \|y − ŷ\|` on a frozen nominal model, fast + slow channels, fast channel vetoes | `res_fast_scale` (state units), the nominal model, the OOD morphology |
 | Fast loop (1 kHz) | zero-heap C99 core: firewall → priority chain → dwell → cooldown → anti-windup → bumpless → clamps | gain bank, `u_max`, slew limit, safety envelope, feedforward model |
 | Field tuning | 3 scalars orthogonal to the AI | the physical meaning of each knob and its safe range |
-| Acceptance | 4 engineering assertions (drift, latency, OOD abstention, data/compute) | thresholds that are *engineering* thresholds, not tuned per run |
+| Acceptance | 4 engineering checks (drift, latency, OOD abstention, data/compute) | thresholds that are *engineering* thresholds, not tuned per run |
 
 The shared normalized feature vector (used by the nearest-centroid coarse classifier) is:
 
@@ -282,7 +302,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 - [ ] Two residual channels with fast/slow split; only the fast channel vetoes.
 - [ ] 3–6 dimensionless features; class means from ≤ 50 calibration runs; no raw-signal classifier.
 - [ ] Confidence is a margin measure (`d₂/(d₁+d₂)`), not a softmax of an unverifiable logit.
-- [ ] Artificial OOD injection ⇒ veto within 10 ms and zero envelope violations.
+- [ ] Artificial OOD injection ⇒ veto within 10 ms and no envelope breach **in the synthetic benchmark conditions**.
 
 **D. Safety and behaviour**
 - [ ] Envelope trip 0.90 / clear 0.75 with 60 ms look-ahead verified against `|ẋ|`.
@@ -319,7 +339,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 - [ ] 残差快/慢双通道；只有快通道参与否决。
 - [ ] 3–6 维无量纲特征；类均值来自 ≤ 50 次标定；不做原始信号分类器。
 - [ ] 置信度是边际量（`d₂/(d₁+d₂)`），不是无法核验的 logit softmax。
-- [ ] 人工注入 OOD ⇒ 10 ms 内弃权且安全包络零越界。
+- [ ] 人工注入 OOD ⇒ 10 ms 内弃权，且在**合成基准工况下**安全包络零越界。
 
 **D. 安全与行为**
 - [ ] 包络触发 0.90 / 清除 0.75、60 ms 前视已用 `|ẋ|` 实测验证。
@@ -407,7 +427,8 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 | the per-tick execution order and hysteresis behaviour | `c99_layered_core/layered_gatekeeper.c` |
 | how the presets are used in closed loop (observer, features, classifier) | `matlab_simulink/sim_core_engine.m` |
 | sample complexity / drift / compute evidence | `matlab_simulink/run_efficiency_analysis.m` |
-| the four acceptance assertions and the figures | `matlab_simulink/run_all_benchmarks.m` |
+| the four engineering checks and the figures | `matlab_simulink/run_all_benchmarks.m` |
+| reproducible seeds | four-stage benchmark `seed = 7`, efficiency study `seed = 17`, C regression test uses no `rand()` (see `AGENTS.md` §7) |
 | the rules an AI assistant must not break | `AGENTS.md` |
 
 **中文提示：** 修改任何域参数时，只改 `matlab_simulink/load_domain_profile.m` 中对应的 preset，

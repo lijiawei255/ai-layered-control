@@ -36,7 +36,7 @@ function out = sim_core_engine(profile, opts)
 %     .ood_on         enable Stage 4 OOD fault        (default true)
 %     .verbose        print a short stage summary     (default false)
 %
-%   The gatekeeper implemented in LOCAL_CORE_STEP is a 1:1 MATLAB mirror of
+%   The gatekeeper implemented in LOCAL_CORE_STEP is a line-by-line MATLAB mirror of
 %   c99_layered_core/layered_gatekeeper.c (same decision order, dwell timer,
 %   post-fault cooldown, per-controller anti-windup, NaN firewall and fault
 %   bitmask) so the figure-producing benchmark and the deployable C core can
@@ -59,6 +59,10 @@ else
     P = profile;
 end
 opts = local_defaults(opts, P);
+
+% Fixed seed for every stochastic term (sensor noise and the outlier schedule),
+% so the benchmark is bit-reproducible on a given MATLAB release.
+rng(opts.seed, 'twister');
 
 dt = P.dt;
 N  = round(opts.t_end/dt);
@@ -137,7 +141,7 @@ end
 % 3. Engineering metrics
 % ------------------------------------------------------------------------
 out.metrics = local_metrics(P, out, opts);
-out.metrics.assertions = local_assertions(P, out);
+out.metrics.checks = local_checks(P, out);
 
 if opts.verbose
     local_print_summary(P, out);
@@ -880,9 +884,9 @@ M.stage_names_short = P.stage.short;
 M.ref = out.ref;
 end
 
-function A = local_assertions(P, out)
-% Engineering assertions from the execution plan.  Returns a struct with
-% logical flags and the numbers behind them.  Assertions that need a stage the
+function A = local_checks(P, out)
+% Engineering checks for the reference benchmark.  Returns a struct with
+% logical flags and the numbers behind them.  Checks that need a stage the
 % caller did not simulate are reported as not evaluable (false + NaN) instead
 % of raising, so short/partial runs (calibration, panel B) still work.
 A = struct();
@@ -891,32 +895,32 @@ edge = P.stage.edges;
 n_s  = size(M.rmse, 2);
 has_stage = @(s) (s <= n_s) && (out.t(end) >= edge(s+1) - P.dt - 1e-9);
 
-% Assertion 1: Stage 2, B2 RMSE > 2x B3 RMSE.
+% Engineering check 1: Stage 2, B2 RMSE > 2x B3 RMSE.
 if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(2)
     idx2 = out.t >= edge(2) & out.t < edge(3);
     A.stage2_rmse_b2 = sqrt(mean((out.b2.x(idx2)-out.ref.r(idx2)).^2));
     A.stage2_rmse_b3 = sqrt(mean((out.b3.x(idx2)-out.ref.r(idx2)).^2));
-    A.assert1 = A.stage2_rmse_b2 > 2*A.stage2_rmse_b3;
+    A.check1 = A.stage2_rmse_b2 > 2*A.stage2_rmse_b3;
 else
-    A.stage2_rmse_b2 = NaN; A.stage2_rmse_b3 = NaN; A.assert1 = false;
+    A.stage2_rmse_b2 = NaN; A.stage2_rmse_b3 = NaN; A.check1 = false;
 end
 
-% Assertion 2: Stage 3, B2 phase-lag chattering and tracking both degrade
+% Engineering check 2: Stage 3, B2 phase-lag chattering and tracking both degrade
 % far beyond B3 under 10 Hz + 60-120 ms jitter + frame drops.
 if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(3)
     A.stage3_chatter_b2 = M.chatter(2, 3);
     A.stage3_chatter_b3 = M.chatter(3, 3);
     A.stage3_rmse_b2 = M.rmse(2, 3);
     A.stage3_rmse_b3 = M.rmse(3, 3);
-    A.assert2 = (A.stage3_chatter_b2 > 3*A.stage3_chatter_b3) && ...
+    A.check2 = (A.stage3_chatter_b2 > 3*A.stage3_chatter_b3) && ...
                 (A.stage3_rmse_b2 > 2*A.stage3_rmse_b3);
 else
     A.stage3_chatter_b2 = NaN; A.stage3_chatter_b3 = NaN;
     A.stage3_rmse_b2 = NaN; A.stage3_rmse_b3 = NaN;
-    A.assert2 = false;
+    A.check2 = false;
 end
 
-% Assertion 3: Stage 4, B2 breaches the envelope, B3 has zero violations
+% Engineering check 3: Stage 4, B2 breaches the envelope, B3 has zero violations
 % and abstains within 10 ms.
 if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(4)
     idx4 = out.t >= edge(4);
@@ -925,15 +929,15 @@ if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(4)
     A.stage4_maxabs_b2 = max(abs(out.b2.x(idx4)));
     A.stage4_maxabs_b3 = max(abs(out.b3.x(idx4)));
     A.veto_latency_ms = M.veto_latency_ms;
-    A.assert3 = (A.stage4_violations_b2 > 0) && ...
+    A.check3 = (A.stage4_violations_b2 > 0) && ...
                 (A.stage4_violations_b3 == 0) && ...
                 (A.veto_latency_ms < 10);
 else
     A.stage4_violations_b2 = NaN; A.stage4_violations_b3 = NaN;
     A.stage4_maxabs_b2 = NaN; A.stage4_maxabs_b3 = NaN;
-    A.veto_latency_ms = NaN; A.assert3 = false;
+    A.veto_latency_ms = NaN; A.check3 = false;
 end
-A.all = A.assert1 && A.assert2 && A.assert3;
+A.all = A.check1 && A.check2 && A.check3;
 end
 
 function local_print_summary(P, out)
@@ -944,7 +948,7 @@ for b = 1:3
     fprintf('%-18s %10.4f %10.4f %10.4f\n', lab{b}, ...
         out.metrics.rmse(b,1), out.metrics.rmse(b,2), out.metrics.maxabs(b,4));
 end
-fprintf('assert1=%d assert2=%d assert3=%d (veto latency %.2f ms)\n', ...
-    out.metrics.assertions.assert1, out.metrics.assertions.assert2, ...
-    out.metrics.assertions.assert3, out.metrics.assertions.veto_latency_ms);
+fprintf('check1=%d check2=%d check3=%d (veto latency %.2f ms)\n', ...
+    out.metrics.checks.check1, out.metrics.checks.check2, ...
+    out.metrics.checks.check3, out.metrics.checks.veto_latency_ms);
 end

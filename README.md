@@ -8,16 +8,18 @@ actuator. No end-to-end `u = pi(x)` model ever touches the 1 kHz path.**
 
 **TL;DR**
 
-* **50 calibration runs, not 1,000+.** The AI learns a 3-way regime label from 4 normalised
-  macro-features (16 floats, no weights file). The continuous-policy alternative needs more than 1,000
-  samples to clear the same deployment bar.
+* **A few dozen calibration runs, not a thousand.** The 10 Hz AI only has to map four normalised
+  macro-features onto one of three damping schedules: it reaches 100 % deployment quality with 40
+  calibration runs. The end-to-end alternative needs about 120 runs on the unit it was trained on - and
+  scores 0 % on the same task once that unit is deployed with +35 % drift, at any sample count.
 * **~100,000x less compute.** 2.41e4 MAC/s and 2.21e3 B, against 2.40e9 MAC/s and 5.60e6 B for a
   1.2 M-parameter policy running at 1 kHz (99,502x / 2,536x). It fits a microcontroller that is already
   on the board.
 * **+35 % unit-to-unit drift, zero retraining.** RMSE 0.0122 rad vs 0.0516 rad for the end-to-end
   branch (4.22x). Across a full 0 -> +50 % drift sweep the AI stays frozen: 0.0111 -> 0.0151 rad.
-* **Zero safety-envelope breaches on an unseen OOD fault.** 0 violations vs 1,733; the layered branch
-  explicitly *abstains* 2.0 ms after fault onset and holds the axis inside its envelope.
+* **Explicit abstention on an unseen OOD fault.** Zero envelope excursions in the four-stage synthetic
+  benchmark of this repository, against 1,733 for the end-to-end branch; the layered controller latches
+  its abstention 2.0 ms after fault onset and holds the axis inside the envelope.
 * **4.2-4.9x less actuator travel.** Total variation TV(u) over 40 s: 342.0 N*m vs 1,442.9 N*m
   (end-to-end) and 1,664.8 N*m (fixed PID). Same task, a fraction of the wear.
 
@@ -26,7 +28,7 @@ actuator. No end-to-end `u = pi(x)` model ever touches the 1 kHz path.**
 > computed-torque policy standing in for a learned continuous controller. The compute and memory figures
 > are analytic (weights x rate), not profiled on hardware. Nothing here is a claim about a specific
 > machine. What is real: the C99 core (105 deterministic assertions, 0 failures), the four engineering
-> assertions, and the fact that every number below is produced by the acceptance run in section 6 (the
+> checks, and the fact that every number below is produced by the acceptance run in section 6 (the
 > console prints some of them to one decimal; the full-precision values live in the returned structs).
 
 ---
@@ -76,29 +78,38 @@ reference, noise realisation and fault schedule:
 | RMSE S4 unseen OOD fault [rad] | 0.1372 | 0.6152 | 0.0295 |
 | Phase-lag chattering index S3 [norm.] | 0.089 | 0.123 | 0.013 |
 | Actuator total variation TV(u), 40 s [N*m] | 1664.8 | 1442.9 | 342.0 |
-| Safety-envelope violations S1 / S2 / S3 / S4 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / **1733** | 0 / 0 / 0 / 0 |
+| Envelope excursions S1 / S2 / S3 / S4 [count] | 0 / 0 / 0 / 0 | 0 / 0 / 0 / **1733** | 0 / 0 / 0 / 0 |
 | OOD abstention response time | - | - | **2.0 ms** |
-| Training samples required | - | > 1000 | <= 50 |
+| Calibration samples required | - | ~120 (nominal unit) | <= 50 |
 | Compute (MAC/s) | - | 2.40e9 | 2.41e4 |
 | Memory footprint | - | 5.60e6 B | 2.21e3 B |
 
-All four engineering assertions pass - the run ends with `ALL FOUR ASSERTIONS PASSED.`:
+All four engineering checks hold - the run ends with `All four engineering checks passed.`:
 
 1. **S2 anti-overfitting:** 0.0516 vs 0.0122 rad (4.22x), AI frozen, +35 % uncalibrated drift.
 2. **S3 latency decoupling:** chattering 0.123 vs 0.013 (9.50x); RMSE 0.0933 vs 0.0125 rad under 10 Hz,
    60-120 ms jitter and 15 % dropped frames.
-3. **S4 OOD abstention:** 1,733 envelope breaches vs **0**, veto latched 2.0 ms after onset, safe fallback
-   regulator for the rest of the stage.
-4. **Data and compute:** coarse classifier at 79.75 % with `N <= 50` against an 85.13 % ceiling
-   (reached at `N = 1000`); continuous policy 78.75 % at `N = 500`, 91.88 % at `N = 1000`, 97.63 % at
-   `N = 2000`; 99,502x compute and 2,536x memory reduction.
+3. **S4 OOD abstention:** 1,733 vs **0** envelope excursions in the four-stage synthetic benchmark of
+   this repository, veto latched 2.0 ms after onset, safe-fallback regulator for the rest of the stage.
+4. **Data and compute:** the coarse classifier is already at 100 % deployment quality with `N <= 50`
+   (saturated at `N = 40`); the continuous policy needs about `N = 120` on the nominal unit (81.2 % at
+   `N = 40`, 100 % at `N = 120`) and stays at 0 % when the same unit is deployed with +35 % drift, even
+   at `N = 2000`; 99,502x compute and 2,536x memory reduction.
 
-Sample-complexity curves (`N = 15 / 40 / 120 / 250 / 500 / 1000 / 2000`):
+Sample-complexity curves (`N = 15 / 40 / 120 / 250 / 500 / 1000 / 2000`). Deployment quality = the
+damping actually applied stays within 10 % of the closed-loop optimum at that operating point, with the
+150 ms classifier dwell applied to the per-frame decisions first:
 
-| Learner | 15 | 40 | 120 | 250 | 500 | 1000 | 2000 |
+| Learner / deployment condition | 15 | 40 | 120 | 250 | 500 | 1000 | 2000 |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Coarse 3-class regime classifier | 72.56 % | **79.75 %** | 84.38 % | 84.13 % | 83.44 % | 85.13 % | 84.31 % |
-| Continuous policy (damping within 8 %) | 12.75 % | 26.06 % | 39.31 % | 78.75 % | 78.75 % | 91.88 % | 97.63 % |
+| Layered coarse classifier, deployed at +35 % drift | 87.5 % | **100 %** | 100 % | 100 % | 100 % | 100 % | 100 % |
+| Continuous policy, nominal unit (0 % drift) | 28.1 % | 81.2 % | 100 % | 100 % | 100 % | 100 % | 100 % |
+| Continuous policy, deployed at +35 % drift | 3.1 % | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
+
+The shape of that table is the argument in one glance: the coarse classifier saturates within a few
+tens of calibration runs, the continuous policy needs ~120 runs on the machinery it was trained on, and
+on a unit with +35 % drift it never clears the bar - extra nominal-unit data does not help, because the
+constant it is missing is physical, not statistical.
 
 Zero-retraining drift sweep (AI frozen, uncalibrated plant drift 0 / 17 / 33 / 50 %): the end-to-end
 branch rises 0.0101 -> 0.0783 rad (7.75x); the layered branch stays at 0.0111 -> 0.0151 rad (1.36x).
@@ -115,10 +126,11 @@ changes, then at `t = 30 s` a clean switch into `REGIME_SAFE_FALLBACK (4)` with 
 
 ![Sample complexity of coarse classification vs a continuous policy, zero-retraining drift robustness, and compute / memory footprint on a log scale](assets/efficiency_and_generalization.png)
 
-**Figure 2 - why the layering is cheap.** (a) the classifier saturates within a few tens of calibration
-runs and then runs into its quantisation ceiling; the continuous policy needs more than a thousand.
-(b) with the AI frozen, the layered branch stays flat across the drift sweep while the end-to-end branch
-rises monotonically. (c) compute, memory and inference rate on a log scale (99,502x / 2,536x).
+**Figure 2 - why the layering is cheap.** (a) deployment quality against the number of calibration runs:
+the coarse classifier is already at 100 % with 40 runs, the continuous policy needs about 120 runs on
+the unit it trained on, and it sits at 0 % once that unit is deployed with +35 % drift - at any sample
+count. (b) with the AI frozen, the layered branch stays flat across the drift sweep while the end-to-end
+branch rises monotonically. (c) compute, memory and inference rate on a log scale (99,502x / 2,536x).
 
 ![Cross-domain trajectories for industrial servo, edge VLA and closed-loop neuromodulation](assets/domain_profiles_comparison.png)
 
@@ -131,6 +143,12 @@ Only the physical constants change; the architecture does not.
 The failure of a monolithic `u = pi_theta(x)` policy in a real loop is not a model-capacity problem. It
 is five separate structural problems, and each one is dissolved by *where* the AI sits, not by making the
 AI bigger.
+
+The research lineage matters here. Most AI-plus-control work in the literature stays inside one
+continuous controller - tuning its parameters, or replacing it with an end-to-end network that regresses
+the physical inverse dynamics directly. This repository proposes the step *above* that layer: instead of
+fitting a continuous parameter manifold, it arbitrates between a small set of discrete structures and
+rejects the operating points it does not recognise.
 
 ### 4.1 Boundary ill-conditioning: the regression target is discontinuous where it matters
 
@@ -156,8 +174,9 @@ normalised features encodes the *shape* of the operating point. Sample complexit
 of magnitude, and only the second transfers across units.
 
 *Fix.* Frozen AI plus three scalar field knobs (`gain_scale`, `damping_scale`, `safety_margin_scale`).
-**Evidence:** <= 50 vs > 1,000 samples; 0.0111 -> 0.0151 rad across the +50 % drift sweep with no
-retraining.
+**Evidence:** 100 % deployment quality from 40 calibration runs against ~120 runs for the continuous
+policy on its own unit, and 0 % for that same policy once the unit carries +35 % drift; 0.0111 -> 0.0151
+rad across the +50 % drift sweep with no retraining.
 
 ### 4.3 Compute, power, and latency jitter inside the loop
 
@@ -173,15 +192,16 @@ with a bounded worst case; a stale frame becomes a watchdog hold instead of a ba
 
 ### 4.4 Unsafe forced extrapolation under OOD
 
-*Symptom.* On an unseen fault the black box keeps producing confident commands, saturates, breaches the
-envelope.
+*Symptom.* On an unseen fault the black box keeps producing confident commands, saturates, and pushes the
+axis outside its envelope.
 
 *Cause.* A learned function is defined off its training support; "confidence" is another learned output
 trained on the same data, not an evidence channel.
 
 *Fix.* An independent physics-residual hypothesis test against a frozen nominal model, with an explicit
-abstention state, sticky latches, hysteresis and a re-arm cooldown. **Evidence:** 0 vs 1,733 envelope
-breaches; veto 2.0 ms after onset; 0.0295 rad RMSE afterwards under a PD-only safe regulator.
+abstention state, sticky latches, hysteresis and a re-arm cooldown. **Evidence:** 1,733 vs 0 envelope
+excursions in the four-stage synthetic benchmark of this repository; veto 2.0 ms after onset; 0.0295 rad
+RMSE afterwards under a PD-only safe regulator.
 
 ### 4.5 Zero field debuggability
 
@@ -213,8 +233,20 @@ the regime label change. All three presets ship in
 | What the 1 kHz core owns | torque loop, envelope, actuator limits | torque loop, envelope, actuator limits | stimulation envelope inside strict clinical bounds |
 | Drift to absorb without retraining | +35 % inertia, 2.4x break-away friction | +35 % link/payload inertia | +35 % electrode impedance, scar-tissue boundary |
 | OOD event to abstain on | 42 Hz parasitic structural resonance + sensor spikes | 38 Hz structural mode + sensor spikes | 33 Hz lead resonance + stimulation artefacts |
-| S2 RMSE, end-to-end vs layered [rad] | 0.0516 / **0.0122** | 0.0353 / **0.0086** | 0.0551 / **0.0269** |
-| S4 envelope breaches, end-to-end vs layered | 1733 / **0** | 1637 / **0** | 182 / **0** |
+
+Measured on all three presets with the same engine (synthetic dynamics presets, no hardware in the loop):
+
+| preset | S2 RMSE B2 | S2 RMSE B3 | S3 RMSE B2 | S3 RMSE B3 | S4 envelope excursions B2 | S4 envelope excursions B3 | TV(u) B2 | TV(u) B3 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `industrial` (rad) | 0.0516 | 0.0122 | 0.0933 | 0.0125 | 1733 | 0 | 1442.9 | 342.0 |
+| `edge_vla` (rad) | 0.0353 | 0.0086 | 0.2887 | 0.0102 | 1637 | 0 | 22484.5 | 18848.6 |
+| `neuromodulation` (norm.) | 0.0551 | 0.0269 | 0.0711 | 0.0238 | 182 | 0 | 11953.3 | 13824.0 |
+
+The pattern repeats across all three: under +35 % drift the layered branch tracks 4.2x, 4.1x and 2.0x
+better, under edge latency the gap widens, and only the end-to-end branch leaves the envelope. The
+actuator-travel column is deliberately left in - it shows that the layer that stays inside the envelope
+is *not* the one that works the actuator hardest (the neuromodulation preset is the case where the
+end-to-end branch happens to be smoother; its cost is the 182 excursions).
 
 Figure 3 above shows the three presets side by side. Per-domain thresholds, a porting checklist and the
 most common misuse per domain are in
@@ -227,16 +259,22 @@ required), and optionally any C99 compiler (`gcc`, `clang`, MSVC, `arm-none-eabi
 core test. Run both from the repository root.
 
 **6.1 The full acceptance run** - builds the model, simulates the 40 s four-stage bench, runs the
-efficiency study and the three domains, exports the three figures, checks all four assertions. CPU only. The script prints a `=== TIMING ===` block: on the reference laptop (R2024b, idle) a cold `matlab -batch` takes **27.3 s**, of which **11.5 s is the one-off Simulink model build / first load**; the simulation + efficiency + domain + figure work itself is **15.8 s cold** and **~9-10 s in an already-warm MATLAB session**:
+efficiency study and the three domains, exports the three figures, and evaluates the four engineering
+checks. Everything is plain MATLAB on the CPU, and the script prints its own `=== TIMING ===` block. On
+the reference laptop (R2024b, idle) a cold `matlab -batch` takes about **27 s**, of which **~11.5 s is
+the one-off Simulink model build / first load**; in an already-warm MATLAB session the same work takes
+about **10 s**:
 
 ```powershell
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-Success signals: the four `assertion N ... PASS` lines, the final line `ALL FOUR ASSERTIONS PASSED.`,
-three PNGs rewritten in `assets/` at 240 dpi (within the 200-300 dpi budget), and exit code `0` (the
-script raises if any assertion fails). Individual experiments (efficiency only, one domain, model only)
-are listed in [`AGENTS.md`](AGENTS.md) section 4.4.
+Success signals: the four `[1]`-`[4] ... PASS` lines under `=== ENGINEERING CHECKS ===`, the final line
+`All four engineering checks passed.`, three PNGs rewritten in `assets/` at 240 dpi (within the 200-300
+dpi budget), and exit code `0` (the script raises if any check fails). The run is deterministic: the
+four-stage benchmark uses `seed = 7`, the efficiency study `seed = 17`, and the C test uses no random
+number generator at all, so the printed numbers reproduce digit for digit. Individual experiments
+(efficiency only, one domain, model only) are listed in [`AGENTS.md`](AGENTS.md) section 4.4.
 
 **6.2 The standalone C99 core** - 105 deterministic assertions, no MATLAB involved:
 
@@ -248,6 +286,12 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 c99_layered_core/test_gatekeeper_standa
 Success signals: every check line starts with `[PASS]`, the last line is
 `SUMMARY: n_pass=105, n_fail=0`, and the exit code is `0`. (`rta_test.exe` is gitignored, and the module
 compiles warning-free under `-pedantic -Wall -Wextra`.)
+
+**6.3 The Simulink model** - `matlab_simulink/ai_layered_control_bench.slx` comes from
+`build_simulink_model.m` (built-in blocks only), and its parameters are inlined in the model, so it
+needs no workspace variables: after `clearvars` you can double-click Run, or run
+`sim('matlab_simulink/ai_layered_control_bench.slx')`. Treat it as a generated artefact and do not edit
+it by hand - change the builder and regenerate.
 
 That is the whole loop: one command proves the architecture's claims end to end, one command proves the
 deployable core in isolation. If either fails, the repository is broken - that is the contract.
@@ -324,13 +368,13 @@ and motion, plus 0.20 rad sensor outliers at roughly 4 per second (an 80-sigma e
 floor). The end-to-end branch forces extrapolation: it saturates, then drives the axis past the 1.0 rad
 envelope 1,733 times in 10 s - RMSE 0.6152 rad, chatter 0.986. The layered branch's fast residual channel
 crosses its threshold 2.0 ms after onset, latches `GATE_VETO_OOD_RESIDUAL`, switches to the PD-only safe
-regulator with a bumpless transfer, never breaches the envelope, and finishes the stage at 0.0295 rad. It
+regulator with a bumpless transfer, stays inside the envelope, and finishes the stage at 0.0295 rad. It
 stays in fallback for a 500 ms cooldown after the fault subsides; the test suite pins the exact re-arm
 tick.
 
 **Total picture.** The monolithic branch wins 0.0087 to 0.0098 on the stage where its assumption holds,
-and loses by 4.22x, 7.5x and 1,733 envelope breaches on the three stages where it does not. That trade is
-the whole argument, and it is why the layered design is the default for machines that run unattended.
+and loses by 4.22x, 7.5x and 1,733 envelope excursions on the three stages where it does not. That trade
+is the whole argument, and it is why the layered design is the default for machines that run unattended.
 
 </details>
 
@@ -405,15 +449,13 @@ the full per-tick semantics.
   deterministic (no `rand()`, no `<math.h>`; a truncated-Taylor rotation matrix generates the reference
   sine), so it prints `SUMMARY: n_pass=105, n_fail=0` everywhere.
 
-**IEC 61508 / IEC 62304 readiness, stated honestly.** This repository does not claim a certified
-component, a SIL, or a medical-device class. What it does claim is *shape*: the safety function is
-separable and deterministic (one straight-line C function, fixed state, testable at every boundary); the
-learned element is an *input* with a range-checked interface rather than an authority (in IEC 61508 terms
-the core can be the safety function while the classifier is a monitored input); adaptation is a change of
-three scalar parameters with physical meaning, regression-tested by the same suite, rather than a new
-trained-model version requiring a new dataset and revalidation (IEC 62304 style change control); and the
-runtime produces its own audit trail. Those four properties are what a safety case can be built on. They
-are not a substitute for a hazard analysis, a SIL verification or a clinical evaluation.
+**Certification posture.** The core borrows defensive embedded-programming principles - zero dynamic
+allocation, bounded execution steps, input sanitisation, fault-bit logging - as a structure reference for
+later engineering work; the code in this repository is not certified functional-safety or medical-device
+firmware. The same principles are why the deterministic part is easy to test exhaustively: one
+straight-line C function, fixed state, a range-checked interface to the learned layer, and a runtime audit
+trail. That is a starting point for a safety case, not a substitute for a hazard analysis, hardware-in-the-
+loop testing, or the certification work of the target industry.
 
 ## 10. Fault audit bit mask
 
@@ -471,26 +513,13 @@ Per stage, the layered branch stays between 51.3 and 148.3 N*m while the alterna
 units are domain-specific - compare branches within one benchmark, not across domains; (2) low TV is not
 automatically good: in S3 the end-to-end branch has the *lowest* TV (17.4 N*m) because its command is
 frozen between 10 Hz frames, which is a stale actuator, not a well-behaved one. Read TV together with
-tracking error and safety violations, never alone.
+tracking error and envelope excursions, never alone.
 
-## 13. Privacy and size
+## 13. Repository contents and further reading
 
-* **No data, no weights, no logs.** Nothing learned ships: the coarse classifier is a 16-float prototype
-  table plus four feature scales. There are no `.mat` files, no image datasets, no training logs, no
-  checkpoints, no MEX binaries.
-* **Four binaries only.** One generated `.slx` (the Simulink sketch, built from built-in blocks by
-  `build_simulink_model.m`) and three generated 240 dpi PNGs of roughly 180-260 KB each. The repository
-  stays under 1.5 MB in total.
-* **No absolute paths, no usernames.** Every path in the documentation is repository-relative. The
-  Simulink builder pins `Creator`, `LastModifiedBy` and `ModifiedByFormat` to `ai-layered-control`, so a
-  local Windows user name can never leak into the model metadata.
-* **Hygiene by construction.** [`.gitignore`](.gitignore) blocks `*.mat`, `*.mex*`, `slprj/`, `*.slxc`,
-  `*.asv`, `*.o`, `*.exe`, `*.obj`, `_scratch/` and editor/agent dot-directories, while explicitly
-  un-ignoring `matlab_simulink/*.slx` and `assets/*.png` so the four intended artifacts stay trackable.
-* **ASCII console.** The acceptance run prints pure 7-bit ASCII - no box-drawing characters, no locale
-  assumptions - so it can be pasted into a CI log, a ticket or an agent transcript unchanged.
-
-## 14. Repository layout and further reading
+The repository is plain text - C99, MATLAB, Markdown - plus one generated Simulink model and three
+generated figures. Nothing learned is shipped: the coarse classifier is a 16-float prototype table plus
+four feature scales.
 
 ```text
 ai-layered-control/
@@ -521,19 +550,29 @@ ai-layered-control/
 | [`docs/domain_mapping_guide.md`](docs/domain_mapping_guide.md) | the same mapping applied to industrial servo/WAAM, edge VLA and neuromodulation, with per-domain thresholds and misuse patterns |
 | [`c99_layered_core/layered_gatekeeper.h`](c99_layered_core/layered_gatekeeper.h) | the contract: 4 regimes, 5 gate states, 5 fault bits, the full per-tick semantics |
 
-## 15. What this benchmark is, and is not
+### Sister project: jev-tune
 
-* **Synthetic, paired, reproducible.** One plant model, one reference, one fault schedule; the same noise
-  and delay realisations are applied to all three branches, so the comparison is paired rather than
-  averaged. Everything is plain MATLAB: no toolbox, no GPU, no MEX, no training loop.
-* **Not hardware.** No real machine, no measured dataset, no device profiling. The compute and memory
-  numbers are analytic from weight counts and inference rates.
-* **Not a claim about your plant.** The architecture is the transferable part; the constants in
-  `load_domain_profile.m` are an engineering starting point to be re-commissioned, not a tuning to copy.
-* **Not the last word.** The manifesto's final section lists the five observations that would weaken or
-  break the argument - including the honest case for staying end-to-end when the policy *is* the plant
-  model, when the task parameter is high-dimensional, when the loop is slow, or when data is abundant.
+[`jev-tune`](https://github.com/lijiawei255/jev-tune) works one level lower, inside a single controller:
+continuous parameter-layer tuning with a C99 safety boundary as the backstop. This repository works one
+level higher, at the discrete structural layer - coarse semantic classification across operating
+conditions, convergence from very few calibration runs, compute decoupling between the slow and fast
+loops, and explicit rejection of operating points it does not recognise. The two are complementary:
+parameter-layer fitting and structural-layer arbitration, together forming one engineering-systems path
+from "tune the controller" to "decide which controller, and refuse the ones you cannot vouch for".
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Scope and disclaimer
+
+This repository is a **reference implementation and conceptual benchmark** for academic exchange and
+architectural exploration. Every experiment in it runs on a **parameterised synthetic nonlinear plant**;
+it contains no clinical data from real patients and no production data from real machines, and nothing
+in it has been validated on hardware.
+
+Before any of this is used on a real industrial machine, robot or neuromodulation system, the full
+engineering process for that application has to be carried out: hazard analysis (FMEA / STPA, and the
+equivalent clinical risk analysis for medical use), hardware-in-the-loop testing, and the certification
+required by the relevant industrial-safety or medical-device regulations. The numbers in this README
+describe a simulation; they are not a safety claim about any device.

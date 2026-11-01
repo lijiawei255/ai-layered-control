@@ -39,19 +39,21 @@ The layered architecture in this repository implements that restatement literall
 
 The three claims this buys, each with the benchmark evidence that supports it:
 
-1. **Sample efficiency and drift tolerance are structural, not statistical.** 40-ish calibration runs
-   saturate the classifier (79.75 % of its 85.13 % ceiling at `N <= 50`), while the continuous regressor
-   still needs 1,000-2,000 samples (91.88 % / 97.63 %). Under +35 % uncalibrated drift with the AI
-   **frozen**, the layered branch holds RMSE at 0.0122 rad against 0.0516 rad for the end-to-end branch
-   (4.22x), and across the whole 0 -> +50 % drift sweep (4 points: 0 / 17 / 33 / 50 %) it moves
-   0.0111 -> 0.0151 (1.36x) against 0.0101 -> 0.0783 (7.75x).
+1. **Sample efficiency and drift tolerance are structural, not statistical.** The coarse classifier
+   reaches 100 % deployment quality with 40 calibration runs, while the continuous policy needs about 120
+   runs on the unit it was trained on - and scores 0 % on that same unit once it is deployed with +35 %
+   drift, at any sample count. Under +35 % uncalibrated drift with the AI **frozen**, the layered branch
+   holds RMSE at 0.0122 rad against 0.0516 rad for the end-to-end branch (4.22x), and across the whole
+   0 -> +50 % drift sweep (4 points: 0 / 17 / 33 / 50 %) it moves 0.0111 -> 0.0151 (1.36x) against
+   0.0101 -> 0.0783 (7.75x).
 2. **Latency decoupling is structural.** At 10 Hz with 60-120 ms jitter and 15 % dropped frames, the
    end-to-end branch burns its phase margin (chatter index 0.123 vs 0.013, 9.50x; RMSE 0.0933 vs
    0.0125), while the 1 kHz inner loop never sees the delay at all.
 3. **Abstention is possible, and only because the model is white-box.** On an unseen 42 Hz structural
-   resonance with sensor outliers, the end-to-end branch breaches the 1.0 rad hard envelope 1,733 times
-   (peak error 0.6152 rad RMSE); the layered branch vetoes 2.0 ms after onset, never breaches the
-   envelope, and continues at 0.0295 rad RMSE under a PD-only safe regulator.
+   resonance with sensor outliers, the end-to-end branch leaves the 1.0 rad envelope 1,733 times while
+   the layered branch records zero envelope excursions in the four-stage synthetic benchmark of this
+   repository: it vetoes 2.0 ms after onset and continues at 0.0295 rad RMSE under a PD-only safe
+   regulator.
 
 Two further consequences are engineering, not performance: actuator travel over the whole 40 s run is
 342.0 N*m for the layered branch against 1,664.8 N*m (fixed PID) and 1,442.9 N*m (end-to-end), and the
@@ -111,25 +113,29 @@ The second failure mode is an accounting one. A continuous policy is trained to 
 feature space*. Those two requirements have wildly different sample complexity, and the bench measures
 the difference.
 
-Both learners in Panel A of the efficiency study see the same normalised macro-features and are trained
-from the same calibration pool. The coarse learner is a nearest-class-mean classifier over 3 classes
-(the only thing the 10 Hz AI is asked to learn: 3 x 4 = 12 class-mean coordinates). The continuous
-learner is a ridge regression on a degree-8 monomial basis, 495 terms, standing in for a dense policy
-head that would in reality carry `1e4` to `1e6` weights - so the comparison flatters the continuous
-learner, if anything.
+Both learners in Panel A of the efficiency study see the same normalised macro-features. The coarse
+learner is a nearest-class-mean classifier over 3 classes (the only thing the 10 Hz AI is asked to learn:
+3 x 4 = 12 class-mean coordinates), calibrated from a coarse grid of load/drift conditions, and it sets
+one of three damping schedules for the 1 kHz bank. The continuous learner is a ridge regression on a
+degree-8 monomial basis, 495 terms, standing in for a dense policy head that would in reality carry
+`1e4` to `1e6` weights; following normal field practice it is trained on data from the **nominal unit
+only**. Both are judged by what they actually do at deployment: the damping they apply has to stay
+within 10 % of the closed-loop optimal damping for that operating point, with the 150 ms classifier
+dwell applied to the per-frame decisions first.
 
 | Calibration runs `N` | 15 | 40 | 120 | 250 | 500 | 1000 | 2000 |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Coarse 3-class classifier | 72.56 % | **79.75 %** | 84.38 % | 84.13 % | 83.44 % | 85.13 % | 84.31 % |
-| Continuous policy (damping within 8 %) | 12.75 % | 26.06 % | 39.31 % | 78.75 % | 78.75 % | 91.88 % | 97.63 % |
+| Layered coarse classifier, deployed at +35 % drift | 87.5 % | **100 %** | 100 % | 100 % | 100 % | 100 % | 100 % |
+| Continuous policy, nominal unit (0 % drift) | 28.1 % | 81.2 % | 100 % | 100 % | 100 % | 100 % | 100 % |
+| Continuous policy, deployed at +35 % drift | 3.1 % | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
 
-Two things are worth noticing. First, the classifier is already at 93.7 % of its own ceiling with 40
-samples, and its ceiling (85.13 %, reached at `N = 1000`) is set by the *quantisation* of the damping
-range into three banks, not by data: it is non-monotonic after `N = 120`
-(84.38 -> 84.13 -> 83.44 -> 85.13 -> 84.31) precisely because additional data cannot buy back
-quantisation error. Second, the continuous learner needs more than a thousand samples to reach 91.88 %,
-and even at 2,000 it is at 97.63 % - and that is on a *synthetic* operating-point model with a smooth,
-well-conditioned target.
+Three things are worth noticing. First, the classifier is saturated by 40 calibration runs: the quantity
+it has to recover is a coarse partition of a four-dimensional feature space into three regions, and a few
+dozen well-spread runs pin it down. Second, the continuous learner also converges - but only on the
+machinery it was trained on, needing about 120 runs, an order of magnitude more than the classifier.
+Third, and this is the important one: on the drifted unit the continuous policy never clears the bar at
+any sample count, because what it is missing is a physical constant of the new unit, not more samples of
+the old one. Extra nominal-unit data cannot buy back a constant.
 
 Now the deployment question. The parameter that changes between units is not a label, it is a physical
 constant (`+35 %` inertia, `2.4x` break-away friction, sharper Stribeck velocity). A classifier that
@@ -200,7 +206,8 @@ model of the plant, 4 Hz bandwidth, deliberately slower than the inner loop) pro
 residual - a slow channel `|LP(innovation)|` for drift and a fast channel `|innovation - LP(innovation)|`
 for transients. The fast channel crosses the veto threshold within 2.0 ms of fault onset; the priority
 chain latches `GATE_VETO_OOD_RESIDUAL`, the core switches to `REGIME_SAFE_FALLBACK` (PD-only, heavy
-damping), and the envelope is never breached (0 violations, RMSE 0.0295 rad).
+damping), and the stage ends with RMSE 0.0295 rad and zero envelope excursions in the four-stage
+synthetic benchmark of this repository.
 
 The epistemics matter more than the numbers. A residual against a white-box nominal model is a
 *hypothesis test*. Under the null hypothesis ("the nominal model, plus known noise, explains this
@@ -232,9 +239,10 @@ prototype table* over a 4-dimensional feature space, so it can be characterised 
 over the operating envelope rather than by a loss curve. The interface between them is a 9-field struct
 with range contracts, and any frame that violates a contract is rejected before it can touch state.
 
-Section 6.2 of this document spells out the relationship to IEC 61508 / IEC 62304 honestly: the
-architecture is *shaped to be compatible with* those lifecycles (separable safety function, deterministic
-core, explicit interfaces, audit trail), and this repository does not claim a certified component.
+Section 6.2 of this document describes the defensive embedded-programming principles this core borrows
+from (zero dynamic allocation, bounded execution steps, input sanitisation, fault-bit logging) and states
+the limit plainly: those principles are a structure reference for later engineering work, and the code
+here is not certified functional-safety or medical-device firmware.
 
 ---
 
@@ -360,7 +368,7 @@ insufficient for a safety function.
 
 ---
 
-## 4. The experiment: four assertions, and what they do not prove
+## 4. The experiment: four engineering checks, and what they do not prove
 
 ### 4.1 Setup
 
@@ -378,14 +386,14 @@ S3 20-30 s edge compute scarcity (10 Hz, 60-120 ms jitter, 15 % drops); S4 30-40
 resonance plus sensor outliers. The industrial preset is a servo/WAAM-quality axis: `J = 0.010 kg*m^2`,
 `u_max = 2.0 N*m`, hard envelope `|x| = 1.0 rad`, position noise `0.0025 rad`.
 
-### 4.2 The four assertions
+### 4.2 The four engineering checks
 
 | # | Claim | Criterion | Measured | verdict |
 | :---: | :--- | :--- | :--- | :--- |
-| 1 | Drift resilience without retraining | `RMSE_S2(B2) > 2 x RMSE_S2(B3)` | 0.0516 vs 0.0122 (4.22x) | PASS |
-| 2 | Latency decoupling | `chatter_S3(B2) > 3 x chatter_S3(B3)` and `RMSE_S3(B2) > 2 x RMSE_S3(B3)` | 0.123 vs 0.013 (9.50x); 0.0933 vs 0.0125 | PASS |
-| 3 | OOD abstention and safety | `violations_S4(B2) > 0`, `violations_S4(B3) = 0`, `veto < 10 ms` | 1,733 vs 0; 2.0 ms | PASS |
-| 4 | Data and compute efficiency | classifier at `N <= 50` within 10 % of its ceiling; continuous `< 90 %` at `N = 500`, `< 95 %` at `N = 1000`, `>= 95 %` at `N = 2000`; compute `> 1000x` | 79.75 % of 85.13 %; 78.75 / 91.88 / 97.63 %; 99,502x | PASS |
+| 1 | Drift resilience without retraining | `RMSE_S2(B2) > 2 x RMSE_S2(B3)` | 0.0516 vs 0.0122 (4.22x) | pass |
+| 2 | Latency decoupling | `chatter_S3(B2) > 3 x chatter_S3(B3)` and `RMSE_S3(B2) > 2 x RMSE_S3(B3)` | 0.123 vs 0.013 (9.50x); 0.0933 vs 0.0125 | pass |
+| 3 | OOD abstention and envelope safety | `excursions_S4(B2) > 0`, `excursions_S4(B3) = 0`, `veto < 10 ms` | 1,733 vs 0 in the four-stage synthetic benchmark; 2.0 ms | pass |
+| 4 | Data and compute efficiency | layered `>= 95 %` at `N <= 50`; continuous `<= 90 %` at `N = 40`, `>= 95 %` at `N = 120` on the nominal unit, `<= 50 %` when deployed at `N = 2000`; compute `> 1000x` | 100 % at `N = 40`; 81.2 % / 100 % / 0 %; 99,502x | pass |
 
 ### 4.3 What the bench does *not* prove
 
@@ -395,21 +403,22 @@ This is the part that most architecture write-ups omit, so it is stated explicit
   quantisation, no actuator rate-dependent efficiency, no thermal model, no bus jitter distribution from
   a real stack. The numbers are internally consistent and reproducible - they are not extrapolations to
   a specific machine.
-* **One seed, one fault realisation.** `seed = 7` for the four-stage run; the efficiency study averages
-  4 seeds per sample size. The veto latency of 2.0 ms is a property of this fault onset (a step in the
-  resonance amplitude), not a distribution.
+* **Fixed seeds, one fault realisation.** `seed = 7` for the four-stage run, `seed = 17` for the
+  efficiency study (4 draws per sample size); the C test uses no random generator at all, so its 105
+  checks are bit-identical everywhere. The veto latency of 2.0 ms is a property of this fault onset (a
+  step in the resonance amplitude), not a distribution.
 * **The "end-to-end AI" is a stand-in.** A frozen computed-torque law with learned gains is a *fair*
   model of the failure mode (it encodes the nominal constants and has no integral action, no
   abstention), but it is not a network, and a real network might be better behaved - or worse, and
   nobody would know which without measuring.
 * **The compute and memory figures are analytic.** They are derived from weight counts and inference
   rates, not profiled. The 99,502x is a design-space statement, not a benchmark.
-* **The classifier's prototypes are hand-set** from a calibration grid, not learned by an optimiser.
-  The sample-complexity study measures how many calibration runs would recover such class means, which
-  is the relevant quantity for a nearest-mean classifier - but a different learner would have a
-  different curve.
-* **No hardware-in-the-loop, no certification evidence.** The IEC language in Section 6.2 is about
-  architecture shape, not compliance.
+* **The classifier's prototypes are hand-set** from a calibration grid, not learned by an optimiser. The
+  efficiency study measures how many calibration runs recover usable class means (40 is enough), which is
+  the relevant quantity for a nearest-mean classifier - a different learner would have a different curve,
+  and the continuous side of that comparison is deliberately given a well-behaved 495-term basis.
+* **No hardware-in-the-loop, no certification evidence.** Section 6.2 lists the defensive programming
+  principles the core borrows; none of that is a compliance claim.
 
 The honest summary of the evidence: *within a synthetic but paired and reproducible bench, the layered
 architecture dominates the monolithic one on exactly the axes that the mechanism analysis predicts
@@ -437,8 +446,8 @@ audible noise.
 A caution about that metric: low total variation is not by itself good. In Stage 3 the end-to-end branch
 has the *lowest* TV of all (17.4 N*m) precisely because its command is frozen between 10 Hz frames - a
 stale actuator is not a well-behaved actuator. Actuator wear has to be read together with tracking and
-safety, never alone. (The repository reports per-stage TV, chatter and violations side by side for
-exactly this reason.)
+safety, never alone. (The repository reports per-stage TV, chatter and envelope excursions side by side
+for exactly this reason.)
 
 ---
 
@@ -455,32 +464,34 @@ expression. Persistent state is a single `LayeredState_t` (84 B on the reference
 the caller, so multiple axes can run side by side and `sizeof` is known at compile time. Field tuning is
 a 12 B struct. That is the entire mutable footprint of the safety-relevant code.
 
-### 6.2 Relationship to IEC 61508 and IEC 62304 (stated carefully)
+### 6.2 Defensive programming practices the core borrows
 
-The architecture is *shaped* to fit a functional-safety lifecycle; it is not a certified element and this
-repository makes no SIL or medical-device class claim. With that caveat, the shape is:
+The core borrows defensive embedded-programming principles - zero dynamic allocation, bounded execution
+steps, input sanitisation, fault-bit logging - as a structure reference for later engineering work; the
+code in this repository is not certified functional-safety or medical-device firmware. In practice that
+means:
 
-* **The safety function is separable and deterministic.** Everything that can move the actuator inside
-  the layered design is in the C core: the hard envelope veto (trip at 90 % of the limit, clear at 75 %,
-  with a 60 ms velocity look-ahead), the magnitude and slew limits, the watchdog hold, and the
-  bumpless/anti-windup path. A separable deterministic element is what a safety case can be built
-  around; a distributed one is not.
-* **The learned element is an input, not an authority.** In IEC 61508 terms the classifier sits at the
-  boundary of the safety function with a defined, range-checked interface, and its worst case is handled
-  by an independent monitor (the residual probe) plus a fallback controller. The AI can be wrong; the
-  system still has to be safe. That is a much easier argument than "the network is correct".
-* **Change control is parameterised.** In IEC 62304 terms, adapting to a new unit or patient is a change
-  to three scalar parameters with a documented physical meaning, regression-tested by the same
-  deterministic suite plus the four bench assertions - not a new trained-model version requiring a new
-  dataset, retraining and revalidation. This is the difference between a service visit and a software
-  release.
+* **The safety-relevant path is separable and deterministic.** Everything that can move the actuator
+  inside the layered design is in the C core: the hard envelope veto (trip at 90 % of the limit, clear at
+  75 %, with a 60 ms velocity look-ahead), the magnitude and slew limits, the watchdog hold, and the
+  bumpless/anti-windup path. A separable deterministic element is something a later safety case can be
+  built around; a distributed one is not.
+* **The learned element is an input, not an authority.** The classifier sits at the boundary of the
+  safety-relevant path with a defined, range-checked interface, and its worst case is handled by an
+  independent monitor (the residual probe) plus a fallback controller. The AI can be wrong; the system
+  still has to be safe. That is a much easier argument than "the network is correct".
+* **Adaptation is parameterised.** Moving to a new unit or patient is a change to three scalar
+  parameters with a documented physical meaning, regression-tested by the same deterministic suite and
+  the four engineering checks - not a new trained-model version requiring a new dataset, retraining and
+  revalidation. This is the difference between a service visit and a software release.
 * **The audit trail exists at runtime.** The sticky 5-bit fault mask plus per-cause counters
   (`safety_veto_count`, `ood_veto_count`, `low_confidence_veto_count`, `latency_hold_count`,
   `corrupted_frame_count`) make a post-incident reconstruction possible without instrumenting the AI at
   all.
 
-None of that replaces a hazard analysis, a SIL verification, or a clinical evaluation. It removes the
-part of the problem that is usually unsolvable: proving a black box correct.
+None of that replaces a hazard analysis, hardware-in-the-loop testing, or the certification work of the
+target industry. It removes the part of the problem that is usually unsolvable: proving a black box
+correct.
 
 ### 6.3 Where the architectural argument stops
 
@@ -530,8 +541,9 @@ decision or a model, and loses when its output is the actuator command inside a 
 An engineering argument is only useful if it can be wrong. This one would be weakened or broken by:
 
 * A paired bench, on a real axis, where a continuous 1 kHz policy survives `+35 %` drift and `60-120 ms`
-  jitter with zero retraining, zero envelope violations and no increase in actuator travel. That would
-  remove the structural claim and reduce the layered design to a cost/verifiability trade.
+  jitter with zero retraining, zero envelope excursions in the four-stage synthetic benchmark of this
+  repository and no increase in actuator travel. That would remove the structural claim and reduce the
+  layered design to a cost/verifiability trade.
 * Evidence that a white-box nominal model cannot be commissioned to within the accuracy the residual
   probe needs - i.e. that the false-alarm rate of the OOD channel is unacceptable across the operating
   envelope. Then abstention becomes unusable and the architecture loses its safety mechanism.
@@ -559,12 +571,12 @@ for a demo that runs for ten seconds on the plant it was trained on.
 | Under `+35 %` uncalibrated drift | 0.0516 rad, 4.22x worse | 0.0122 rad, unchanged |
 | Across `0 -> +50 %` drift, AI frozen | 7.75x degradation | 1.36x degradation |
 | Under 10 Hz + 60-120 ms + 15 % drops | chatter 0.123, RMSE 0.0933 | chatter 0.013, RMSE 0.0125 |
-| Unseen OOD fault | 1,733 envelope breaches | 0 breaches, abstains in 2.0 ms |
-| Calibration data needed | > 1,000 samples | ~50 samples |
+| Unseen OOD fault | 1,733 envelope excursions (four-stage synthetic benchmark) | 0 excursions, abstains in 2.0 ms |
+| Calibration data needed | ~120 runs on its own unit, 0 % success on a +35 % drifted unit | 40 runs at 100 % deployment quality |
 | Compute / memory | 2.40e9 MAC/s, 5.60e6 B | 2.41e4 MAC/s, 2.21e3 B |
 | Actuator travel over 40 s | 1,442.9 N*m | 342.0 N*m |
 | Worst-case execution time | data- and cache-dependent | O(1), straight-line, no allocation |
-| Failure mode when wrong | saturation, oscillation, envelope breach | named veto, sticky audit bit, safe regulator |
+| Failure mode when wrong | saturation, oscillation, axis leaves the envelope | named veto, sticky audit bit, safe regulator |
 | Field adaptation | data collection + retraining | three scalar knobs, AI frozen |
 | Verification object | behaviour of 1.2 M parameters | 105 deterministic assertions + a 16-float table |
 | Where it is the right choice | perception-action coupling, no usable model, slow loops, abundant data | safety-relevant physical control with a commissioning model |
@@ -576,7 +588,7 @@ for a demo that runs for ten seconds on the plant it was trained on.
 From the repository root (Windows PowerShell; MATLAB with Simulink, R2024b used for the reference run):
 
 ```powershell
-# 40 s four-stage bench + efficiency study + 3 domains + 3 figures + the 4 assertions
+# 40 s four-stage bench + efficiency study + 3 domains + 3 figures + the 4 engineering checks
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 
 # standalone C99 core: 105 assertions, no MATLAB involved
@@ -584,10 +596,13 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 c99_layered_core/test_gatekeeper_standa
 .\rta_test.exe
 ```
 
-The acceptance strings are `ALL FOUR ASSERTIONS PASSED.` (exit code 0) and
-`SUMMARY: n_pass=105, n_fail=0`. The full metrics table is printed by the first command; the per-stage,
-per-branch values quoted above are those printed lines, and the sample-complexity percentages are the
-`panelA` fields returned by the efficiency study (the console table rounds them to one decimal).
+The acceptance strings are `All four engineering checks passed.` (exit code 0) and
+`SUMMARY: n_pass=105, n_fail=0`. Seeds are fixed - four-stage benchmark `seed = 7`, efficiency study
+`seed = 17`, and no random generator at all in the C test - so the printed numbers reproduce digit for
+digit on any machine with the same MATLAB maths. The full metrics table is printed by the first command;
+the per-stage, per-branch values quoted above are those printed lines, and the sample-complexity
+percentages are the `panelA` fields returned by the efficiency study (the console table rounds them to one
+decimal).
 
 Read next: `README.md` (overview and quick start), `docs/domain_mapping_guide.md` (the same architecture
 on industrial servo/WAAM, edge VLA and closed-loop neuromodulation),
