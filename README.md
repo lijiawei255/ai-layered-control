@@ -138,6 +138,18 @@ branch rises monotonically. (c) compute, memory and inference rate on a log scal
 servo/WAAM, the edge VLA preset (10 Hz policy over a 1 kHz joint loop) and closed-loop neuromodulation.
 Only the physical constants change; the architecture does not.
 
+### Core systems insight: more nominal data cannot fix cross-unit drift
+
+> **The sample count is not what fails.** On the unit it trained on, the continuous policy reaches 100 % deployable success with 120 calibration runs; move the same frozen policy to a unit carrying +35 % drift and it is at 0 % for every sample count from 40 to 2000. A 3-class coarse classifier reaches 100 % on that drifted unit with 40 runs - because it learned a qualitative partition and left the quantitative offset to feedback.
+
+The usual remedy for poor cross-unit generalisation is more of the same: more data on the nominal distribution, a bigger model, per-unit retraining. Figure 2(a) tests that remedy directly instead of assuming it. It holds the plant model, the feature pipeline and the scoring rule fixed, varies only the number of calibration runs, and then asks what each learner actually does when the machinery changes underneath it. The answer is that the two learners are not limited by the same quantity.
+
+What is measured there is deployment quality, not training loss. Both learners see the same four normalised macro-features, and both are scored the same way: the damping actually applied must stay within 10 % of the closed-loop optimum for that operating point, after the 150 ms classifier dwell. On the unit it trained on, the continuous policy is a competent learner - 28.1 % at N = 15, 81.2 % at N = 40, and 100 % from N = 120 on, where N counts calibration runs. The same frozen policy deployed on a unit carrying +35 % drift scores 3.1 % at N = 15 and exactly 0 % at every N from 40 to 2000. That is a hard floor, not a plateau: every decision falls outside the 10 % tolerance, and the curve does not creep upward with data. The layered curve, measured on the drifted unit, is already 87.5 % at N = 15 and 100 % from N = 40 on.
+
+The mechanism has a name, and it is not variance. The regressor is not learning how machines of this class behave; it is interpolating the inverse-dynamics manifold of the single machine in its training set. Every additional nominal sample lowers the empirical risk on that manifold and tightens the fit to it, which increases, rather than decreases, the effective error on a unit whose inertia (+35 %), break-away friction (2.4x) and Stribeck velocity (0.25x) sit outside it. What is missing is a physical constant, and no density of 0 %-drift samples carries information about a +35 % offset. The deployment point is off the support the learner fixed, so more data, a larger basis and stronger regularisation all pull on the wrong axis.
+
+The layered structure escapes at N = 40 because it splits the map into two parts that fail independently. The slow 10 Hz classifier learns only the qualitative partition of a four-dimensional dimensionless feature space into three regimes - 12 class-mean coordinates plus 4 feature scales, 16 floats in total. Because each feature is normalised by amplitude, actuator limit or velocity scale, a +35 % shift in the plant constants barely moves the operating point in that space, so the partition transfers. The quantitative offset is deliberately not learned at all: the 1 kHz deterministic bank's integrator, with tracking anti-windup, absorbs the unknown bias; the magnitude-then-slew clamps bound the transient; and three field scalars give the engineer the last 10 %. The rule of thumb follows from this: if the deployment condition can drift by tens of percent and you cannot collect data at the drifted condition, the binding question is not "how many samples" but "what is learned (a decision, not a command), how is its input normalised (so the decision survives scale changes), and what absorbs the remainder (a feedback loop you can bound)". The same mechanism shows up as the Stage 2 result in the four-stage benchmark - 0.0516 rad for the end-to-end branch against 0.0122 rad for the layered one, a 4.22x ratio - and is argued from the control side in [`docs/systems_engineering_manifesto_en.md`](docs/systems_engineering_manifesto_en.md) section 2.2.
+
 ## 4. Five engineering bottlenecks of end-to-end continuous control - and the structural fix
 
 The failure of a monolithic `u = pi_theta(x)` policy in a real loop is not a model-capacity problem. It
@@ -559,6 +571,21 @@ conditions, convergence from very few calibration runs, compute decoupling betwe
 loops, and explicit rejection of operating points it does not recognise. The two are complementary:
 parameter-layer fitting and structural-layer arbitration, together forming one engineering-systems path
 from "tune the controller" to "decide which controller, and refuse the ones you cannot vouch for".
+
+## Citation
+
+If this reference architecture or benchmark is useful in your work, the repository is citable. GitHub renders a **Cite this repository** button in the right-hand sidebar of the project page from [`CITATION.cff`](CITATION.cff), and that button exports APA or BibTeX for you. If you would rather paste the entry directly:
+
+```bibtex
+@software{li2026ailayeredcontrol,
+  author       = {Li, Jiawei},
+  title        = {{ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control}},
+  year         = {2026},
+  version      = {1.0.0},
+  url          = {https://github.com/lijiawei255/ai-layered-control},
+  note         = {ORCID: 0009-0002-8322-4474}
+}
+```
 
 ## License
 
