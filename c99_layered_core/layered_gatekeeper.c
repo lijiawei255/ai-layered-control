@@ -1,0 +1,546 @@
+/*
+ * layered_gatekeeper.c
+ * ---------------------------------------------------------------------------
+ * Zero-dependency ANSI C99 implementation of the deterministic 1 kHz core
+ * declared in layered_gatekeeper.h.
+ *
+ * Deployment constraints honoured on purpose (this file must be boring to
+ * certify and safe to drop into a 1 kHz ISR):
+ *   - the only include is the module header (which pulls in <stdint.h>);
+ *   - no <math.h> / libm: |.|, clamping and the whole decision logic are hand
+ *     written, no exp()/sqrt()/trig is ever needed;
+ *   - no allocation, no I/O, no recursion, no loops over memory: one step is a
+ *     fixed straight-line path, so the worst-case execution time is O(1);
+ *   - no file-static mutable state: every byte of persistence lives in
+ *     LayeredState_t, so several instances can run side by side.
+ *
+ * One step, in this order:
+ *   0. input firewall             reject NaN/Inf/out-of-range IPC frames
+ *   1. safety envelope veto       sticky, latches ENVELOPE_BREACH
+ *   2. OOD residual veto          sticky, latches OOD_RESIDUAL
+ *   3. confidence / abstention    sticky latch, latches LOW_CONFIDENCE
+ *   4. heartbeat watchdog         hold actuator, latches LATENCY_TIMEOUT
+ *   5. dwell timer + post-fault recovery cooldown for the normal AI regime
+ *   6. controller bank (+ deterministic feedforward u_ff), tracking
+ *      anti-windup, bumpless transfer, hard clamps
+ * ---------------------------------------------------------------------------
+ */
+
+#include "layered_gatekeeper.h"
+
+/* Anything with a larger magnitude is treated as a non-finite (overflowed)
+ * measurement.  FLT_MAX is ~3.4028e38, so every finite value passes.  This is
+ * the "<math.h>-free isfinite()" used by the input firewall. */
+#define LAYERED_FINITE_LIMIT 3.0e38f
+
+/* Build-time guard: the straight-line bank code below is written out for
+ * exactly LAYERED_NUM_REGIMES controllers.  If the header ever changes that
+ * number, this typedef makes the build fail instead of silently truncating. */
+typedef char lg_bank_size_check[(LAYERED_NUM_REGIMES == 4) ? 1 : -1];
+
+/* ========================================================================= */
+/* Dependency-free float helpers                                             */
+/* ========================================================================= */
+
+static float lg_absf(float v)
+{
+    return (v < 0.0f) ? -v : v;
+}
+
+static float lg_clampf(float v, float lo, float hi)
+{
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+/* NaN fails both comparisons, +Inf / -Inf fail one of them: no <math.h>. */
+static int lg_is_finite(float v)
+{
+    return (v >= -LAYERED_FINITE_LIMIT) && (v <= LAYERED_FINITE_LIMIT);
+}
+
+/* ========================================================================= */
+/* Mailbox decoding                                                          */
+/* ========================================================================= */
+
+/* The firewall has already guaranteed 1.0 <= ai_regime <= 4.0.
+ * 4.0 is an explicit abstention and maps to the safe fallback bank. */
+static layered_regime_t lg_mailbox_regime(float ai_regime)
+{
+    if (ai_regime < 1.5f) {
+        return REGIME_NOMINAL;
+    }
+    if (ai_regime < 2.5f) {
+        return REGIME_HIGH_LOAD_DAMPED;
+    }
+    if (ai_regime < 3.5f) {
+        return REGIME_BOUNDARY_COMPLIANT;
+    }
+    return REGIME_SAFE_FALLBACK;
+}
+
+static int lg_mailbox_abstains(float ai_regime)
+{
+    return (ai_regime >= 3.5f);
+}
+
+/* ========================================================================= */
+/* Input firewall                                                            */
+/* ========================================================================= */
+
+/* A frame is corrupt when any field is NaN/Inf or outside its contract range.
+ * Called before ANY persistent state is touched, so a corrupt frame can never
+ * poison an integrator. */
+static int lg_frame_is_corrupt(const LayeredInput_t *input)
+{
+    if (!lg_is_finite(input->ai_regime) ||
+        !lg_is_finite(input->ai_confidence) ||
+        !lg_is_finite(input->outer_age_s) ||
+        !lg_is_finite(input->physics_residual) ||
+        !lg_is_finite(input->x) ||
+        !lg_is_finite(input->x_dot) ||
+        !lg_is_finite(input->r) ||
+        !lg_is_finite(input->r_dot) ||
+        !lg_is_finite(input->u_ff)) {
+        return 1;
+    }
+    if (input->ai_regime < 1.0f || input->ai_regime > 4.0f) {
+        return 1;
+    }
+    if (input->ai_confidence < 0.0f || input->ai_confidence > 1.0f) {
+        return 1;
+    }
+    if (input->physics_residual < 0.0f) {
+        return 1;
+    }
+    if (input->outer_age_s < 0.0f) {
+        return 1;
+    }
+    return 0;
+}
+
+/* ========================================================================= */
+/* Controller bank helpers                                                   */
+/* ========================================================================= */
+
+/* u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + u_ff, with the two
+ * field-tuning knobs applied to the gains (gain_scale scales P and I,
+ * damping_scale D).  u_ff is the deterministic white-box feedforward produced
+ * by the commissioning model / trajectory generator; it is added to EVERY bank
+ * controller (and therefore to every back-calculation term) so that the
+ * "inactive controller tracks the applied command" identity still holds. */
+static float lg_pid_output(const LayeredConfig_t *config,
+                           const FieldTuning_t *tuning,
+                           int bank,
+                           float e,
+                           float ed,
+                           float integ,
+                           float u_ff)
+{
+    return (config->kp[bank] * tuning->gain_scale) * e
+         + (config->kd[bank] * tuning->damping_scale) * ed
+         + (config->ki[bank] * tuning->gain_scale) * integ
+         + u_ff;
+}
+
+/* Tracking anti-windup (back-calculation) for ONE integrator.
+ *
+ *   integ += dt*e + (u_actual - u_pid) * dt / (ki_eff * windup_tau_s)
+ *
+ * Every integrator of the bank follows the command that was really applied, so
+ * an inactive controller can never store hidden windup and a later switch
+ * releases no energy.  When ki_eff == 0 (or the time constant is disabled) the
+ * back-calculation term has no defined gain and is skipped: the integrator is
+ * then a pure accumulator and still clamped. */
+static void lg_integrate(float *integ,
+                         float ki_eff,
+                         float e,
+                         float dt,
+                         float u_pid,
+                         float u_actual,
+                         float windup_tau,
+                         float limit)
+{
+    float next = *integ + e * dt;
+
+    if (ki_eff != 0.0f && windup_tau > 0.0f) {
+        next += (u_actual - u_pid) * dt / (ki_eff * windup_tau);
+    }
+    *integ = lg_clampf(next, -limit, limit);
+}
+
+/* ========================================================================= */
+/* API                                                                       */
+/* ========================================================================= */
+
+void Layered_Init(LayeredState_t *state,
+                  const LayeredConfig_t *config,
+                  const FieldTuning_t *tuning)
+{
+    (void)config; /* the core never copies its configuration */
+    (void)tuning;
+
+    if (state == 0) {
+        return;
+    }
+
+    state->initialized = 1;
+    state->u_applied = 0.0f;
+    state->u_target = 0.0f;
+    state->integ[0] = 0.0f;
+    state->integ[1] = 0.0f;
+    state->integ[2] = 0.0f;
+    state->integ[3] = 0.0f;
+    state->blend = 0.0f;
+    state->regime = REGIME_NOMINAL;
+    state->ood_latched = 0;
+    state->safety_latched = 0;
+    state->conf_latched = 0;
+    state->dwell_ticks = 0u;
+    state->recovery_ticks = 0u;
+    state->fault_audit_bitmask = 0u;
+    state->step_count = 0u;
+    state->safety_veto_count = 0u;
+    state->ood_veto_count = 0u;
+    state->low_confidence_veto_count = 0u;
+    state->latency_hold_count = 0u;
+    state->corrupted_frame_count = 0u;
+}
+
+LayeredOutput_t Layered_Step(LayeredState_t *state,
+                             const LayeredConfig_t *config,
+                             const FieldTuning_t *tuning,
+                             const LayeredInput_t *input)
+{
+    LayeredOutput_t out;
+    float u_max;
+    float integ_limit;
+    float du_max;
+    float dt_eff;
+    float windup_tau;
+    float limit_eff;
+    float x_abs;
+    float xdot_abs;
+    float predicted_abs;
+    float residual_abs;
+    float e;
+    float ed;
+    float u_pid0;
+    float u_pid1;
+    float u_pid2;
+    float u_pid3;
+    float u_active;
+    float u_cmd;
+    int snap;
+    int conf_before;
+    int conf_veto;
+    int latency_hold;
+    int veto_active;
+    int do_control;
+    int bank;
+    layered_gate_state_t gate;
+    layered_regime_t regime;
+    layered_regime_t mailbox_regime;
+
+    /* Fail-safe answer for a broken caller (null pointer): no command, the
+     * strictest gate reported.  Never dereferences a null pointer. */
+    out.u = 0.0f;
+    out.u_target = 0.0f;
+    out.gate = GATE_VETO_SAFETY_ENVELOPE;
+    out.regime = REGIME_SAFE_FALLBACK;
+    out.blend = 0.0f;
+    out.fault_audit_bitmask = 0u;
+    out.corrupted = 0;
+
+    if (state == 0 || config == 0 || tuning == 0 || input == 0) {
+        return out;
+    }
+
+    /* Self-healing: a forgotten Layered_Init() costs one null step, never a
+     * wild actuator command. */
+    if (!state->initialized) {
+        Layered_Init(state, config, tuning);
+    }
+
+    /* ---------------- 0. INPUT FIREWALL -------------------------------- */
+    /* Nothing below this block runs for a corrupt frame: no integrator, no
+     * latch, no blend, no dwell counter is touched.  The actuator simply
+     * stays where it is (fail-safe hold) and the sticky NAN_CORRUPTION bit
+     * records that this IPC frame must be investigated. */
+    if (lg_frame_is_corrupt(input)) {
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
+        state->corrupted_frame_count++;
+        state->step_count++;
+
+        out.u = state->u_applied;
+        out.u_target = state->u_target;
+        out.gate = GATE_HOLD_LATENCY;
+        out.regime = state->regime;
+        out.blend = state->blend;
+        out.fault_audit_bitmask = state->fault_audit_bitmask;
+        out.corrupted = 1;
+        return out;
+    }
+
+    snap = (state->step_count == 0u);
+    conf_before = state->conf_latched;
+
+    u_max = lg_absf(config->u_max);
+    integ_limit = lg_absf(config->integ_limit);
+    dt_eff = lg_absf(config->dt_s);
+    du_max = lg_absf(config->u_slew_max_per_s) * dt_eff;
+    windup_tau = config->windup_tau_s;
+
+    /* ---------------- 1. hard safety envelope -------------------------- */
+    limit_eff = lg_absf(config->state_safety_limit * tuning->safety_margin_scale);
+    x_abs = lg_absf(input->x);
+    xdot_abs = lg_absf(input->x_dot);
+    predicted_abs = x_abs + lg_absf(config->safety_predict_s) * xdot_abs;
+
+    if (state->safety_latched) {
+        float clear_level = config->safety_clear_ratio * limit_eff;
+        /* Sticky until BOTH the measurement and the prediction recede. */
+        if (x_abs < clear_level && predicted_abs < clear_level) {
+            state->safety_latched = 0;
+        }
+    } else if (x_abs > config->safety_trip_ratio * limit_eff ||
+               predicted_abs > limit_eff) {
+        state->safety_latched = 1;
+        state->safety_veto_count++;
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_ENVELOPE_BREACH;
+    }
+
+    /* ---------------- 2. physics-residual (OOD) veto -------------------- */
+    residual_abs = lg_absf(input->physics_residual);
+    if (state->ood_latched) {
+        if (residual_abs < config->residual_clear_ratio * config->max_physics_residual) {
+            state->ood_latched = 0;
+        }
+    } else if (residual_abs > config->max_physics_residual) {
+        state->ood_latched = 1;
+        state->ood_veto_count++;
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_OOD_RESIDUAL;
+    }
+
+    /* ---------------- 3. confidence / explicit abstention --------------- */
+    /* STICKY latch, as the contract describes:
+     *   - trip  : confidence < min_ai_confidence, or an explicit ai_regime == 4
+     *             abstention (the AI says "I do not vouch for this frame");
+     *   - clear : confidence >= confidence_clear_ratio (an ABSOLUTE level in
+     *             [0,1], not a multiple) AND the classifier reports a normal
+     *             regime again;
+     *   - in between the previous decision is kept (hysteresis).
+     * confidence_clear_ratio must therefore be chosen above min_ai_confidence,
+     * e.g. min 0.45 / clear 0.55. */
+    mailbox_regime = lg_mailbox_regime(input->ai_regime);
+    if (input->ai_confidence < config->min_ai_confidence ||
+        lg_mailbox_abstains(input->ai_regime) != 0) {
+        state->conf_latched = 1;
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LOW_CONFIDENCE;
+    } else if (input->ai_confidence >= config->confidence_clear_ratio &&
+               lg_mailbox_abstains(input->ai_regime) == 0) {
+        state->conf_latched = 0;
+    }
+    conf_veto = state->conf_latched;
+    if (conf_veto && !conf_before) {
+        /* Diagnostics only: one count per veto EPISODE (rising edge of the
+         * latch), never one per held tick. */
+        state->low_confidence_veto_count++;
+    }
+
+    /* ---------------- 4. heartbeat watchdog ----------------------------- */
+    latency_hold = (input->outer_age_s > config->outer_timeout_s);
+    if (latency_hold) {
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LATENCY_TIMEOUT;
+
+        /* Diagnostics only: count one hold EPISODE, not every held tick.  The
+         * age of a live heartbeat grows by exactly one inner period per tick,
+         * so the first stale tick is the one where the age crosses the
+         * timeout; later ticks of the same episode overshoot by more than a
+         * period and are not counted again. */
+        if ((input->outer_age_s - config->outer_timeout_s) <= dt_eff) {
+            state->latency_hold_count++;
+        }
+    }
+
+    /* ---------------- 5. decision priority ------------------------------ */
+    veto_active = (state->safety_latched != 0) ||
+                  (state->ood_latched != 0) ||
+                  (conf_veto != 0);
+
+    if (state->safety_latched) {
+        gate = GATE_VETO_SAFETY_ENVELOPE;
+        regime = REGIME_SAFE_FALLBACK;
+    } else if (state->ood_latched) {
+        gate = GATE_VETO_OOD_RESIDUAL;
+        regime = REGIME_SAFE_FALLBACK;
+    } else if (conf_veto) {
+        gate = GATE_VETO_LOW_CONFIDENCE;
+        regime = REGIME_SAFE_FALLBACK;
+    } else if (latency_hold) {
+        gate = GATE_HOLD_LATENCY;
+        regime = state->regime; /* keep the last valid bank */
+    } else {
+        gate = GATE_NORMAL;
+
+        if (state->recovery_ticks > 0u) {
+            /* Post-fault cooldown: the fault is gone but the AI is not
+             * re-armed yet, so the safe regulator keeps the plant.  Only a
+             * fully clean tick consumes cooldown. */
+            state->recovery_ticks--;
+            regime = REGIME_SAFE_FALLBACK;
+        } else if (mailbox_regime == state->regime) {
+            regime = state->regime;
+        } else if (state->dwell_ticks >= config->min_dwell_ticks) {
+            regime = mailbox_regime; /* dwell satisfied: accept the switch */
+        } else {
+            regime = state->regime;  /* anti-chatter: keep the old regime */
+        }
+    }
+
+    if (veto_active) {
+        /* Any active veto re-arms the cooldown, so the AI is never re-armed
+         * on the very next clean sample. */
+        state->recovery_ticks = config->ood_recovery_cooldown_ticks;
+    }
+
+    /* ---------------- 6. controller bank -------------------------------- */
+    do_control = (gate != GATE_HOLD_LATENCY);
+
+    if (do_control) {
+        e = input->r - input->x;
+        ed = input->r_dot - input->x_dot;
+
+        /* The whole bank is evaluated every tick at a fixed cost: the inactive
+         * controllers need their own u_pid for the tracking anti-windup.  The
+         * deterministic feedforward enters every bank identically. */
+        u_pid0 = lg_pid_output(config, tuning, 0, e, ed, state->integ[0], input->u_ff);
+        u_pid1 = lg_pid_output(config, tuning, 1, e, ed, state->integ[1], input->u_ff);
+        u_pid2 = lg_pid_output(config, tuning, 2, e, ed, state->integ[2], input->u_ff);
+        u_pid3 = lg_pid_output(config, tuning, 3, e, ed, state->integ[3], input->u_ff);
+
+        bank = (int)regime - 1;
+        if (bank < 0) {
+            bank = 0;
+        }
+        if (bank > 3) {
+            bank = 3;
+        }
+        switch (bank) {
+        case 0:
+            u_active = u_pid0;
+            break;
+        case 1:
+            u_active = u_pid1;
+            break;
+        case 2:
+            u_active = u_pid2;
+            break;
+        default:
+            u_active = u_pid3;
+            break;
+        }
+
+        /* Bumpless transfer: first-order follow of the active controller. */
+        if (snap) {
+            /* Very first step: take the target as-is so the command never has
+             * to ramp up from zero. */
+            state->u_target = u_active;
+            state->blend = 1.0f;
+        } else {
+            if (regime != state->regime) {
+                state->blend = 0.0f; /* a bank switch restarts the transfer */
+            }
+            state->u_target += config->blend_alpha * (u_active - state->u_target);
+            state->blend = lg_clampf(state->blend + config->blend_alpha, 0.0f, 1.0f);
+        }
+
+        /* Hard actuator limits: magnitude first, then slew rate. */
+        u_cmd = lg_clampf(state->u_target, -u_max, u_max);
+        u_cmd = lg_clampf(u_cmd, state->u_applied - du_max, state->u_applied + du_max);
+
+        /* Tracking anti-windup for every controller of the bank. */
+        lg_integrate(&state->integ[0],
+                     config->ki[0] * tuning->gain_scale,
+                     e, dt_eff, u_pid0, u_cmd, windup_tau, integ_limit);
+        lg_integrate(&state->integ[1],
+                     config->ki[1] * tuning->gain_scale,
+                     e, dt_eff, u_pid1, u_cmd, windup_tau, integ_limit);
+        lg_integrate(&state->integ[2],
+                     config->ki[2] * tuning->gain_scale,
+                     e, dt_eff, u_pid2, u_cmd, windup_tau, integ_limit);
+        lg_integrate(&state->integ[3],
+                     config->ki[3] * tuning->gain_scale,
+                     e, dt_eff, u_pid3, u_cmd, windup_tau, integ_limit);
+
+        state->u_applied = u_cmd;
+
+        out.u = u_cmd;
+        out.u_target = state->u_target;
+        out.blend = state->blend;
+    } else {
+        /* GATE_HOLD_LATENCY: the actuator stands still.  Command, target,
+         * blend progress, dwell counter and every integrator are frozen so
+         * that the stale AI layer leaves no trace in the controller state. */
+        out.u = state->u_applied;
+        out.u_target = state->u_target;
+        out.blend = state->blend;
+    }
+
+    /* ---------------- 7. dwell bookkeeping + output --------------------- */
+    if (regime != state->regime) {
+        state->dwell_ticks = 0u;
+    } else {
+        state->dwell_ticks++;
+    }
+    state->regime = regime;
+
+    out.gate = gate;
+    out.regime = regime;
+    out.fault_audit_bitmask = state->fault_audit_bitmask;
+    out.corrupted = 0;
+
+    state->step_count++;
+    return out;
+}
+
+const char *Layered_GateName(layered_gate_state_t gate)
+{
+    switch (gate) {
+    case GATE_NORMAL:
+        return "GATE_NORMAL";
+    case GATE_HOLD_LATENCY:
+        return "GATE_HOLD_LATENCY";
+    case GATE_VETO_OOD_RESIDUAL:
+        return "GATE_VETO_OOD_RESIDUAL";
+    case GATE_VETO_LOW_CONFIDENCE:
+        return "GATE_VETO_LOW_CONFIDENCE";
+    case GATE_VETO_SAFETY_ENVELOPE:
+        return "GATE_VETO_SAFETY_ENVELOPE";
+    default:
+        break;
+    }
+    return "GATE_UNKNOWN";
+}
+
+const char *Layered_RegimeName(layered_regime_t regime)
+{
+    switch (regime) {
+    case REGIME_NOMINAL:
+        return "REGIME_NOMINAL";
+    case REGIME_HIGH_LOAD_DAMPED:
+        return "REGIME_HIGH_LOAD_DAMPED";
+    case REGIME_BOUNDARY_COMPLIANT:
+        return "REGIME_BOUNDARY_COMPLIANT";
+    case REGIME_SAFE_FALLBACK:
+        return "REGIME_SAFE_FALLBACK";
+    default:
+        break;
+    }
+    return "REGIME_UNKNOWN";
+}
