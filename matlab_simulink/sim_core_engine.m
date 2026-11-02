@@ -6,9 +6,10 @@ if nargin < 2, opts = struct(); end
 defaults = struct('branches',[1 2 3],'mode','dynamic','fixed_regime',[], ...
     'seed',7,'drift',.35,'scenario',[],'duration',40,'substeps',2, ...
     'ood',true,'jitter',true,'spikes',true,'bias',true,'wallphase',.4, ...
-    'noise_scale',1,'fault_f',[12 24],'zeta',.012,'wallk',300,'wallx',.43, ...
-    'tuning',[1 1 1],'ood_gate',true,'conf_gate',true,'ffsafe',0, ...
-    'auto_calibrate',true,'log_core',false,'amplitude',[],'probe_spikes',true);
+    'noise_scale',1,'s3_noise',.006,'fault_f',[12 24],'zeta',.012,'wallk',300,'wallx',.43, ...
+    'tuning',[1 1 1],'ood_gate',true,'conf_gate',true, ...
+    'auto_calibrate',true,'log_core',false,'amplitude',[],'probe_spikes',true, ...
+    'corrupt_slow_at',Inf,'smoothing',false);
 keys = fieldnames(defaults);
 for j=1:numel(keys)
     if ~isfield(opts,keys{j}), opts.(keys{j})=defaults.(keys{j}); end
@@ -66,7 +67,7 @@ p(stage==1,4)=1.2*(1+4.5*o.drift);
 p(stage==1,5)=2.5*(1+4.3*o.drift);
 ran=reshape(lcg(o.seed+11,6*n),n,6)';
 white=(ran(1,:)+ran(2,:)+ran(3,:)-1.5)'*2;
-sigma=repmat(.0015,n,1); sigma(stage==2)=.015;
+sigma=repmat(.0015,n,1); sigma(stage==2)=o.s3_noise;
 noise=white.*sigma*o.noise_scale;
 onset=30.037; wallstart=20; freqstart=30;
 if ~isempty(o.scenario), onset=.037; wallstart=0; freqstart=0; end
@@ -137,7 +138,7 @@ end
 
 function pr=probe_init(x)
 pr=struct('xh',x,'vh',0.,'lp',0.,'buf',[],'yf',x,'vf',0., ...
-    'me',0.,'mu',0.,'hf',0.,'sp',0.,'rough',.0017^2,'noisef',x, ...
+    'me',0.,'mu',0.,'hf',0.,'sp',0.,'power',0.,'load_energy',0.,'contact',0., ...
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
     'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[]);
 end
@@ -151,17 +152,21 @@ innov=ym-xp;
 pr.lp=pr.lp+dt/.10*(innov-pr.lp);
 pr.slowenergy=pr.slowenergy+dt/.35*(pr.lp*pr.lp-pr.slowenergy);
 aa=dt/(dt+1/(2*pi*25));
+old_y2=pr.y2;
 pr.y1=pr.y1+aa*(med-pr.y1); pr.y2=pr.y2+aa*(pr.y1-pr.y2);
 actual=(pr.y2-2*pr.yold+pr.yolder)/(dt*dt); pr.yolder=pr.yold; pr.yold=pr.y2;
 predicted=(u-p(2)*pr.vf-p(3)*ym-friction(pr.vf,p))/p(1);
 pr.apbuf=[pr.apbuf,predicted]; if numel(pr.apbuf)>3, pr.apbuf=pr.apbuf(2:end); end
 pr.a1=pr.a1+aa*(pr.apbuf(1)-pr.a1); pr.a2=pr.a2+aa*(pr.a1-pr.a2);
 ar=actual-pr.a2; pr.alp=pr.alp+dt/(dt+1/(2*pi*5))*(ar-pr.alp);
+v25=(pr.y2-old_y2)/dt;
+pr.power=pr.power+dt/.05*(p(1)*pr.alp*v25-pr.power);
+pr.load_energy=pr.load_energy+dt/.05*((p(1)*pr.alp)^2-pr.load_energy);
+evidence=0; if pr.power/(pr.load_energy+.25)>.03, evidence=pr.power-.10; end
+pr.contact=max([pr.contact*(1-dt/8),evidence,0]);
 pr.ae=pr.ae+dt/.008*((ar-pr.alp)^2-pr.ae); pr.hf=sqrt(max(pr.ae,0))/500;
 pr.xh=xp+dt*40*innov; pr.vh=vp+dt*400*innov;
 vd=(ym-pr.yf)/.002; pr.yf=pr.yf+dt/.002*(ym-pr.yf); pr.vf=pr.vf+dt/.002*(vd-pr.vf);
-pr.noisef=pr.noisef+dt/.003*(ym-pr.noisef);
-pr.rough=pr.rough+dt/.15*((ym-pr.noisef)^2-pr.rough);
 pr.me=pr.me+dt/.25*((r-ym)^2-pr.me); pr.mu=pr.mu+dt/.25*(u*u-pr.mu);
 sp=pr.sp; if ~spike_gate, sp=0; end
 pr.veto=max([sp,pr.hf,pr.veto*(1-dt)]);
@@ -176,8 +181,8 @@ end
 
 function B=run_branch(P,c,o,mode)
 n=numel(c.t); dt=P.dt; nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
-x=c.r(1); v=0.; xm=x; vm=0.; wasflex=false; u0=0.; integ=0.; pr=probe_init(x);
-ctx=zeros(1,4); frames=zeros(ceil(n/100),4); last_stamp=0.; cfg=P.cfg; cfg.ff_scale(4)=o.ffsafe;
+x=c.r(1); v=0.; xm=x; vm=0.; wasflex=false; u0=0.; integ=0.; target=0.; pr=probe_init(x);
+ctx=zeros(1,4); frames=zeros(ceil(n/100),4); last_stamp=0.; cfg=P.cfg;
 if ~isempty(P.classifier)
     cfg.min_ai_confidence=P.classifier.trip; cfg.confidence_clear_ratio=P.classifier.clear;
 end
@@ -185,14 +190,14 @@ ckeys=fieldnames(cfg); for j=1:numel(ckeys), cfg.(ckeys{j})=single(cfg.(ckeys{j}
 tune=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
 logs=zeros(n,14); macro=zeros(ceil(n/100),5);
 age=zeros(n,1);
-CI=zeros(n,9*double(o.log_core)); CO=zeros(n,6*double(o.log_core));
+CI=zeros(n,9*double(o.log_core)); CO=zeros(n,7*double(o.log_core));
 for k=1:n
     r=c.r(k); rd=c.rd(k); rdd=c.rdd(k);
     [pr,ym,yd,res]=probe_step(pr,x+c.noise(k)+c.sfault(k)+c.spike(k),u0,r,nom,dt,o.probe_spikes);
     if mod(k-1,100)==0
         mi=floor((k-1)/100)+1;
-        q=sqrt(max([pr.me,pr.mu,pr.slowenergy,pr.rough],0));
-        frames(mi,:)=q./(q+P.feature_scales).*[1,1,.5,1.4];
+        q=sqrt(max([pr.me,pr.mu,pr.slowenergy],0));
+        frames(mi,:)=[q./(q+P.feature_scales).*[1,1,.5],1.4*min(pr.contact/.01,1)];
         macro(mi,:)=[c.t(k),frames(mi,:)];
     end
     for mi=c.arrivals{k}
@@ -214,7 +219,9 @@ for k=1:n
     elseif strcmp(mode,'b1')
         kp=P.baseline(1); kd=P.baseline(2); ki=P.baseline(3);
         raw=kp*e+kd*ed+ki*integ+uff;
-        u=clamp(clamp(raw,-20,20),u0-2,u0+2);
+        if o.smoothing && k>1, target=target+P.cfg.blend_alpha*(raw-target);
+        else, target=raw; end
+        u=clamp(clamp(target,-20,20),u0-2,u0+2);
         if ki~=0, integ=clamp(integ+dt*e+(u-raw)*dt/(ki*.1),-.5,.5); end
     else
         if ~isempty(o.fixed_regime), ai=o.fixed_regime; conf=1.; end
@@ -224,6 +231,7 @@ for k=1:n
         end
         ci=conf; if ~o.conf_gate, ci=1.; end
         mai=ai; if age(k)>P.cfg.outer_timeout_s, mai=4; ci=0.; end
+        if c.t(k)>=o.corrupt_slow_at, ci=NaN; end
         residual=res; if ~o.ood_gate, residual=0.; end
         input=single([mai,ci,age(k),residual,ym,yd,r,rd,uff]);
         [core,result]=core_step(core,cfg,tune,input);
@@ -292,18 +300,29 @@ st=struct('u_applied',single(0),'u_target',single(0),'integ',zeros(4,1,'single')
 end
 
 function [st,out]=core_step(st,c,t,in)
-bad=any(~isfinite(in)) || any(abs(in)>single(3e38)) || in(1)<1 || in(1)>4 || ...
-    in(2)<0 || in(2)>1 || in(3)<0 || in(4)<0;
+bad=any(~isfinite(in(4:9))) || any(abs(in(4:9))>single(3e38)) || in(4)<0;
+mailbox_bad=any(~isfinite(in(1:3))) || any(abs(in(1:3))>single(3e38)) || ...
+    in(1)<1 || in(1)>4 || in(2)<0 || in(2)>1 || in(3)<0;
 fields={'dt_s','outer_timeout_s','max_physics_residual','residual_clear_ratio', ...
  'min_ai_confidence','confidence_clear_ratio','state_safety_limit','safety_trip_ratio', ...
  'safety_clear_ratio','safety_predict_s','u_max','u_slew_max_per_s','blend_alpha','integ_limit','windup_tau_s'};
 values=[t(:);c.kp;c.kd;c.ki;c.ff_scale;zeros(numel(fields),1,'single')];
 for j=1:numel(fields), values(19+j)=c.(fields{j}); end
 bad=bad || any(~isfinite(values)) || any(abs(values)>single(3e38));
+bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
+    c.state_safety_limit<=0 || c.u_max<=0 || c.u_slew_max_per_s<=0 || ...
+    c.blend_alpha<=0 || c.blend_alpha>1 || c.integ_limit<0 || c.windup_tau_s<0 || ...
+    c.safety_predict_s<0 || c.residual_clear_ratio<0 || c.residual_clear_ratio>1 || ...
+    c.min_ai_confidence<0 || c.min_ai_confidence>1 || ...
+    c.confidence_clear_ratio<c.min_ai_confidence || c.confidence_clear_ratio>1 || ...
+    c.safety_trip_ratio<=0 || c.safety_trip_ratio>1 || c.safety_clear_ratio<0 || ...
+    c.safety_clear_ratio>c.safety_trip_ratio || any(t<single(.1)) || ...
+    t(1)>4 || t(2)>4 || t(3)>1;
 if bad
     st.fault=bitor(st.fault,uint32(16)); st.recovery=double(c.ood_recovery_cooldown_ticks);
-    out=[double(st.u_applied),double(st.u_target),1,st.regime,double(st.blend),double(st.fault)]; return;
+    out=[double(st.u_applied),double(st.u_target),1,st.regime,double(st.blend),double(st.fault),1]; return;
 end
+if mailbox_bad, st.fault=bitor(st.fault,uint32(16)); end
 dt=abs(c.dt_s); du=abs(c.u_slew_max_per_s)*dt;
 limit=abs(c.state_safety_limit*t(3)); xa=abs(in(5)); pred=xa+abs(c.safety_predict_s)*abs(in(6));
 if st.safety
@@ -317,12 +336,13 @@ elseif abs(in(4))>c.max_physics_residual
     st.ood=true; st.fault=bitor(st.fault,uint32(2));
 end
 mailbox=1+(in(1)>=1.5)+(in(1)>=2.5)+(in(1)>=3.5);
-if in(2)<c.min_ai_confidence || in(1)>=3.5
+if mailbox_bad, mailbox=4; end
+if mailbox_bad || in(2)<c.min_ai_confidence || in(1)>=3.5
     st.conf=true; st.fault=bitor(st.fault,uint32(4));
 elseif in(2)>=c.confidence_clear_ratio && in(1)<3.5
     st.conf=false;
 end
-stale=in(3)>c.outer_timeout_s;
+stale=isfinite(in(3)) && abs(in(3))<=single(3e38) && in(3)>c.outer_timeout_s;
 if stale, st.fault=bitor(st.fault,uint32(1)); st.recovery=double(c.ood_recovery_cooldown_ticks); end
 old=st.regime;
 if st.safety, gate=4; reg=4;
@@ -344,7 +364,10 @@ end
 if st.safety || st.ood || st.conf, st.recovery=double(c.ood_recovery_cooldown_ticks); end
 if gate~=1
     e=in(7)-in(5); ed=in(8)-in(6);
-    bank=(c.kp*t(1))*e+(c.kd*t(2))*ed+(c.ki*t(1)).*st.integ+c.ff_scale*in(9);
+    bank=zeros(4,1,'single');
+    bank(1:3)=(c.kp(1:3)*t(1))*e+(c.kd(1:3)*t(2))*ed+ ...
+        (c.ki(1:3)*t(1)).*st.integ(1:3)+c.ff_scale(1:3)*in(9);
+    bank(4)=c.kp(4)*(-in(5))+c.kd(4)*(-in(6))+c.ki(4)*st.integ(4);
     if ~st.started, st.u_target=bank(reg); st.blend=single(1);
     else
         if reg~=old, st.blend=single(0); end
@@ -355,7 +378,9 @@ if gate~=1
     command=clamp(st.u_target,-abs(c.u_max),abs(c.u_max));
     command=clamp(command,st.u_applied-du,st.u_applied+du);
     for j=1:4
-        ki=c.ki(j)*t(1); next=st.integ(j)+e*dt;
+        if j==4, ki=c.ki(4); error=-in(5);
+        else, ki=c.ki(j)*t(1); error=e; end
+        next=st.integ(j)+error*dt;
         if ki~=0 && c.windup_tau_s>0
             next=next+(command-bank(j))*dt/(ki*c.windup_tau_s);
         end
@@ -365,7 +390,7 @@ if gate~=1
 end
 if reg~=old, st.dwell=0; else, st.dwell=st.dwell+1; end
 st.regime=reg;
-out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault)];
+out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault),double(mailbox_bad)];
 end
 
 function y=clamp(x,lo,hi)

@@ -38,13 +38,22 @@ The configuration bank fields `kp`, `kd`, `ki` and `ff_scale` each contain four 
 It returns three prototypes and three confidence parameters.
 Freeze these parameters, then call `auto_field_tune(evaluate, current)`.
 The trial callback returns `(measured_cost, valid)`; reject constraint violations.
+Include load/stiction and contact trials, contact-force limits, veto fraction and R4 occupancy.
 Invalid candidates cannot win, and an entirely invalid search returns the current knobs.
-The search adjusts gain and damping while retaining the commissioned safety-margin scale.
+The fixed six-trial grid is (0.75,1), (1,1), (1.25,1), (2,1), (1.25,0.5), (1.25,0.75)
+for gain/damping; every candidate retains the commissioned safety-margin scale.
+Gain/damping lie in [0.10,4.0], margin in [0.10,1.0]. R4 ignores these gain scalings,
+trajectory references and feedforward; it uses fixed feedback toward the safe zero.
 
 Frame age advances every tick from the source timestamp.
 On timeout the adapter sends R4 with zero confidence while retaining the real age.
 C's native HOLD retains an actuator command; the device fallback defines the desired physical behavior.
+Malformed slow mailbox fields run closed-loop R4 with `corrupted=1`; valid fast sensors remain active.
 Count safety violations from true/measured state, independently of gate activity.
+
+The template commissions three viscous-load classes from measured velocity changes and applied effort.
+Its smooth trajectory starts at rest. PASS requires zero state-envelope violations, zero abnormal
+gate/R4/corruption ticks and RMSE below 0.02 state units; the frozen classifier also serves field tuning.
 
 ## Benchmark contract
 
@@ -55,6 +64,10 @@ The physical fixture combines Karnopp friction, unit drift, moving unilateral co
 white measurement noise and a passive variable-frequency flexible mode.
 The benchmark regenerates its training samples and classifier archive deterministically.
 It reports the four-stage metrics, mode ablations, frozen-AI tuning and action-sample efficiency.
+Per branch/unit, six full 40 s candidate missions provide 240 s of search trajectories;
+independent validation uses two 6 s S2 runs plus a 40 s mission, totaling 52 s.
+Search candidates must have zero breaches, nominal tracking and acceptable normal-stage contact
+force, veto fraction and R4 occupancy. Host simulation time is reported separately from trajectory time.
 The deployment path reads measured features; stage labels are confined to plant generation and scoring.
 
 Porting order, multi-axis ownership and timeout behavior are specified in

@@ -22,6 +22,7 @@ fixture into a process model, robot digital twin or physiological model.
 | `FieldTuning_t` | Gain, damping and commissioned safety-margin scales |
 
 Define the actuator mapping, state envelope, slew bounds and fallback objective together.
+Express the commissioned fallback point as state zero for the fixed R4 law.
 Nominal-model mismatch informs the probe; the classifier cannot redefine that evidence.
 Choose dimensionless macro-features from measured signals and commission their scales.
 No deployed mode decision may use benchmark stage labels or scheduled fault times.
@@ -58,12 +59,16 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 The callback returns measured cost and constraint validity. Invalid candidates are rejected;
 if all candidates are invalid, the current knobs remain in use.
+Evaluate both load/stiction and contact behavior; constrain force, veto fraction and R4 occupancy.
 Keep the safety-margin scale fixed during automated gain/damping searches.
+Gain/damping are bounded to [0.10,4.0] and margin to [0.10,1.0].
 A new unit within the same interface can retain the semantic archive.
 A new physical domain starts with a new interface and commissioning archive.
 
 每次候选试验返回实测误差与约束是否满足；不合格候选不能被选中，
 全部不合格时保留当前旋钮。自动增益／阻尼搜索保持已确定的安全裕度不变。
+试验覆盖重载静摩擦与接触工况，同时限制接触力、否决率和 R4 占比。
+增益／阻尼范围为 [0.10,4.0]，安全裕度范围为 [0.10,1.0]。
 同场景换机台可冻结语义档案，全新物理领域先建立新接口与标定档案。
 
 ## Multi-axis and timeout / 多轴与超时
@@ -75,6 +80,8 @@ The core remains a single-axis API.
 
 On a stale frame, preserve actual age and send explicit R4 abstention.
 This lets deterministic fallback run while the latency fault remains observable.
+Malformed slow fields also select closed-loop R4, preserving envelope/residual priority.
+R4 uses fixed gains, zero-state error and no feedforward, independent of field tuning.
 Native C HOLD preserves the applied command; its physical effect depends on the device.
 Restore normal decisions only after fresh frames satisfy the recovery conditions.
 
@@ -82,6 +89,8 @@ Restore normal decisions only after fresh frames satisfy the recovery conditions
 只有单位和控制定义相同的通道才能共享只读配置。
 适配层处理耦合约束与协调回退，C API 保持单轴形式。
 超时后保留真实帧龄并显式发送 R4；新鲜帧经过恢复条件后才重新启用正常模态。
+慢环字段损坏也进入闭环 R4，保留包络与残差优先级。
+R4 固定增益、零状态参考和零前馈，不受现场增益旋钮缩放。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence and the scope statement are maintained in

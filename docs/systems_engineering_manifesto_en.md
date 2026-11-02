@@ -36,6 +36,8 @@ Every tick's magnitude and slew limits belong to the actuator contract.
 Safe fallback is an explicit control regime. Its reference behavior, damping and feedforward
 permissions must be defined for the target device. Holding the previous actuator command is a
 different behavior from holding a mechanical position or a physiological state.
+The core's R4 returns toward a commissioned safe zero with fixed gains and no feedforward.
+Corrupt slow decisions select that closed-loop law while valid fast measurements remain active.
 
 ## Adaptation belongs to identifiable physical parameters
 
@@ -43,6 +45,7 @@ A new device can preserve the semantic regime definition while changing quantita
 Small-sample calibration establishes the regime prototypes and confidence thresholds.
 Subsequent field tuning freezes that archive and searches bounded gain and damping adjustments
 under the same deterministic safety controls.
+Trial acceptance jointly constrains load/stiction error, contact force and fallback occupancy.
 
 This separation makes commissioning evidence readable: the record shows which physical knobs
 changed, what trial constraints were checked and how tracking changed.

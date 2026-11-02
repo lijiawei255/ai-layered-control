@@ -15,7 +15,7 @@
  *     LayeredState_t, so several instances can run side by side.
  *
  * One step, in this order:
- *   0. input firewall             reject NaN/Inf/out-of-range IPC frames
+ *   0. split firewall             fast corruption holds; bad mailbox runs R4
  *   1. safety envelope veto       sticky, latches ENVELOPE_BREACH
  *   2. OOD residual veto          sticky, latches OOD_RESIDUAL
  *   3. confidence / abstention    sticky latch, latches LOW_CONFIDENCE
@@ -86,6 +86,21 @@ static int lg_settings_are_corrupt(const LayeredConfig_t *c, const FieldTuning_t
             return 1;
         }
     }
+    if (c->dt_s <= 0.0f || c->outer_timeout_s <= 0.0f ||
+        c->max_physics_residual <= 0.0f || c->state_safety_limit <= 0.0f ||
+        c->u_max <= 0.0f || c->u_slew_max_per_s <= 0.0f ||
+        c->blend_alpha <= 0.0f || c->blend_alpha > 1.0f ||
+        c->integ_limit < 0.0f || c->windup_tau_s < 0.0f || c->safety_predict_s < 0.0f ||
+        c->residual_clear_ratio < 0.0f || c->residual_clear_ratio > 1.0f ||
+        c->min_ai_confidence < 0.0f || c->min_ai_confidence > 1.0f ||
+        c->confidence_clear_ratio < c->min_ai_confidence || c->confidence_clear_ratio > 1.0f ||
+        c->safety_trip_ratio <= 0.0f || c->safety_trip_ratio > 1.0f ||
+        c->safety_clear_ratio < 0.0f || c->safety_clear_ratio > c->safety_trip_ratio ||
+        t->gain_scale < 0.10f || t->gain_scale > 4.0f ||
+        t->damping_scale < 0.10f || t->damping_scale > 4.0f ||
+        t->safety_margin_scale < 0.10f || t->safety_margin_scale > 1.0f) {
+        return 1;
+    }
     return 0;
 }
 
@@ -118,15 +133,12 @@ static int lg_mailbox_abstains(float ai_regime)
 /* Input firewall                                                            */
 /* ========================================================================= */
 
-/* A frame is corrupt when any field is NaN/Inf or outside its contract range.
- * Called before ANY persistent state is touched, so a corrupt frame can never
- * poison an integrator. */
-static int lg_frame_is_corrupt(const LayeredInput_t *input)
+/* Fast measurements must remain usable before any controller can execute.
+ * Signed state, reference and actuator quantities are valid; residual is
+ * the only nonnegative fast input. */
+static int lg_fast_input_is_corrupt(const LayeredInput_t *input)
 {
-    if (!lg_is_finite(input->ai_regime) ||
-        !lg_is_finite(input->ai_confidence) ||
-        !lg_is_finite(input->outer_age_s) ||
-        !lg_is_finite(input->physics_residual) ||
+    if (!lg_is_finite(input->physics_residual) ||
         !lg_is_finite(input->x) ||
         !lg_is_finite(input->x_dot) ||
         !lg_is_finite(input->r) ||
@@ -134,13 +146,21 @@ static int lg_frame_is_corrupt(const LayeredInput_t *input)
         !lg_is_finite(input->u_ff)) {
         return 1;
     }
+    return input->physics_residual < 0.0f;
+}
+
+/* Slow mailbox corruption requests closed-loop fallback, never a hold. */
+static int lg_mailbox_is_corrupt(const LayeredInput_t *input)
+{
+    if (!lg_is_finite(input->ai_regime) ||
+        !lg_is_finite(input->ai_confidence) ||
+        !lg_is_finite(input->outer_age_s)) {
+        return 1;
+    }
     if (input->ai_regime < 1.0f || input->ai_regime > 4.0f) {
         return 1;
     }
     if (input->ai_confidence < 0.0f || input->ai_confidence > 1.0f) {
-        return 1;
-    }
-    if (input->physics_residual < 0.0f) {
         return 1;
     }
     if (input->outer_age_s < 0.0f) {
@@ -153,12 +173,11 @@ static int lg_frame_is_corrupt(const LayeredInput_t *input)
 /* Controller bank helpers                                                   */
 /* ========================================================================= */
 
-/* u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + u_ff, with the two
+/* Normal banks: kp[i]*e + kd[i]*ed + ki[i]*integ[i] + ff_scale[i]*u_ff, with the two
  * field-tuning knobs applied to the gains (gain_scale scales P and I,
  * damping_scale D).  u_ff is the deterministic white-box feedforward produced
- * by the commissioning model / trajectory generator; it is added to EVERY bank
- * controller (and therefore to every back-calculation term) so that the
- * "inactive controller tracks the applied command" identity still holds. */
+ * by the commissioning model / trajectory generator. R4 has its own zero-state
+ * error, fixed gains and no feedforward; its integral tracks that same law. */
 static float lg_pid_output(const LayeredConfig_t *config,
                            const FieldTuning_t *tuning,
                            int bank,
@@ -167,6 +186,9 @@ static float lg_pid_output(const LayeredConfig_t *config,
                            float integ,
                            float u_ff)
 {
+    if (bank == 3) {
+        return config->kp[3] * e + config->kd[3] * ed + config->ki[3] * integ;
+    }
     return (config->kp[bank] * tuning->gain_scale) * e
          + (config->kd[bank] * tuning->damping_scale) * ed
          + (config->ki[bank] * tuning->gain_scale) * integ
@@ -269,6 +291,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     int veto_active;
     int do_control;
     int bank;
+    int mailbox_corrupt;
     layered_gate_state_t gate;
     layered_regime_t regime;
     layered_regime_t mailbox_regime;
@@ -294,13 +317,13 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     }
 
     /* ---------------- 0. INPUT FIREWALL -------------------------------- */
-    /* Nothing below this block runs for a corrupt frame: no integrator, no
+    /* Invalid fast inputs/settings stop here: no integrator, no
      * latch, no blend, no dwell counter is touched. The applied command
      * remains unchanged and the sticky NAN_CORRUPTION bit
      * records that this IPC frame must be investigated.  The recovery
      * cooldown is re-armed because a corrupt frame is not a clean sample; it
      * must never count towards "consecutive clean ticks". */
-    if (lg_frame_is_corrupt(input) || lg_settings_are_corrupt(config, tuning)) {
+    if (lg_fast_input_is_corrupt(input) || lg_settings_are_corrupt(config, tuning)) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
         state->corrupted_frame_count++;
         state->recovery_ticks = config->ood_recovery_cooldown_ticks;
@@ -314,6 +337,11 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         out.fault_audit_bitmask = state->fault_audit_bitmask;
         out.corrupted = 1;
         return out;
+    }
+    mailbox_corrupt = lg_mailbox_is_corrupt(input);
+    if (mailbox_corrupt) {
+        state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
+        state->corrupted_frame_count++;
     }
 
     snap = (state->control_started == 0);
@@ -366,8 +394,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
      *   - in between the previous decision is kept (hysteresis).
      * confidence_clear_ratio must therefore be chosen above min_ai_confidence,
      * e.g. min 0.45 / clear 0.55. */
-    mailbox_regime = lg_mailbox_regime(input->ai_regime);
-    if (input->ai_confidence < config->min_ai_confidence ||
+    mailbox_regime = mailbox_corrupt ? REGIME_SAFE_FALLBACK : lg_mailbox_regime(input->ai_regime);
+    if (mailbox_corrupt || input->ai_confidence < config->min_ai_confidence ||
         lg_mailbox_abstains(input->ai_regime) != 0) {
         state->conf_latched = 1;
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LOW_CONFIDENCE;
@@ -383,7 +411,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     }
 
     /* ---------------- 4. heartbeat watchdog ----------------------------- */
-    latency_hold = (input->outer_age_s > config->outer_timeout_s);
+    latency_hold = lg_is_finite(input->outer_age_s) &&
+                   (input->outer_age_s > config->outer_timeout_s);
     if (latency_hold) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LATENCY_TIMEOUT;
 
@@ -452,11 +481,11 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
 
         /* The whole bank is evaluated every tick at a fixed cost: the inactive
          * controllers need their own u_pid for the tracking anti-windup.  The
-         * deterministic feedforward enters every bank identically. */
+         * normal banks use scaled nominal feedforward; R4 returns to zero. */
         u_pid0 = lg_pid_output(config, tuning, 0, e, ed, state->integ[0], input->u_ff);
         u_pid1 = lg_pid_output(config, tuning, 1, e, ed, state->integ[1], input->u_ff);
         u_pid2 = lg_pid_output(config, tuning, 2, e, ed, state->integ[2], input->u_ff);
-        u_pid3 = lg_pid_output(config, tuning, 3, e, ed, state->integ[3], input->u_ff);
+        u_pid3 = lg_pid_output(config, tuning, 3, -input->x, -input->x_dot, state->integ[3], 0.0f);
 
         bank = (int)regime - 1;
         if (bank < 0) {
@@ -512,8 +541,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
                      config->ki[2] * tuning->gain_scale,
                      e, dt_eff, u_pid2, u_cmd, windup_tau, integ_limit);
         lg_integrate(&state->integ[3],
-                     config->ki[3] * tuning->gain_scale,
-                     e, dt_eff, u_pid3, u_cmd, windup_tau, integ_limit);
+                     config->ki[3],
+                     -input->x, dt_eff, u_pid3, u_cmd, windup_tau, integ_limit);
 
         state->u_applied = u_cmd;
         state->control_started = 1;
@@ -541,7 +570,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     out.gate = gate;
     out.regime = regime;
     out.fault_audit_bitmask = state->fault_audit_bitmask;
-    out.corrupted = 0;
+    out.corrupted = mailbox_corrupt;
 
     state->step_count++;
     return out;

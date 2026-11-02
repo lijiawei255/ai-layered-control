@@ -13,18 +13,18 @@
  *     beyond -std=c99 -pedantic -Wall -Wextra ;
  *   - fixed, statically-sized state (LayeredState_t), safe for 1 kHz ISRs;
  *   - sticky black-box fault audit bitmask for post-incident forensics
- *     (a defensive-programming structure reference for later engineering work).
+ *     with explicit gate decisions.
  *
  * Architecture (see README.md for the full picture):
  *
  *   slow outer loop (10 Hz, any Linux/Android/edge accelerator)
  *        |  mailbox: regime in {1,2,3}, confidence in [0,1], heartbeat
  *        v
- *   THIS MODULE (1 kHz, deterministic, ~1.5 kB of RAM)
- *        - NaN/Inf/corrupted-IPC firewall (reject frame, hold actuator)
+ *   THIS MODULE (1 kHz, deterministic, 88 B state + 132 B config + 12 B tuning)
+ *        - fast-input firewall; corrupt slow mailboxes request closed-loop R4
  *        - heartbeat watchdog: survives 10 Hz jitter / dropped frames
  *        - physics-residual + confidence veto: explicit ABSTENTION
- *        - hard safety-envelope veto: cannot command unsafe states
+ *        - predictive state-envelope veto: selects fixed-gain R4
  *        - anti-chatter minimum dwell time on normal regime transitions
  *        - post-fault recovery cooldown before AI is re-armed
  *        - controller bank with per-controller anti-windup and bumpless
@@ -50,10 +50,10 @@ extern "C" {
 /* Discrete operating regimes produced by the slow coarse classifier.        */
 /* ------------------------------------------------------------------------- */
 typedef enum {
-    REGIME_NOMINAL            = 1, /* factory-nominal plant / patient          */
-    REGIME_HIGH_LOAD_DAMPED   = 2, /* +35 % inertia / impedance drift: damp    */
-    REGIME_BOUNDARY_COMPLIANT = 3, /* non-smooth friction / contact boundary   */
-    REGIME_SAFE_FALLBACK      = 4  /* deliberate abstention: safe regulator    */
+    REGIME_NOMINAL            = 1, /* nominal tracking                        */
+    REGIME_HIGH_LOAD_DAMPED   = 2, /* high load / static-friction rejection    */
+    REGIME_BOUNDARY_COMPLIANT = 3, /* compliant unilateral contact            */
+    REGIME_SAFE_FALLBACK      = 4  /* fixed-gain return toward the safe zero   */
 } layered_regime_t;
 
 /* ------------------------------------------------------------------------- */
@@ -63,8 +63,8 @@ typedef enum {
 /* ------------------------------------------------------------------------- */
 typedef enum {
     GATE_NORMAL                = 0, /* AI regime accepted, bank-controller on  */
-    GATE_HOLD_LATENCY          = 1, /* outer heartbeat stale: hold actuator    */
-    GATE_VETO_OOD_RESIDUAL     = 2, /* |y - y_hat| too large: ABSTAIN (OOD)    */
+    GATE_HOLD_LATENCY          = 1, /* stale heartbeat or unusable fast input  */
+    GATE_VETO_OOD_RESIDUAL     = 2, /* physics innovation too large: ABSTAIN    */
     GATE_VETO_LOW_CONFIDENCE   = 3, /* AI self-confidence too low: ABSTAIN     */
     GATE_VETO_SAFETY_ENVELOPE  = 4  /* state at/approaching hard safety limit  */
 } layered_gate_state_t;
@@ -82,19 +82,22 @@ typedef enum {
 
 /* ------------------------------------------------------------------------- */
 /* On-site field calibration: the ONLY three numbers a technician touches    */
-/* when the same firmware is moved to a new machine / new patient.  There is */
+/* when the same firmware is moved to a new device. There is                 */
 /* no retraining and no dataset upload -- the AI stays frozen.               */
 /* ------------------------------------------------------------------------- */
 typedef struct {
-    float gain_scale;          /* scales all P/I gains;   1.0 = factory nominal */
-    float damping_scale;       /* scales all D gains;     1.0 = factory nominal */
-    float safety_margin_scale; /* scales the safety limit; 1.0 = factory nominal */
+    float gain_scale;          /* normal-bank P/I scale, [0.10, 4.0]           */
+    float damping_scale;       /* normal-bank D scale, [0.10, 4.0]             */
+    float safety_margin_scale; /* tightens the state envelope, [0.10, 1.0]     */
 } FieldTuning_t;
 
 #define LAYERED_NUM_REGIMES 4
 
 /* ------------------------------------------------------------------------- */
-/* Deployment constants of the deterministic core (set once at boot).        */
+/* Deployment constants (set once at boot). Positive: dt, timeout, residual   */
+/* and state limits, magnitude, slew. Nonnegative: integral bound, anti-windup */
+/* time and prediction horizon. Ratios: 0 <= safety_clear <= safety_trip <= 1, */
+/* safety_trip > 0; residual_clear in [0,1]; 0 <= confidence_trip <= clear <= 1.*/
 /* ------------------------------------------------------------------------- */
 typedef struct {
     float dt_s;                 /* inner-loop period, 0.001 s = 1 kHz          */
@@ -115,7 +118,7 @@ typedef struct {
 
     float u_max;                /* hard actuator magnitude limit               */
     float u_slew_max_per_s;     /* hard actuator slew-rate limit               */
-    float blend_alpha;          /* per-step bumpless transfer coefficient, 0..1*/
+    float blend_alpha;          /* per-step transfer coefficient, (0,1]        */
     float integ_limit;          /* absolute clamp on every integral state      */
     float windup_tau_s;         /* tracking anti-windup time constant          */
 
@@ -125,8 +128,8 @@ typedef struct {
     float kp[LAYERED_NUM_REGIMES]; /* controller bank: index = regime - 1      */
     float kd[LAYERED_NUM_REGIMES];
     float ki[LAYERED_NUM_REGIMES];
-    float ff_scale[LAYERED_NUM_REGIMES]; /* per-bank gain on the deterministic  */
-                                         /* feedforward u_ff (1.0 = as supplied) */
+    float ff_scale[LAYERED_NUM_REGIMES]; /* normal-bank feedforward scaling;    */
+                                         /* index 3 is reserved, R4 ignores it  */
 } LayeredConfig_t;
 
 /* ------------------------------------------------------------------------- */
@@ -156,7 +159,7 @@ typedef struct {
     layered_regime_t regime;     /* regime actually used by the controller bank */
     float blend;                 /* bumpless-transfer progress in [0,1]         */
     uint32_t fault_audit_bitmask;/* sticky snapshot of all root-cause flags     */
-    int corrupted;               /* 1 = this frame was rejected by the firewall */
+    int corrupted;               /* 1 = invalid fast input/settings or mailbox */
 } LayeredOutput_t;
 
 /* ------------------------------------------------------------------------- */
@@ -200,17 +203,16 @@ void Layered_Init(LayeredState_t *state,
  * The function is O(1): fixed-size checks and controller arithmetic, no
  * allocation, no library calls.
  *
- * 0. INPUT FIREWALL (executed before any controller state is touched)
- *    Any non-finite input, configuration or tuning value (NaN/Inf), or
- *    out-of-range enum (ai_regime outside
- *    [1,4], confidence outside [0,1], negative residual/age) is rejected:
- *      - LAYERED_FAULT_BIT_NAN_CORRUPTION is latched,
- *      - corrupted_frame_count is incremented,
- *      - controller state / integrators / dwell counter / latches are NOT
- *        updated and the last applied command is held (fail-safe hold),
- *      - the recovery cooldown IS re-armed: a corrupt frame is not a clean
- *        sample, so it cannot count towards the configured clean cooldown,
- *      - the output is flagged corrupted = 1.
+ * 0. SPLIT INPUT FIREWALL
+ *    Invalid configuration/tuning or nonfinite fast inputs (x, x_dot, r,
+ *    r_dot, u_ff, physics_residual) hold the last command without advancing
+ *    controller state. Negative residual is invalid; signed state/reference
+ *    and command quantities are valid.
+ *    Invalid slow mailbox fields (nonfinite values, regime outside [1,4],
+ *    confidence outside [0,1], negative age) force explicit R4 abstention.
+ *    Valid sensors still run the fast closed loop, including envelope/OOD
+ *    priority. Both paths set corrupted=1, latch NAN_CORRUPTION, increment
+ *    corrupted_frame_count and re-arm recovery cooldown.
  *    ai_regime == 4 is *not* corruption: it is an explicit AI abstention and
  *    is handled as GATE_VETO_LOW_CONFIDENCE.
  *
@@ -243,8 +245,7 @@ void Layered_Init(LayeredState_t *state,
  *    stops 1->2->1->2 mode ping-ponging on a noisy boundary.
  *
  * 3. POST-FAULT RECOVERY COOLDOWN
- *    Whenever the gate is not GATE_NORMAL - any veto, a latency hold, or a
- *    corrupt frame - the core runs/reports the safe fallback and re-arms
+ *    Any veto, native latency hold or corrupt frame re-arms
  *    ood_recovery_cooldown_ticks.  After the fault clears the core keeps
  *    REGIME_SAFE_FALLBACK (gate GATE_NORMAL, no veto) until that many
  *    CONSECUTIVE clean samples have elapsed; only then is the AI regime
@@ -252,8 +253,11 @@ void Layered_Init(LayeredState_t *state,
  *
  * 4. CONTROLLER BANK + ANTI-WINDUP + BUMPLESS TRANSFER
  *    u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + ff_scale[i]*u_ff
- *    (i = regime-1; i = 3 for the safety fallback; gains scaled by
- *    FieldTuning_t).  u_ff is the deterministic feedforward command produced
+ *    for normal banks i=0..2, with gains scaled by FieldTuning_t.
+ *    R4 uses kp[3]*(-x) + kd[3]*(-x_dot) + ki[3]*integ[3], fixed gains,
+ *    zero reference and no feedforward. Its anti-windup uses that same law
+ *    and error -x. The field knobs never scale R4 gains.
+ *    u_ff is the deterministic feedforward command produced
  *    by the commissioning model / trajectory generator, so the plant-inverse
  *    term stays white-box and is never produced by the AI.  ff_scale[i] is a
  *    per-bank commissioned gain on that same white-box term; it is not an AI

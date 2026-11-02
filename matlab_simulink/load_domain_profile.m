@@ -18,7 +18,7 @@ P.cfg = struct('dt_s',.001,'outer_timeout_s',.35, ...
     'kp',[60;110;8;2],'kd',[1.2;1.5;.8;.35], ...
     'ki',[60;300;2;0],'ff_scale',[1;1;1;0]);
 P.baseline = [110,1.5,300]; % Kp, Kd, Ki; no transfer smoothing.
-P.feature_scales = [.5,20,.006,.005];
+P.feature_scales = [.5,20,.006];
 P.classifier = []; P.policy = [];
 P.units = struct('state','rad','input','N m','contact','N');
 % Each application supplies its own measured states and actuator mapping.

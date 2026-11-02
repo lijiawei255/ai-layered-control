@@ -20,7 +20,6 @@
  *   stage 6   anti-chatter dwell, recovery cooldown, sticky fault audit bits
  *   stage 7   NaN/Inf/out-of-range IPC firewall
  *   stage 8   tracking anti-windup across a saturated bank switch
- *   stage 9   global invariants: |u|, slew rate, no NaN, step count
  * ---------------------------------------------------------------------------
  */
 
@@ -1011,13 +1010,13 @@ static void test_firewall(void)
         bad = good;
         switch (i) {
         case 0:
-            bad.ai_confidence = make_nan();
+            bad.x_dot = make_nan();
             break;
         case 1:
             bad.physics_residual = make_inf();
             break;
         case 2:
-            bad.ai_regime = 99.0f;
+            bad.r_dot = make_inf();
             break;
         case 3:
             bad.x = make_nan();
@@ -1408,12 +1407,11 @@ static void test_feedforward(void)
           "stage 10 feedforward: |u| stays inside u_max=%.2f for every feedforward level (%.5f / %.5f / %.5f)",
           (double)cfg.u_max, (double)u_no_ff, (double)u_ff_small, (double)u_ff_big);
 
-    /* The bank equations really add u_ff to EVERY controller, otherwise the
-     * "inactive controllers track the applied command" identity breaks. */
+    /* Normal-bank anti-windup includes the deterministic feedforward. */
     /* the scenario keeps r == x, so both tracking errors are exactly zero */
     e = 0.0f;
     ed = 0.0f;
-    for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
+    for (i = 0; i < 3; ++i) {
         float u_pid = (cfg.kp[i] * tun.gain_scale) * e +
                       (cfg.kd[i] * tun.damping_scale) * ed +
                       (cfg.ki[i] * tun.gain_scale) * st.integ[i] +
@@ -1423,7 +1421,7 @@ static void test_feedforward(void)
         }
     }
     check(track_ok != 0,
-          "stage 10 feedforward: all 4 bank outputs (each including u_ff) track the applied command within 0.05");
+          "stage 10 feedforward: normal bank outputs include u_ff and track the applied command within 0.05");
     check(inv.violations == 0,
           "stage 10 feedforward: the actuator invariants hold with feedforward enabled");
 }
@@ -1555,8 +1553,9 @@ static void test_first_control_step(void)
           "stage 12 first step: a corrupt first frame is rejected and does not consume the snap");
 
     out = step_checked(&inv, &st, &cfg, &tun, &in);
-    check(out.blend == 1.0f && st.control_started == 1 && out.u > 0.0f,
-          "stage 12 first step: the first clean control step snaps blend to 1 (u=%.6f)",
+    check(out.blend == 1.0f && st.control_started == 1 && out.u == 0.0f &&
+          out.regime == REGIME_SAFE_FALLBACK,
+          "stage 12 first step: the first clean tick snaps to zero-state R4 during recovery (u=%.6f)",
           (double)out.u);
 
     /* A normal first frame also snaps. */
@@ -1765,6 +1764,178 @@ static void test_settings_and_clamp(void)
           "NaN recovery: normal arithmetic restores a finite positive target and command");
 }
 
+/* Slow mailbox faults retain fast feedback and safety priority. */
+static void test_mailbox_fallback(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    LayeredInput_t good = {1.0f, 0.95f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 5.0f, 100.0f};
+    LayeredInput_t in;
+    LayeredOutput_t out;
+    int i, k, accepted = 0, continuous = 0, cooldown = 0;
+    float peak, velocity;
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    for (i = 0; i < 12; ++i) {
+        in = good;
+        switch (i) {
+        case 0: in.ai_regime = make_nan(); break;
+        case 1: in.ai_regime = make_inf(); break;
+        case 2: in.ai_regime = 0.0f; break;
+        case 3: in.ai_regime = 5.0f; break;
+        case 4: in.ai_confidence = make_nan(); break;
+        case 5: in.ai_confidence = make_inf(); break;
+        case 6: in.ai_confidence = -0.1f; break;
+        case 7: in.ai_confidence = 1.1f; break;
+        case 8: in.outer_age_s = make_nan(); break;
+        case 9: in.outer_age_s = make_inf(); break;
+        case 10: in.outer_age_s = -0.1f; break;
+        default: in.ai_regime = -make_inf(); break;
+        }
+        Layered_Init(&st, &cfg, &tun);
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        accepted += out.corrupted && out.regime == REGIME_SAFE_FALLBACK &&
+            out.gate == GATE_VETO_LOW_CONFIDENCE && out.u < 0.0f &&
+            st.corrupted_frame_count == 1u &&
+            (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0u;
+        for (k = 0; k < 20; ++k) out = Layered_Step(&st, &cfg, &tun, &in);
+        continuous += st.step_count == 21u && st.corrupted_frame_count == 21u &&
+            out.u < 0.0f && st.integ[3] < 0.0f &&
+            st.recovery_ticks == cfg.ood_recovery_cooldown_ticks;
+    }
+    check(accepted == 12, "mailbox firewall: all malformed slow fields enter R4 with valid feedback");
+    check(continuous == 12, "mailbox firewall: repeated faults keep integrating R4 and re-arm cooldown");
+    in = good; in.ai_confidence = make_nan(); in.x = 1.1f;
+    Layered_Init(&st, &cfg, &tun);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted && out.gate == GATE_VETO_SAFETY_ENVELOPE && out.u < 0.0f,
+          "mailbox firewall: envelope priority survives corrupt AI and an outward reference");
+    in.x = good.x; in.physics_residual = 2.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted && out.gate == GATE_VETO_OOD_RESIDUAL && out.u < 0.0f,
+          "mailbox firewall: independent OOD priority survives corrupt AI");
+    in = good; in.ai_regime = 3.0f;
+    for (k = 0; k < (int)cfg.ood_recovery_cooldown_ticks; ++k) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        cooldown += out.regime == REGIME_SAFE_FALLBACK && out.gate == GATE_NORMAL && !out.corrupted;
+    }
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(cooldown == (int)cfg.ood_recovery_cooldown_ticks &&
+          out.regime == REGIME_BOUNDARY_COMPLIANT && out.gate == GATE_NORMAL,
+          "mailbox firewall: normal R3 resumes only after the full clean cooldown");
+    cfg.ki[3] = 0.0f;
+    in = good; in.ai_confidence = make_nan(); in.x = 0.4f; in.x_dot = 0.0f;
+    Layered_Init(&st, &cfg, &tun);
+    st.control_started = 1; st.u_applied = 1.34f; st.u_target = 1.34f;
+    peak = in.x; velocity = 0.0f;
+    for (k = 0; k < 5000; ++k) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        velocity += cfg.dt_s * (out.u - 0.2f * velocity) / 0.1f;
+        in.x += cfg.dt_s * velocity; in.x_dot = velocity;
+        if (t_absf(in.x) > peak) peak = t_absf(in.x);
+    }
+    check(peak < 1.0f && t_absf(in.x) < 0.4f && out.corrupted && st.step_count == 5000u,
+          "mailbox firewall: persistent NaN AI retains a bounded closed-loop return (peak=%.4f)",
+          (double)peak);
+}
+
+/* Physical-domain settings bounds and unchanged binary layout. */
+static void test_settings_bounds(void)
+{
+    LayeredConfig_t cfg, valid;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, -0.02f, -0.03f, -0.05f, -0.01f, -0.01f};
+    LayeredOutput_t out;
+    float *knobs[3];
+    float upper[3] = {4.0f, 4.0f, 1.0f};
+    int rejected = 0, bounds = 0, i, j;
+    build_config(&valid); cfg = valid;
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+#define BAD_SETTING(name, value) do { cfg = valid; cfg.name = (value); \
+    Layered_Init(&st, &cfg, &tun); out = Layered_Step(&st, &cfg, &tun, &in); \
+    rejected += out.corrupted && out.gate == GATE_HOLD_LATENCY; } while (0)
+    BAD_SETTING(dt_s, 0.0f); BAD_SETTING(dt_s, -0.001f);
+    BAD_SETTING(outer_timeout_s, 0.0f); BAD_SETTING(max_physics_residual, 0.0f);
+    BAD_SETTING(state_safety_limit, 0.0f); BAD_SETTING(u_max, 0.0f);
+    BAD_SETTING(u_slew_max_per_s, 0.0f); BAD_SETTING(blend_alpha, 0.0f);
+    BAD_SETTING(blend_alpha, 1.01f); BAD_SETTING(integ_limit, -1.0f);
+    BAD_SETTING(windup_tau_s, -1.0f); BAD_SETTING(safety_predict_s, -1.0f);
+    BAD_SETTING(residual_clear_ratio, -0.01f); BAD_SETTING(residual_clear_ratio, 1.01f);
+    BAD_SETTING(min_ai_confidence, -0.01f); BAD_SETTING(min_ai_confidence, 1.01f);
+    BAD_SETTING(confidence_clear_ratio, 0.44f); BAD_SETTING(confidence_clear_ratio, 1.01f);
+    BAD_SETTING(safety_trip_ratio, 0.0f); BAD_SETTING(safety_trip_ratio, 1.01f);
+    BAD_SETTING(safety_clear_ratio, -0.01f); BAD_SETTING(safety_clear_ratio, 0.91f);
+#undef BAD_SETTING
+    check(rejected == 22, "settings domains: nonphysical timing, limits, smoothing and ratios are rejected");
+    cfg = valid;
+    knobs[0] = &tun.gain_scale; knobs[1] = &tun.damping_scale; knobs[2] = &tun.safety_margin_scale;
+    for (i = 0; i < 3; ++i) {
+        for (j = 0; j < 4; ++j) {
+            *knobs[i] = j == 0 ? 0.10f : j == 1 ? upper[i] : j == 2 ? 0.099f : upper[i] + 0.001f;
+            Layered_Init(&st, &cfg, &tun);
+            out = Layered_Step(&st, &cfg, &tun, &in);
+            bounds += (out.corrupted != 0) == (j >= 2);
+        }
+        *knobs[i] = 1.0f;
+    }
+    check(bounds == 12, "field knobs: gain/damping [0.10,4], margin [0.10,1] include endpoints only");
+    cfg.blend_alpha = 1.0f; cfg.residual_clear_ratio = 0.0f; cfg.integ_limit = 0.0f;
+    cfg.windup_tau_s = 0.0f; cfg.safety_predict_s = 0.0f; cfg.safety_clear_ratio = 0.0f;
+    cfg.safety_trip_ratio = 1.0f; cfg.min_ai_confidence = 0.0f; cfg.confidence_clear_ratio = 1.0f;
+    Layered_Init(&st, &cfg, &tun);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(!out.corrupted && out.gate == GATE_NORMAL,
+          "settings domains: allowed boundary settings and signed state/reference/feedforward are valid");
+    in.physics_residual = -0.01f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted && out.gate == GATE_HOLD_LATENCY,
+          "fast firewall: residual alone must be nonnegative");
+    check(sizeof(LayeredState_t) == 88 && sizeof(LayeredConfig_t) == 132 &&
+          sizeof(FieldTuning_t) == 12 && sizeof(LayeredInput_t) == 36 && sizeof(LayeredOutput_t) == 28,
+          "binary contract: state/config/tuning/input/output = 88/132/12/36/28 bytes");
+}
+
+static void test_safe_bank_and_r3(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t low, high;
+    LayeredState_t a, b;
+    LayeredInput_t ia = {4.0f, 1.0f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 10.0f, 100.0f};
+    LayeredInput_t ib;
+    LayeredOutput_t oa, ob;
+    float expected;
+    int k, same = 1;
+    build_config(&cfg);
+    build_tuning(&low, 0.10f, 0.10f, 1.0f); build_tuning(&high, 4.0f, 4.0f, 1.0f);
+    cfg.ff_scale[3] = 4.0f;
+    ib = ia; ib.r = -20.0f; ib.r_dot = -10.0f; ib.u_ff = -100.0f;
+    Layered_Init(&a, &cfg, &low); Layered_Init(&b, &cfg, &high);
+    for (k = 0; k < 100; ++k) {
+        oa = Layered_Step(&a, &cfg, &low, &ia); ob = Layered_Step(&b, &cfg, &high, &ib);
+        same &= oa.u == ob.u && oa.u_target == ob.u_target && a.integ[3] == b.integ[3];
+        if (k == 0) {
+            check(t_absf(a.integ[3] + ia.x * cfg.dt_s) < 1.0e-7f,
+                  "R4 anti-windup: fixed gain and zero-state error define the safe integral");
+        }
+    }
+    check(same && oa.u < 0.0f, "R4 authority: knobs, unsafe references and nonzero ff_scale cannot change fallback");
+    ia.ai_regime = 1.0f; ia.x = 1.1f; ia.physics_residual = 0.0f;
+    Layered_Init(&a, &cfg, &high); oa = Layered_Step(&a, &cfg, &high, &ia);
+    check(oa.gate == GATE_VETO_SAFETY_ENVELOPE && oa.u < 0.0f,
+          "R4 envelope: outward trajectory demand cannot override zero-state return");
+    build_config(&cfg); cfg.min_dwell_ticks = 0;
+    build_tuning(&low, 1.5f, 0.75f, 1.0f);
+    ia.ai_regime = 3.0f; ia.x = 0.1f; ia.x_dot = 0.03f; ia.r = 0.2f; ia.r_dot = 0.05f; ia.u_ff = 0.15f;
+    Layered_Init(&a, &cfg, &low); oa = Layered_Step(&a, &cfg, &low, &ia);
+    expected = cfg.kp[2]*low.gain_scale*(ia.r-ia.x) +
+        cfg.kd[2]*low.damping_scale*(ia.r_dot-ia.x_dot) + cfg.ff_scale[2]*ia.u_ff;
+    check(oa.regime == REGIME_BOUNDARY_COMPLIANT && oa.gate == GATE_NORMAL &&
+          t_absf(oa.u_target - expected) < 1.0e-7f && oa.u > 0.0f,
+          "R3 controller: compliant bank executes its own scaled gains and feedforward");
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -1805,6 +1976,9 @@ int main(void)
     test_priority();
     test_api();
     test_settings_and_clamp();
+    test_mailbox_fallback();
+    test_settings_bounds();
+    test_safe_bank_and_r3();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

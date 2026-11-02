@@ -61,7 +61,8 @@ for br=1:3
         if br==2
             expr='(60-52*u(4))*u(1)+(1.2-0.4*u(4))*u(2)+u(3)';
         else
-            expr='(abs(u(5))<0.9)*((60+50*(u(4)>0.5))*u(1)+1.2*u(2)+u(3))+(abs(u(5))>=0.9)*(2*u(1)+0.35*u(2))';
+            set_param([mdl '/' tag '_Inputs'],'Inputs','6'); signals{6}=[tag '_Rate'];
+            expr='(abs(u(5))<0.9)*((60+50*(u(4)>0.5))*u(1)+1.2*u(2)+u(3))-(abs(u(5))>=0.9)*(2*u(5)+0.35*u(6))';
         end
     end
     for j=1:numel(signals), add_line(mdl,[signals{j} '/1'],[tag '_Inputs/' num2str(j)]); end

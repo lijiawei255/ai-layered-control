@@ -9,15 +9,23 @@
  *   dt timeout max_res res_clear min_conf conf_clear x_limit trip clear
  *   predict u_max slew alpha integ_limit windup min_dwell recovery
  *   kp0 kp1 kp2 kp3 kd0..kd3 ki0..ki3 ff0..ff3
- *   then N lines of 9 LayeredInput_t fields.
+ *   gain_scale damping_scale safety_margin_scale as float32 bit patterns
+ *   then N lines of 9 float32 bit patterns for LayeredInput_t fields.
  *
  * Output: N lines of
- *   u u_target gate regime blend fault_audit_bitmask
+ *   u u_target gate regime blend fault_audit_bitmask corrupted
  */
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "layered_gatekeeper.h"
+
+static float input_value(unsigned bits)
+{
+    union { uint32_t bits; float value; } input;
+    input.bits = (uint32_t)bits;
+    return input.value;
+}
 
 int main(int argc, char **argv)
 {
@@ -29,6 +37,7 @@ int main(int argc, char **argv)
     LayeredConfig_t cfg;
     LayeredState_t st;
     FieldTuning_t tun;
+    unsigned tuning_bits[3];
 
     if (argc < 3) {
         fprintf(stderr, "usage: %s input.txt output.txt\n", argv[0]);
@@ -71,9 +80,14 @@ int main(int argc, char **argv)
         if (fscanf(f, "%f", &cfg.ff_scale[j]) != 1) { fclose(f); return 2; }
     }
 
-    tun.gain_scale = 1.0f;
-    tun.damping_scale = 1.0f;
-    tun.safety_margin_scale = 1.0f;
+    if (fscanf(f, "%u %u %u", &tuning_bits[0], &tuning_bits[1], &tuning_bits[2]) != 3) {
+        fprintf(stderr, "bad tuning\n");
+        fclose(f);
+        return 2;
+    }
+    tun.gain_scale = input_value(tuning_bits[0]);
+    tun.damping_scale = input_value(tuning_bits[1]);
+    tun.safety_margin_scale = input_value(tuning_bits[2]);
     Layered_Init(&st, &cfg, &tun);
 
     g = fopen(argv[2], "w");
@@ -85,20 +99,29 @@ int main(int argc, char **argv)
     for (k = 0; k < N; ++k) {
         LayeredInput_t in;
         LayeredOutput_t out;
-        if (fscanf(f, "%f %f %f %f %f %f %f %f %f",
-                   &in.ai_regime, &in.ai_confidence, &in.outer_age_s,
-                   &in.physics_residual, &in.x, &in.x_dot,
-                   &in.r, &in.r_dot, &in.u_ff) != 9) {
+        unsigned bits[9];
+        if (fscanf(f, "%u %u %u %u %u %u %u %u %u",
+                   &bits[0], &bits[1], &bits[2], &bits[3], &bits[4],
+                   &bits[5], &bits[6], &bits[7], &bits[8]) != 9) {
             fprintf(stderr, "bad trace row %d\n", k);
             fclose(f);
             fclose(g);
             return 2;
         }
+        in.ai_regime = input_value(bits[0]);
+        in.ai_confidence = input_value(bits[1]);
+        in.outer_age_s = input_value(bits[2]);
+        in.physics_residual = input_value(bits[3]);
+        in.x = input_value(bits[4]);
+        in.x_dot = input_value(bits[5]);
+        in.r = input_value(bits[6]);
+        in.r_dot = input_value(bits[7]);
+        in.u_ff = input_value(bits[8]);
         out = Layered_Step(&st, &cfg, &tun, &in);
-        fprintf(g, "%.9g %.9g %d %d %.9g %u\n",
+        fprintf(g, "%.9g %.9g %d %d %.9g %u %d\n",
                 (double)out.u, (double)out.u_target,
                 (int)out.gate, (int)out.regime, (double)out.blend,
-                (unsigned)out.fault_audit_bitmask);
+                (unsigned)out.fault_audit_bitmask, (int)out.corrupted);
     }
     fclose(f);
     fclose(g);

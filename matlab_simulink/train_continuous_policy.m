@@ -10,7 +10,16 @@ for j=1:numel(values)
     values(j)=(double(state)+.5)/4294967296;
 end
 X=reshape(values,9,nSamples)'*2-1;
+index=(0:nSamples-1)'; near=mod(index,4)~=0;
+for kind=0:1
+    q=near & mod(index,2)==kind;
+    [r,rd,rdd]=training_reference(kind,(X(q,5)+1)*5);
+    X(q,1)=X(q,1)*.06;
+    X(q,2)=15*X(q,1)+.4*X(q,2);
+    X(q,3:5)=[r/.5,rd/2,rdd/6];
+end
 X(:,6:9)=(X(:,6:9)+1)/2; X(:,9)=X(:,9)*1.4;
+X(near,6:8)=X(near,6:8).*[.03,.10,.06]; X(near,9)=0;
 h=min(max((X(:,9)-.65)/.35,0),1);
 kp=60*(1-h)+8*h; kd=1.2*(1-h)+.8*h; p=P.nominal;
 ff=p.J*(1+unit)*6*X(:,5)+p.b*2*X(:,4)+p.k*.5*X(:,3)+p.fc*sign(X(:,4));
@@ -33,4 +42,21 @@ radial=exp(-max(sum(Z.^2,2)+sum(centers.^2,2)'-2*Z*centers',0)/(2*width^2));
 phi=[ones(nSamples,1),Z,radial];
 w=(phi'*phi+1e-7*nSamples*eye(size(phi,2)))\(phi'*Y);
 policy=struct('mu',mu,'sd',sd,'centers',centers,'width',width,'w',w);
+end
+
+function [r,v,a]=training_reference(kind,t)
+if kind==0
+    r=.5*cos(pi*t); v=-.5*pi*sin(pi*t); a=-.5*pi*pi*cos(pi*t); return;
+end
+move=.9; dwell=.9; u=mod(t+.8,2*(move+dwell));
+r=zeros(size(t)); v=r; a=r;
+r(u<dwell)=.5; r(u>=dwell+move & u<2*dwell+move)=-.5;
+for side=1:2
+    if side==1, q=u>=dwell & u<dwell+move; tau=(u(q)-dwell)/move; sg=-1;
+    else, q=u>=2*dwell+move; tau=(u(q)-2*dwell-move)/move; sg=1; end
+    pp=tau.*tau.*tau.*(10+tau.*(-15+6*tau));
+    vv=tau.*tau.*(30-60*tau+30*tau.*tau);
+    aa=tau.*(60-180*tau+120*tau.*tau);
+    r(q)=-sg*.5+sg*pp; v(q)=sg*vv/move; a(q)=sg*aa/(move*move);
+end
 end

@@ -18,7 +18,7 @@ A classifier, rule tree or VLM may implement this interface. It cannot write `u`
 The reference prototype model stores twelve coordinates and three confidence parameters.
 Its four feature normalizations belong to the device interface.
 
-The C99 ABI is fixed: `LayeredState_t` 88 B, `LayeredConfig_t` 132 B, `FieldTuning_t` 12 B.
+The C99 ABI is fixed: state/config/tuning/input/output occupy 88/132/12/36/28 B.
 Preserve field order, types, function signatures and the sole dependency on `<stdint.h>`.
 There is no heap, OS call, mutable global state or libm dependency.
 Compile without `-ffast-math`; IEEE NaN comparisons are part of the input firewall.
@@ -26,6 +26,7 @@ Compile without `-ffast-math`; IEEE NaN comparisons are part of the input firewa
 ```c
 LayeredState_t state;
 LayeredConfig_t config;
+LayeredInput_t input;
 FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
 /* Populate config and input from the commissioned device interface. */
 Layered_Init(&state, &config, &field_tuning);
@@ -36,8 +37,8 @@ LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 
 | Order | Duty |
 | :---: | :--- |
-| 0 | Reject nonfinite input, configuration or tuning and malformed mailbox fields; hold the applied command and latch corruption. |
-| 1 | Enforce the state envelope and velocity look-ahead with hysteresis. |
+| 0 | Invalid fast inputs/settings hold; malformed slow mailboxes latch corruption and run closed-loop R4 using valid sensors. |
+| 1 | Select R4 when the state envelope or velocity look-ahead trips, with hysteresis. |
 | 2 | Latch independent physics-residual OOD veto with release hysteresis. |
 | 3 | Latch low confidence or explicit R4 abstention; clear only on a confident normal regime. |
 | 4 | Detect stale slow-loop frames and retain the latency fault bit. |
@@ -50,7 +51,9 @@ Priority is envelope, residual, confidence, then native latency HOLD.
 All bank integrators track the actually applied command, including inactive banks.
 `blend_alpha` smooths the controller target on every control tick after initialization;
 it is not a switch-only filter. Magnitude limiting precedes hardware slew limiting.
-Nominal feedforward is deterministic and shared by B1/B3; the fallback bank uses `ff_scale[3]=0`.
+Nominal feedforward is deterministic and shared by B1/B3 normal banks.
+R4 always uses zero reference, fixed bank gains and no feedforward, independently of field tuning.
+Its integral and anti-windup use the same zero-state error; `ff_scale[3]` is ignored.
 The nominal residual predictor is frozen independently of supervisor weights.
 
 ## 3. Plain-text source map
@@ -89,6 +92,7 @@ Map all nine input fields: `ai_regime`, `ai_confidence`, `outer_age_s`,
 State and reference share units; derivatives share units per second.
 Residuals and macro-features are dimensionless after device-defined normalization.
 Specify the fallback objective and measurable output limits before tuning controllers.
+Choose state coordinates whose zero is the commissioned safe fallback point.
 The benchmark's radians, torques and mechanical reference are one interface example.
 
 ### Step 2 — Commission the nominal fast loop
@@ -111,10 +115,17 @@ Freeze the resulting prototypes and confidence parameters before unit-to-unit ad
 `auto_field_tune(evaluate, current)` calls `evaluate(knobs) -> (cost, valid)`.
 Run each candidate inside the C gatekeeper and return a measured tracking cost.
 Set `valid=False` on any state, contact, actuator or device-specific constraint violation.
+Each candidate must cover load/stiction and contact conditions, including harmonic and ramped references.
+Constrain contact force, gate-veto fraction and R4 occupancy; repeat those checks after tuning.
 The helper rejects invalid/nonfinite scores and retains `current` when all candidates fail.
-It tests four gain scales at nominal damping, then two damping scales at the best gain.
+It always tests six gain/damping pairs: (0.75,1), (1,1), (1.25,1), (2,1), (1.25,0.5), (1.25,0.75).
+The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
+Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
+veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 runs and a 40 s mission
+(52 s per branch/unit). Device trajectory time and host simulation time are separate quantities.
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
+Gain and damping must lie in [0.10,4.0]; safety margin in [0.10,1.0], so tuning only tightens the envelope.
 Record trial duration and host computation time separately; freeze AI throughout the search.
 A new physical domain requires a new signal/model/controller definition before calibration.
 
@@ -127,6 +138,8 @@ Compute coupled constraints in the device adapter and translate them into per-ch
 or a coordinated device fallback. Keep the single-axis C API unchanged.
 
 Compute `outer_age_s = now - source_timestamp` on every fast tick.
+Nonfinite/out-of-range regime, confidence or age marks the mailbox corrupt and runs R4;
+envelope and residual checks retain priority, with valid sensors driving the closed loop.
 The reference timeout is 350 ms. Once stale, the adapter sends explicit R4 with confidence zero
 while preserving the real age. This selects deterministic fallback and also records latency.
 A fresh frame restores eligibility only after the core's clean recovery cooldown, 300 ms here.
@@ -164,8 +177,8 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-C regression succeeds with no failures and exit code zero. The replay compares gate, regime
-and fault bits exactly; numerical command agreement uses the declared floating-point tolerance.
+C regression succeeds with no failures and exit code zero. Replay compares gate, regime,
+fault bits and corruption flags exactly; command agreement uses the declared floating-point tolerance.
 Benchmark checks compare stage metrics, true-state envelope violations, contact force and field tuning.
 Do not substitute gate activation counts for physical safety violations.
 Compute RMSE from reference and true state at the same tick; TV is the sum of absolute command changes.

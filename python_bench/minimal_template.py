@@ -57,16 +57,11 @@ def auto_calibrate(samples, labels):
     return prototypes, gamma, threshold, 1.25 * threshold
 
 def auto_field_tune(evaluate, current=(1, 1, 1)):
+    """Six bounded trials; device-side validity includes every operating regime."""
     best, score = current, float("inf")
-    for gain in (.75, 1., 1.5, 2.):
-        candidate = (gain, 1., current[2])
-        cost, valid = evaluate(candidate)
-        if valid and np.isfinite(cost) and cost < score:
-            best, score = candidate, cost
-    if not np.isfinite(score):
-        return current
-    gain = best[0]
-    for damping in (.5, .75):
+    grid = ((.75, 1.), (1., 1.), (1.25, 1.),
+            (2., 1.), (1.25, .5), (1.25, .75))
+    for gain, damping in grid:
         candidate = (gain, damping, current[2])
         cost, valid = evaluate(candidate)
         if valid and np.isfinite(cost) and cost < score:
@@ -81,25 +76,27 @@ def classify(features, model):
 
 def rollout(cfg, tuning=(1, 1, 1), model=None, damping=.4):
     core = Core(cfg, tuning); dt = cfg["dt_s"]
-    q = velocity = prediction = u = error_sum = 0.; violations = 0
+    q = velocity = previous_v = load = prediction = u = error_sum = 0.; violations = faults = 0
     regime, confidence, stamp, samples = 1, 1., 0., []
-    for tick in range(1200):
+    for tick in range(1300):
         t = tick * dt
         # SLOT 1: real sensor/reference and actuator I/O; this demo uses a damped axis.
-        r, rd, rdd = .2 * np.sin(2*np.pi*t), .4*np.pi*np.cos(2*np.pi*t), -.8*np.pi**2*np.sin(2*np.pi*t)
+        r, rd, rdd = .1*(1-np.cos(np.pi*t)), .1*np.pi*np.sin(np.pi*t), .1*np.pi**2*np.cos(np.pi*t)
         # SLOT 2: commissioned predictor and dimensionless measured features.
         residual = abs(q - prediction) / .005
-        features = np.array([abs(r-q)/.2, abs(u)/20, residual, abs(velocity)/2])
-        if tick % 100 == 0:
+        if abs(previous_v) > .001: load = max(0., (u-(velocity-previous_v)/dt)/previous_v)
+        features = np.array([abs(r-q)/.2, abs(u)/20, residual, load/(1+load)])
+        if tick and tick % 100 == 0:
             samples.append(features); stamp = t
             if model is not None: regime, confidence = classify(features, model)
         age = t - stamp
         ai, conf = (4, 0.) if age > cfg["outer_timeout_s"] else (regime, confidence)
-        u = core.step(ai, conf, age, residual, q, velocity, r, rd, rdd + .4*rd)[0]
-        error_sum += (r-q)**2; violations += int(abs(q) > cfg["state_safety_limit"])
+        out = core.step(ai, conf, age, residual, q, velocity, r, rd, rdd + .4*rd); u = out[0]
+        error_sum += (r-q)**2; violations += int(abs(q) > cfg["state_safety_limit"]); faults += int(out[1] != 0 or out[2] == 4 or out[5])
         prediction = q + dt * (velocity + dt * (u - .4*velocity))
-        velocity += dt * (u - damping*velocity); q += dt*velocity
-    return (error_sum/1200)**.5, violations == 0, np.array(samples)
+        previous_v = velocity; velocity += dt * (u - damping*velocity); q += dt*velocity
+    error = (error_sum/1300)**.5
+    return error, violations == faults == 0 and error < .02, np.array(samples), (violations, faults)
 
 def main():
     cfg = dict(zip(FLOAT_FIELDS, (.001, .35, 1., .5, .01, .02, 1., .9, .75, .025, 20., 2000., .3, .5, .1)))
@@ -108,9 +105,9 @@ def main():
     observations = np.vstack([rollout(cfg, damping=d)[2] for d in (.4, 2., 5.)])
     model = auto_calibrate(observations, np.repeat((1, 2, 3), 12))
     cfg.update(min_ai_confidence=model[2], confidence_clear_ratio=model[3])
-    evaluate = lambda tuning: rollout(cfg, tuning, model, damping=2.)[:2]
-    tuning = auto_field_tune(evaluate); error, valid = evaluate(tuning)
-    print(f"Template: tuning={tuning}, RMSE={error:.6f}, envelope={'PASS' if valid else 'FAIL'}")
+    evaluate = lambda tuning: rollout(cfg, tuning, model, damping=2.5)[:2]
+    tuning = auto_field_tune(evaluate); error, valid, _, counts = rollout(cfg, tuning, model, damping=2.5)
+    print(f"Template: tuning={tuning}, RMSE={error:.6f}, breaches/gate_faults={counts}, {'PASS' if valid else 'FAIL'}")
     return 0 if valid else 1
 
 if __name__ == "__main__":
