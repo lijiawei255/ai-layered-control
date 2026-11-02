@@ -77,7 +77,7 @@ The nominal residual predictor is frozen independently of supervisor weights.
 
 Keep shared physical constants aligned in the existing MATLAB and Python files.
 Use the same 32-bit LCG and random-number consumption order in both engines.
-The fixture uses Karnopp sticking, unilateral contact and a passive two-inertia flexible mode.
+The fixture uses Karnopp sticking, unilateral contact and a positive-stiffness, positive-damping two-inertia mode.
 S3 measurement noise has one scale and a bounded white distribution; no periodic tone is added.
 Stage labels belong only to plant generation, calibration labels and offline statistics.
 Deployment controllers and residual probes cannot read stage labels, time schedules or fault frequency.

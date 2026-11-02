@@ -65,7 +65,7 @@ Noise, context delay and contact stiffness should have independent controls.
 
 Compare fixed controller modes, a measured-feature classifier and a physical rule supervisor.
 Compare full residual gating with spike-free and residual-only operation.
-Check passive free response and integration-step convergence before attributing an instability
+Check zero-input free response and integration-step convergence before attributing an instability
 to the controller. Distinguish anomaly-detection delay from gate response once evidence arrives.
 
 Safety-envelope breaches, actuator variation and contact force answer different questions.

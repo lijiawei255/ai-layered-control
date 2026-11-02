@@ -61,7 +61,7 @@ The three branches are white-box feedforward plus PID, conditioned RBF continuou
 and a coarse supervisor plus deterministic gatekeeper. Both learned continuous actions and C control
 run at 1 kHz; only context/supervisor updates run at 10 Hz.
 The physical fixture combines Karnopp friction, unit drift, moving unilateral contact,
-white measurement noise and a passive variable-frequency flexible mode.
+white measurement noise and a variable-frequency flexible mode with positive stiffness and damping.
 The benchmark regenerates its training samples and classifier archive deterministically.
 It reports the four-stage metrics, mode ablations, frozen-AI tuning and action-sample efficiency.
 Per branch/unit, six full 40 s candidate missions provide 240 s of search trajectories;
