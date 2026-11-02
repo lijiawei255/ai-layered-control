@@ -1716,7 +1716,7 @@ static void test_settings_and_clamp(void)
     LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f};
     LayeredOutput_t out;
     float *fields[34];
-    int n = 0, i, j, rejected = 0;
+    int n = 0, i, j, rejected = 0, fallback = 0;
     build_config(&cfg);
     build_tuning(&tun, 1.0f, 1.0f, 1.0f);
 #define FIELD(name) fields[n++] = &cfg.name
@@ -1742,12 +1742,20 @@ static void test_settings_and_clamp(void)
             held = out.u; integral = st.integ[0];
             *fields[i] = j ? make_inf() : make_nan();
             out = Layered_Step(&st, &cfg, &tun, &in);
-            rejected += out.corrupted && out.u == held && st.integ[0] == integral &&
-                (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
+            if (i < 31) {
+                rejected += out.corrupted && out.gate == GATE_HOLD_LATENCY &&
+                    out.u == held && st.integ[0] == integral &&
+                    (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
+            } else {
+                fallback += out.corrupted && out.regime == REGIME_SAFE_FALLBACK &&
+                    out.gate == GATE_VETO_LOW_CONFIDENCE && out.u == out.u &&
+                    (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
+            }
             *fields[i] = saved;
         }
     }
-    check(rejected == 68, "settings firewall: all 34 floating fields reject NaN and Inf while holding state");
+    check(rejected == 62, "config firewall: 31 floating fields reject NaN and Inf while holding state");
+    check(fallback == 6, "tuning firewall: three NaN/Inf knobs enter closed-loop R4");
     check(sizeof(LayeredState_t) == 88 && sizeof(LayeredConfig_t) == 132 &&
           sizeof(FieldTuning_t) == 12, "binary contract: state/config/tuning = 88/132/12 bytes");
     Layered_Init(&st, &cfg, &tun);
@@ -1876,7 +1884,8 @@ static void test_settings_bounds(void)
             *knobs[i] = j == 0 ? 0.10f : j == 1 ? upper[i] : j == 2 ? 0.099f : upper[i] + 0.001f;
             Layered_Init(&st, &cfg, &tun);
             out = Layered_Step(&st, &cfg, &tun, &in);
-            bounds += (out.corrupted != 0) == (j >= 2);
+            bounds += j < 2 ? !out.corrupted :
+                out.corrupted && out.regime == REGIME_SAFE_FALLBACK && out.gate != GATE_HOLD_LATENCY;
         }
         *knobs[i] = 1.0f;
     }
@@ -1936,6 +1945,73 @@ static void test_safe_bank_and_r3(void)
           "R3 controller: compliant bank executes its own scaled gains and feedforward");
 }
 
+/* Runtime tuning faults use nominal internal gains and retain closed-loop R4. */
+static void test_runtime_tuning_faults(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun, nominal;
+    LayeredState_t st, reference;
+    LayeredInput_t in, ref_in;
+    LayeredOutput_t out, ref_out;
+    int fault, k, bank;
+    build_config(&cfg);
+    build_tuning(&nominal, 1.0f, 1.0f, 1.0f);
+    for (fault = 0; fault < 4; ++fault) {
+        int holds = 0, safe = 0, violations = 0, polluted = 0, recovery = 0;
+        float peak = 0.0f;
+        tun = nominal;
+        in.ai_regime = 1.0f; in.ai_confidence = 0.95f; in.outer_age_s = 0.0f;
+        in.physics_residual = 0.0f; in.x = 0.0f; in.x_dot = 0.0f;
+        in.r = 0.4f; in.r_dot = 0.0f; in.u_ff = 0.0f;
+        Layered_Init(&st, &cfg, &tun);
+        for (k = 0; k < 10000; ++k) {
+            if (k == 5000) {
+                reference = st;
+                if (fault == 0) tun.gain_scale = 5.0f;
+                else if (fault == 1) tun.gain_scale = -1.0f;
+                else if (fault == 2) tun.gain_scale = make_nan();
+                else tun.safety_margin_scale = 1.5f;
+            }
+            if (k == 7500) tun = nominal;
+            out = Layered_Step(&st, &cfg, &tun, &in);
+            if (k >= 5000 && k < 7500) {
+                ref_in = in; ref_in.ai_regime = 4.0f; ref_in.ai_confidence = 0.0f;
+                ref_out = Layered_Step(&reference, &cfg, &nominal, &ref_in);
+                holds += out.gate == GATE_HOLD_LATENCY;
+                safe += out.regime == REGIME_SAFE_FALLBACK && out.corrupted;
+                polluted += out.u != ref_out.u || out.u_target != ref_out.u_target;
+                for (bank = 0; bank < 4; ++bank) {
+                    polluted += st.integ[bank] != reference.integ[bank] ||
+                        t_absf(st.integ[bank]) > cfg.integ_limit;
+                }
+            }
+            if (k >= 7500 && k < 8000) recovery +=
+                out.regime == REGIME_SAFE_FALLBACK && !out.corrupted && out.gate == GATE_NORMAL;
+            in.x_dot += cfg.dt_s * (out.u - 0.2f * in.x_dot) / 0.1f;
+            in.x += cfg.dt_s * in.x_dot;
+            if (t_absf(in.x) > peak) peak = t_absf(in.x);
+            violations += !(in.x == in.x) || t_absf(in.x) > cfg.state_safety_limit;
+        }
+        check(holds == 0 && safe == 2500 && violations == 0,
+              "runtime tuning case %d: fault at 5 s gives 0 HOLD, 2500 R4 ticks and 0 breaches (peak=%.4f)",
+              fault + 1, (double)peak);
+        check(polluted == 0, "runtime tuning case %d: every bank integral matches nominal-knob R4", fault + 1);
+        check(recovery == 500 && out.regime == REGIME_NOMINAL && !out.corrupted &&
+              st.corrupted_frame_count == 2500u &&
+              (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0u,
+              "runtime tuning case %d: restored knobs recover after the full clean cooldown", fault + 1);
+    }
+    tun = nominal; tun.safety_margin_scale = 1.5f; in.x = 0.95f; in.x_dot = 0.0f;
+    Layered_Init(&st, &cfg, &tun);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted && out.gate == GATE_VETO_SAFETY_ENVELOPE && out.regime == REGIME_SAFE_FALLBACK,
+          "runtime tuning: invalid margin uses the nominal envelope and preserves veto priority");
+    in.x = make_nan();
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted && out.gate == GATE_HOLD_LATENCY,
+          "runtime tuning: invalid fast measurement still takes the HOLD firewall");
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -1979,6 +2055,7 @@ int main(void)
     test_mailbox_fallback();
     test_settings_bounds();
     test_safe_bank_and_r3();
+    test_runtime_tuning_faults();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

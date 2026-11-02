@@ -10,12 +10,12 @@
  *   - no <math.h> / libm: |.|, clamping and the whole decision logic are hand
  *     written, no exp()/sqrt()/trig is ever needed;
  *   - no allocation, no I/O, no recursion: fixed-size checks and controller
- *     arithmetic keep the worst-case execution time O(1);
+ *     arithmetic bound the work per tick; target WCET requires measurement;
  *   - no file-static mutable state: every byte of persistence lives in
  *     LayeredState_t, so several instances can run side by side.
  *
  * One step, in this order:
- *   0. split firewall             fast corruption holds; bad mailbox runs R4
+ *   0. split firewall             bad fast/config holds; bad mailbox/tuning runs R4
  *   1. safety envelope veto       sticky, latches ENVELOPE_BREACH
  *   2. OOD residual veto          sticky, latches OOD_RESIDUAL
  *   3. confidence / abstention    sticky latch, latches LOW_CONFIDENCE
@@ -66,7 +66,7 @@ static int lg_is_finite(float v)
     return (v >= -LAYERED_FINITE_LIMIT) && (v <= LAYERED_FINITE_LIMIT);
 }
 
-static int lg_settings_are_corrupt(const LayeredConfig_t *c, const FieldTuning_t *t)
+static int lg_config_is_corrupt(const LayeredConfig_t *c)
 {
     int i;
     if (!lg_is_finite(c->dt_s) || !lg_is_finite(c->outer_timeout_s) ||
@@ -76,8 +76,7 @@ static int lg_settings_are_corrupt(const LayeredConfig_t *c, const FieldTuning_t
         !lg_is_finite(c->safety_clear_ratio) || !lg_is_finite(c->safety_predict_s) ||
         !lg_is_finite(c->u_max) || !lg_is_finite(c->u_slew_max_per_s) ||
         !lg_is_finite(c->blend_alpha) || !lg_is_finite(c->integ_limit) ||
-        !lg_is_finite(c->windup_tau_s) || !lg_is_finite(t->gain_scale) ||
-        !lg_is_finite(t->damping_scale) || !lg_is_finite(t->safety_margin_scale)) {
+        !lg_is_finite(c->windup_tau_s)) {
         return 1;
     }
     for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
@@ -95,13 +94,19 @@ static int lg_settings_are_corrupt(const LayeredConfig_t *c, const FieldTuning_t
         c->min_ai_confidence < 0.0f || c->min_ai_confidence > 1.0f ||
         c->confidence_clear_ratio < c->min_ai_confidence || c->confidence_clear_ratio > 1.0f ||
         c->safety_trip_ratio <= 0.0f || c->safety_trip_ratio > 1.0f ||
-        c->safety_clear_ratio < 0.0f || c->safety_clear_ratio > c->safety_trip_ratio ||
-        t->gain_scale < 0.10f || t->gain_scale > 4.0f ||
-        t->damping_scale < 0.10f || t->damping_scale > 4.0f ||
-        t->safety_margin_scale < 0.10f || t->safety_margin_scale > 1.0f) {
+        c->safety_clear_ratio < 0.0f || c->safety_clear_ratio > c->safety_trip_ratio) {
         return 1;
     }
     return 0;
+}
+
+static int lg_tuning_is_corrupt(const FieldTuning_t *t)
+{
+    return !lg_is_finite(t->gain_scale) || !lg_is_finite(t->damping_scale) ||
+           !lg_is_finite(t->safety_margin_scale) ||
+           t->gain_scale < 0.10f || t->gain_scale > 4.0f ||
+           t->damping_scale < 0.10f || t->damping_scale > 4.0f ||
+           t->safety_margin_scale < 0.10f || t->safety_margin_scale > 1.0f;
 }
 
 /* ========================================================================= */
@@ -266,6 +271,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
                              const LayeredInput_t *input)
 {
     LayeredOutput_t out;
+    const FieldTuning_t nominal_tuning = {1.0f, 1.0f, 1.0f};
     float u_max;
     float integ_limit;
     float du_max;
@@ -291,7 +297,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     int veto_active;
     int do_control;
     int bank;
-    int mailbox_corrupt;
+    int tuning_corrupt;
+    int outer_corrupt;
     layered_gate_state_t gate;
     layered_regime_t regime;
     layered_regime_t mailbox_regime;
@@ -317,13 +324,13 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     }
 
     /* ---------------- 0. INPUT FIREWALL -------------------------------- */
-    /* Invalid fast inputs/settings stop here: no integrator, no
+    /* Invalid fast inputs/configuration stop here: no integrator, no
      * latch, no blend, no dwell counter is touched. The applied command
      * remains unchanged and the sticky NAN_CORRUPTION bit
      * records that this IPC frame must be investigated.  The recovery
      * cooldown is re-armed because a corrupt frame is not a clean sample; it
      * must never count towards "consecutive clean ticks". */
-    if (lg_fast_input_is_corrupt(input) || lg_settings_are_corrupt(config, tuning)) {
+    if (lg_fast_input_is_corrupt(input) || lg_config_is_corrupt(config)) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
         state->corrupted_frame_count++;
         state->recovery_ticks = config->ood_recovery_cooldown_ticks;
@@ -338,8 +345,12 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         out.corrupted = 1;
         return out;
     }
-    mailbox_corrupt = lg_mailbox_is_corrupt(input);
-    if (mailbox_corrupt) {
+    tuning_corrupt = lg_tuning_is_corrupt(tuning);
+    if (tuning_corrupt) {
+        tuning = &nominal_tuning;
+    }
+    outer_corrupt = tuning_corrupt || lg_mailbox_is_corrupt(input);
+    if (outer_corrupt) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
         state->corrupted_frame_count++;
     }
@@ -394,8 +405,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
      *   - in between the previous decision is kept (hysteresis).
      * confidence_clear_ratio must therefore be chosen above min_ai_confidence,
      * e.g. min 0.45 / clear 0.55. */
-    mailbox_regime = mailbox_corrupt ? REGIME_SAFE_FALLBACK : lg_mailbox_regime(input->ai_regime);
-    if (mailbox_corrupt || input->ai_confidence < config->min_ai_confidence ||
+    mailbox_regime = outer_corrupt ? REGIME_SAFE_FALLBACK : lg_mailbox_regime(input->ai_regime);
+    if (outer_corrupt || input->ai_confidence < config->min_ai_confidence ||
         lg_mailbox_abstains(input->ai_regime) != 0) {
         state->conf_latched = 1;
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LOW_CONFIDENCE;
@@ -570,7 +581,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     out.gate = gate;
     out.regime = regime;
     out.fault_audit_bitmask = state->fault_audit_bitmask;
-    out.corrupted = mailbox_corrupt;
+    out.corrupted = outer_corrupt;
 
     state->step_count++;
     return out;

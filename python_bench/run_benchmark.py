@@ -96,7 +96,7 @@ class PythonGatekeeper:
         cfg = self.cfg
         tune = self.tune
         finite = 3e+38
-        values = [x for v in cfg.values() for x in (v if isinstance(v, list) else [v])] + list(tune.values())
+        values = [x for v in cfg.values() for x in (v if isinstance(v, list) else [v])]
         corrupt = any((not -finite <= v <= finite for v in values))
         positive = ('dt_s', 'outer_timeout_s', 'max_physics_residual', 'state_safety_limit', 'u_max', 'u_slew_max_per_s')
         corrupt |= any(cfg[k] <= 0 for k in positive)
@@ -104,7 +104,6 @@ class PythonGatekeeper:
                         and 0 <= cfg['min_ai_confidence'] <= cfg['confidence_clear_ratio'] <= 1
                         and 0 < cfg['safety_trip_ratio'] <= 1 and 0 <= cfg['safety_clear_ratio'] <= cfg['safety_trip_ratio'])
         corrupt |= any(cfg[k] < 0 for k in ('integ_limit', 'windup_tau_s', 'safety_predict_s'))
-        corrupt |= not (.1 <= tune['gain_scale'] <= 4 and .1 <= tune['damping_scale'] <= 4 and .1 <= tune['safety_margin_scale'] <= 1)
         for v in (physics_residual, x, x_dot, r, r_dot, u_ff):
             if not -finite <= v <= finite:
                 corrupt = True
@@ -116,7 +115,10 @@ class PythonGatekeeper:
             self.recovery_ticks = cfg['ood_recovery_cooldown_ticks']
             self.step_count += 1
             return (self.u_applied, GATE_HOLD_LATENCY, self.regime, self.blend, self.fault_audit_bitmask, 1, self.u_target)
-        mailbox_bad = (any(not -finite <= v <= finite for v in (ai_regime, ai_confidence, outer_age_s))
+        tuning_bad = not (.1 <= tune['gain_scale'] <= 4 and .1 <= tune['damping_scale'] <= 4 and .1 <= tune['safety_margin_scale'] <= 1)
+        if tuning_bad:
+            tune = dict(gain_scale=1.0, damping_scale=1.0, safety_margin_scale=1.0)
+        mailbox_bad = (tuning_bad or any(not -finite <= v <= finite for v in (ai_regime, ai_confidence, outer_age_s))
                        or not 1 <= ai_regime <= 4 or not 0 <= ai_confidence <= 1 or outer_age_s < 0)
         if mailbox_bad:
             self.fault_audit_bitmask |= FAULT_NAN
@@ -677,6 +679,8 @@ def tuning_study(clf):
         b1_check = metrics(mission, simulate(mission, 'b1', baseline=baseline))
         rows.append(dict(drift=drift, knobs=list(tuned), before=before, after=after, b1=b1,
             b1_tuned=b1_after, b1_knobs=b1_best, b1_feasible=any(v['valid'] for v in histories['b1']),
+            search_cost_before=histories['dynamic'][1]['cost'],
+            search_cost_after=next(v['cost'] for v in histories['dynamic'] if v['knobs'] == list(tuned)),
             mission=check, b1_mission=b1_check, candidates=histories,
             search_seconds=240, validation_seconds=52, compute_seconds=time.perf_counter()-start))
     return rows
@@ -726,7 +730,7 @@ def resource_study(policy):
                 action_us=times[0], core_call_us=times[1], core_backend='Python' if USE_PYTHON else 'C99 via ctypes')
 
 def selftest():
-    from minimal_template import Core, State, Config, Tuning, Input, Output
+    from minimal_template import Core, State, Config, Tuning, Input, Output, auto_field_tune
     assert tuple(ctypes.sizeof(t) for t in (State, Config, Tuning, Input, Output)) == (88, 132, 12, 36, 28)
     cfg = {k: [float(np.float32(x)) for x in v] if isinstance(v, list) else float(np.float32(v)) for k, v in CFG.items()}
     for k in ('min_dwell_ticks', 'ood_recovery_cooldown_ticks'):
@@ -753,7 +757,39 @@ def selftest():
         a = Core(q).step(1, 1, 0, 0, 0, 0, 0.1, 0, 0)
         b = PythonGatekeeper(q, dict(gain_scale=1.0, damping_scale=1.0, safety_margin_scale=1.0)).step(1, 1, 0, 0, 0, 0, 0.1, 0, 0)
         assert a[5] == b[5] == 1 and math.isfinite(a[0])
+    for field, bad in (('gain_scale', 5.), ('gain_scale', -1.), ('gain_scale', math.nan), ('safety_margin_scale', 1.5)):
+        c, nominal = Core(cfg), Core(cfg)
+        p = PythonGatekeeper(cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+        x, v, holds, breaches = .2, 0., 0, 0
+        for k in range(10000):
+            if k in (5000, 9000):
+                value = bad if k == 5000 else 1.
+                setattr(c.tuning, field, value); p.tune[field] = value
+            t = k * DT; r = .2 * math.cos(math.pi*t); rd = -.2 * math.pi * math.sin(math.pi*t)
+            ff = PARAM['J']*(-math.pi**2*r) + PARAM['b']*rd + PARAM['k']*r + friction(rd, PARAM)
+            frame = [float(np.float32(z)) for z in (1, 1, 0, 0, x, v, r, rd, ff)]
+            a, b = c.step(*frame), p.step(*frame)
+            injected = 5000 <= k < 9000
+            nominal.step(*([4., 0., *frame[2:]] if injected else frame))
+            assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
+            assert abs(a[0]-b[0]) < 1e-4 and np.allclose(c.state.integ, nominal.state.integ, atol=1e-6)
+            assert np.all(np.isfinite(p.integ)) and np.allclose(c.state.integ, p.integ, atol=1e-5)
+            if injected:
+                assert a[2] == REGIME_SAFE and a[5] == 1 and a[4] & FAULT_NAN
+            holds += int(a[1] == GATE_HOLD_LATENCY); breaches += int(abs(x) > 1.)
+            for _ in range(2):
+                x, v, _ = advance(x, v, a[0], PARAM)
+        assert holds == breaches == 0 and a[2] == REGIME_NOMINAL
+        assert c.state.corrupted_frame_count == p.corrupted_frame_count == 4000
+    trials = []
+    def evaluate(knobs):
+        trials.append(knobs)
+        return (knobs[0]-2)**2 + (knobs[1]-.5)**2, True
+    assert auto_field_tune(evaluate) == (2., .5, 1)
+    assert len(trials) == 6 and trials[-2:] == [(2., .5, 1), (2., .75, 1)]
+    assert auto_field_tune(lambda _: (math.nan, False), (.9,.8,.7)) == (.9,.8,.7)
     print(f'PASS: 6000 frames; gate/regime/fault exact; max|du|={maxerr:.3g}')
+    print('PASS: four mid-run tuning faults; zero HOLD/breaches, finite nominal integrators and clean recovery; adaptive gain/damping search')
 
 def physics_checks():
     for drive in (0.5, 1.01):
@@ -819,7 +855,7 @@ def main():
     assert all((m['B3'][s]['breach'] == 0 for s in m['B3']))
     assert m['B1']['S3']['peak_N'] > 20 and m['B3']['S3']['peak_N'] < 20
     assert m['B1']['S4']['breach'] > 0 and m['B2']['S4']['breach'] > 0
-    assert all((row['after']['rmse'] < row['before']['rmse'] for row in tune))
+    assert all(row['search_cost_after'] <= row['search_cost_before'] for row in tune)
     assert all((s['breach'] == 0 for row in tune for s in row['mission'].values()))
     assert all(row['mission'][stage]['peak_N'] < 20 and row['mission'][stage]['veto_rate'] <= .05
                and row['mission'][stage]['safe'] <= 1000

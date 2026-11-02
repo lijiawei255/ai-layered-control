@@ -46,23 +46,23 @@ RMSE compares reference and true state at the same tick. TV is the within-stage 
 
 **Zero-retraining unit adaptation.** The classifier stays frozen. These independent S2 validations use a 6 s trajectory of amplitude 0.43 rad, seed 811, shared by all controllers. They are separate from the 10 s S2 window above. “+35% / +50% unit drift” means **inertia change plus strong stiction**, not inertia alone; amplified friction dominates this fixture's S2 error. RMSE is in rad and TV in N·m.
 
-| Unit drift | B1 factory | B1 equal-budget S2-best (infeasible) | B3 factory (1,1,1) | B3 feasible tuning (1.25,0.5,1) | B3 RMSE reduction | B3 TV: before → after |
+| Unit drift | B1 factory | B1 equal-budget S2-best (infeasible) | B3 factory (1,1,1) | B3 feasible tuning (1,0.5,1) | B3 RMSE change | B3 TV: before → after |
 |---|---|---|---|---|---|---|
-| +35% | 0.016682 | 0.007751 | 0.020331 | 0.016522 | 18.7% | 1249.03 → 864.10 |
-| +50% | 0.023648 | 0.009317 | 0.027846 | 0.023253 | 16.5% | 1254.20 → 902.48 |
+| +35% | 0.016682 | 0.007751 | 0.020331 | 0.021810 | +7.3% | 1249.03 → 779.21 |
+| +50% | 0.023648 | 0.009317 | 0.027846 | 0.024543 | -11.9% | 1254.20 → 785.96 |
 
-B3 selects **`(1.25,0.5,1)`**, in `gain / damping / safety margin` order. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
+B3 selects **`(1,0.5,1)`**, in `gain / damping / safety margin` order. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
 
 | Unit drift | Candidate | S3 peak / N | S3 TV / N·m | S3 veto fraction | S3 R4 fraction | Mission violation ticks |
 |---|---|---|---|---|---|---|
-| +35% | B3 (1.25,0.5,1) | 17.93 | 2061.94 | 0.00% | 0.00% | 0 |
+| +35% | B3 (1,0.5,1) | 16.12 | 2012.49 | 0.00% | 0.00% | 0 |
 | +35% | B1 (2,1,1) | 75.51 | 16372.36 | 0.00% | 0.00% | 1397 |
-| +50% | B3 (1.25,0.5,1) | 18.65 | 2061.46 | 0.00% | 0.00% | 0 |
+| +50% | B3 (1,0.5,1) | 16.72 | 2012.40 | 0.00% | 0.00% | 0 |
 | +50% | B1 (2,1,1) | 75.49 | 16347.53 | 0.00% | 0.00% | 1031 |
 
-Each branch receives the same six gain/damping pairs: `(0.75,1)`, `(1,1)`, `(1.25,1)`, `(2,1)`, `(1.25,0.5)`, `(1.25,0.75)`; safety margin stays at 1. Each 40 s trial includes sinusoidal and ramped references, stiction, contact and OOD. Acceptance requires zero state violations, S1 RMSE < 0.01 rad, and in each normal stage peak contact < 20 N, veto fraction ≤ 5% and R4 occupancy ≤ 10%. The objective is measured S2 error. All six B1 candidates fail the joint constraints; the helper retains current knobs if none qualifies.
+Each branch receives the same six-trial coordinate search: gains `{0.75,1,1.25,2}` at damping 1, then damping `{0.5,0.75}` at the best feasible first-stage gain. If no first-stage trial qualifies, the second stage uses the current gain. Safety margin stays at 1. Each 40 s trial includes sinusoidal and ramped references, stiction, contact and OOD. Acceptance requires zero state violations, S1 RMSE < 0.01 rad, and in each normal stage peak contact < 20 N, veto fraction ≤ 5% and R4 occupancy ≤ 10%. The objective is measured S2 error. All six B1 candidates fail the joint constraints; the helper retains current knobs if none qualifies.
 
-The search takes **240 s of device trajectories per branch and unit**, followed by **12 s paired S2 validation + 40 s full-mission validation**. Host computation time is reported separately. Accepted B3 tuning reduces S2 RMSE by **18.7% / 16.5%**. The tuned errors are slightly below factory B1 while meeting the measured contact budget. Its normal-stage veto/R4 rates remain zero. B3 accepts position error during contact and stops reference tracking in R4; S4 RMSE is not a safety ranking.
+The search takes **240 s of device trajectories per branch and unit**, followed by **12 s paired S2 validation + 40 s full-mission validation**. Host computation time is reported separately. Accepted B3 tuning reduces measured error on the search trajectory by **4.4% / 4.6%**. Independent S2 validation RMSE increases **7.3%** on the +35% unit and decreases **11.9%** on the +50% unit; both remain above factory B1. Both units meet the measured contact budget with zero normal-stage veto/R4 occupancy. Coordinate search does not explore lower damping at gains rejected in its first stage, and does not guarantee lower error on an independent trajectory. B3 accepts position error during contact and stops reference tracking in R4; S4 RMSE is not a safety ranking.
 
 **Command smoothing explains much of B3's TV advantage.** Giving B1 the identical per-tick low-pass coefficient `alpha = 0.3` reduces TV substantially but leaves excessive contact force:
 
@@ -80,7 +80,7 @@ The search takes **240 s of device trajectories per branch and unit**, followed 
 |---|---|
 | S1 · nominal tracking | Inertia 0.010 kg·m², viscous damping 0.060 N·m·s/rad, ground stiffness 0.300 N·m/rad; dynamic/static friction 0.6 / 1.0 N·m |
 | S2 · Unit Drift: Inertia + Stiction | Inertia +35%; dynamic/static friction 3.09 / 6.2625 N·m. Karnopp zero-speed band 0.003 rad/s; insufficient drive locks the state, breakaway switches to sliding friction |
-| S3 · contact and edge jitter | One-sided wall: stiffness 300 N·m/rad, damping 0.8 N·m·s/rad; position 0.43 + 0.025 sin(2π·0.73t + phase) + 0.24 exp(−(t−20)/0.25) rad during S3, including continuous approach. White measurement-noise standard deviation 0.006 rad; context delay 60–120 ms and 8% frame drops |
+| S3 · contact and edge jitter | One-sided wall: stiffness 300 N·m/rad, damping 0.8 N·m·s/rad; during S3, position 0.43 + 0.025 sin(2π·0.73t + phase) + 0.24 exp(−(t−20)/0.25) rad, including continuous approach. White measurement-noise standard deviation 0.006 rad; context delay 60–120 ms and 8% frame drops |
 | S4 · unseen compound OOD | At 30.037 s, a motor/load pair with 20%/80% inertia split replaces the rigid actuator; positive stiffness/damping create a 12→24 Hz swept mode. Load sensing also receives 0.025 rad bias and 0.18 rad spikes |
 
 Inertia and viscous-damping changes persist through S3/S4; elevated friction belongs to S2. For drift fraction d, damping is 0.060(1 + 0.3d) N·m·s/rad, or 0.0663 at +35%. Both engines use the same 32-bit LCG and bounded, unit-variance white-noise construction. There is no sinusoidal measurement-noise tone. The flexible plant has a decaying zero-input response at the checked fixed modal frequencies. The swept model uses positive stiffness and damping throughout.
@@ -97,7 +97,7 @@ B2 trains on **16,000 nominal-model action labels**: 75% cover nearby sinusoidal
 | B3 R3 · compliant contact | 8 | 2 | 0.8 | 1 |
 | B3 R4 · safe fallback | 2 | 0 | 0.35 | **0** |
 
-R4 uses **zero reference, fixed gains and zero feedforward**, independently of all field knobs. The state coordinate's zero must be the commissioned safe fallback point. Friction can stop the physical state before it reaches zero.
+R4 uses **zero reference, fixed gains and zero feedforward**, independently of all field knobs. The state coordinate's zero must be the commissioned safe fallback point. During abstention, this damping law deliberately gives up trajectory tracking and pulls the state toward zero to preserve the envelope. Friction can stop the physical state before it reaches zero.
 
 ## 3. Mode necessity and independent protection
 
@@ -132,7 +132,7 @@ The full compound fault's first spike triggers a veto in the same control tick. 
 
 The main run uses R1 throughout S1, R2 for 96.8% of S2 and R3 for 94.99% of S3; normal stages have no vetoes. S4 remains in R4 after fault onset. Persistent `ai_confidence = NaN` from 22 s produces **18,000 corrupted frames**, continued R4 command updates and **zero violations**, with whole-mission maximum **|x| = 0.5159 rad**. Corruption remains visible in flags and counters while valid sensors keep the fallback closed loop running.
 
-Five independent noise/phase runs give B1/B2 S4 violations of **777–899 / 622–753 ticks** and zero for B3. Factory B3's S3 force spans **13.44–26.14 N**: three of five phases exceed the 20 N contact budget despite preserving the state envelope. The accepted tuning table validates the commissioned wall phase with independent noise, not every contact geometry. Those five runs have no fresh-frame low-confidence veto; real timeout and cooldown are counted separately. With one/two/four physical substeps, B3's peak force is **20.03 / 19.47 / 19.35 N**, with zero state violations; the coarsest integration slightly exceeds the force budget. Removing context jitter changes B2's main S3 peak from **12.52 to 10.22 N**. Contact force, state safety and asynchronous-context sensitivity are separate outcomes.
+Five independent noise/phase runs give B1/B2 S4 violations of **777–899 / 622–753 ticks** and zero for B3. Factory B3's S3 force spans **13.44–26.14 N**: three of five phases exceed the 20 N contact budget despite preserving the state envelope. The 10 Hz frame rate and normal-regime dwell delay switching, so the first collision can precede completed selection of R3 (19.47 N in the main run). Across the phase scan, B3 reduces peak force to roughly one third of B1, but some phases exceed budget. A hard first-impact force limit requires contact-force protection in the 1 kHz fast loop. The accepted tuning table validates the commissioned wall phase with independent noise, not every contact geometry. Those five runs have no fresh-frame low-confidence veto; real timeout and cooldown are counted separately. With one/two/four physical substeps, B3's peak force is **20.03 / 19.47 / 19.35 N**, with zero state violations; the coarsest integration slightly exceeds the force budget. Removing context jitter changes B2's main S3 peak from **12.52 to 10.22 N**. Contact force, state safety and asynchronous-context sensitivity are separate outcomes.
 
 ## 4. Small-sample commissioning and resource accounting
 
@@ -149,7 +149,7 @@ Panel A uses the actual conditional RBF at 64 / 256 / 1,024 / 4,096 / 16,000 act
 | Conditional RBF, including normalization, centers, width and output coefficients | 5,149 scalars; FP64 41,192 B / FP32 storage 20,596 B |
 | Prototype classifier | 15 scalars; FP32 storage 60 B |
 | C99 state / configuration / field knobs / input / output | **88 / 132 / 12 / 36 / 28 B** |
-| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 4,108 B; `-O2`: 5,036 B |
+| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 4,092 B; `-O2`: 5,100 B |
 
 FP32 bytes are a storage calculation; numerical RBF runs use FP64. State RAM, model storage and code size are separate quantities. Python reports RBF and C-call host times, including ctypes overhead; they are not target WCET. The core uses only `<stdint.h>`, fixed-size arithmetic and no heap, I/O, libm or mutable globals.
 
@@ -163,7 +163,7 @@ FP32 bytes are a storage calculation; numerical RBF runs use FP64. State RAM, mo
 
 ![Three mappings of the common control contract](assets/domain_profiles_comparison.png)
 
-Define variables and a safe fallback → commission the nominal model and controller bank → calibrate measured macro-features → freeze AI and field-tune across operating conditions. A new physical domain needs new units, limits, control laws and probes. A new unit in the same domain can retain the commissioned classifier.
+Define variables and a safe fallback → commission the nominal model and controller bank → calibrate measured macro-features → freeze AI and field-tune across operating conditions. A new physical domain needs new units, limits, control laws and probes. A new unit in the same domain can retain the classifier for moderate parameter shifts such as the benchmark's compound unit drift. Large pure-inertia shifts, for example beyond +75%, can change closed-loop feature scales; rerun the 36-window calibration when that occurs.
 
 ```c
 LayeredState_t state;
@@ -177,7 +177,7 @@ LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 
 The nine core duties are input/settings validation, predictive envelope veto, residual veto, confidence/abstention veto, heartbeat watchdog, minimum dwell, recovery cooldown, controller-bank execution with anti-windup and output limits, and sticky fault reporting. Each integrator tracks the applied command; magnitude is clamped before slew. C ABI and signatures remain fixed.
 
-**Invalid slow mailboxes select closed-loop R4**, set `corrupted` and latch the existing corruption fault bit; envelope and residual vetoes retain priority. Invalid fast signals or settings retain the native command-HOLD path. Signed state, reference, velocity and feedforward values are valid; only the normalized residual must be nonnegative. Gain and damping knobs lie in **[0.10,4.0]**; safety margin lies in **[0.10,1.0]** and can only tighten the envelope. R4 ignores knob scaling, trajectory references and feedforward.
+**Invalid slow mailboxes or field knobs select closed-loop R4**, set `corrupted` and latch the existing corruption fault bit; envelope and residual vetoes retain priority. Invalid fast signals or configuration retain the native command-HOLD path. Invalid knobs are internally replaced by `(1,1,1)` while R4 runs, keeping normal-bank tracking integrators finite. Signed state, reference, velocity and feedforward values are valid; only the normalized residual must be nonnegative. Gain and damping knobs lie in **[0.10,4.0]**; safety margin lies in **[0.10,1.0]** and can only tighten the envelope. These ranges define input validity, not a closed-loop stability guarantee; admissible operating gains come from constrained `auto_field_tune` trials. R4 ignores knob scaling, trajectory references and feedforward.
 
 Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share read-only configuration only where units and limits agree; coupled constraints belong in the device adapter. On a **350 ms** slow-loop timeout the adapter sends explicit R4 abstention and preserves real frame age. Clean recovery passes through the core's **300 ms** cooldown. Native C `HOLD` freezes the **actuator command**, not mechanical position.
 
@@ -197,7 +197,7 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/test_gatekeeper_sta
 .\c99_layered_core\test_gatekeeper_standalone.exe
 ```
 
-The template recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **135 passes, zero failures**. Python/C replay: **6,000 frames**, exact gate/regime/fault/corruption flags and maximum command difference below `1e-4`. Compilers are found through `CC` or `PATH`.
+The template recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **150 passes, zero failures**. Python/C replay: **6,000 frames**, exact gate/regime/fault/corruption flags and maximum command difference below `1e-4`. Compilers are found through `CC` or `PATH`.
 
 MATLAB R2024b + Simulink, built-in functions and blocks:
 
@@ -207,7 +207,7 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('standalone model PASS')"
 ```
 
-The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits JSON. MATLAB/C replays cover **40,000 normal and 40,000 persistent-mailbox-fault frames**, with exact discrete outputs. Nondefault and invalid tuning are also replayable through the existing harness. The `.slx` is a self-contained architectural sketch; numerical engines generate quantitative results. Its B2 delay/hold is on context, while the action path runs at 1 kHz. Read [the builder](matlab_simulink/build_simulink_model.m) as the model's source.
+The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits JSON. MATLAB/C replays cover **40,000 normal and 40,000 persistent-mailbox-fault frames**, with exact discrete outputs. Four additional 40,000-frame replays inject invalid knobs at 5 s: all have zero HOLD ticks, zero violations and finite integrators. The `.slx` is a self-contained architectural sketch; numerical engines generate quantitative results. Its B2 delay/hold is on context, while the action path runs at 1 kHz. Read [the builder](matlab_simulink/build_simulink_model.m) as the model's source.
 
 The safety partition relates to Simplex / runtime assurance; see [AFRL RTA](https://github.com/act3-ace/run-time-assurance) and [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html).
 

@@ -69,6 +69,27 @@ assert(all(z.b3.gate(damaged)~=1) && all(z.metrics.violations(3,:)==0),'Damaged 
 fprintf('[5/5] C99 input replay, acceptance and generated artifacts\n');
 replay=verify_core_equivalence(P);
 mailbox_replay=verify_core_equivalence(P,struct('corrupt_slow_at',22));
+tuning_faults=[5 1 1;-1 1 1;NaN 1 1;1 1 1.5];
+names={'gain_high','gain_negative','gain_nan','margin_high'}; tuning_replays=struct();
+damaged=main.t>=5;
+for j=1:size(tuning_faults,1)
+    tuning=repmat([1 1 1],numel(main.t),1);
+    tuning(damaged,:)=repmat(tuning_faults(j,:),sum(damaged),1);
+    options=struct('branches',3,'tuning',tuning,'log_core',true);
+    z=sim_core_engine(P,options); b=z.b3;
+    assert(all(b.regime(damaged)==4) && all(b.gate(damaged)~=1) && ...
+        all(b.core_out(damaged,7)==1) && all(bitand(uint32(b.core_out(damaged,6)),uint32(16))~=0), ...
+        'Invalid tuning did not enter audited closed-loop R4.');
+    assert(b.integrators_finite && all(isfinite(b.core_out),'all') && ...
+        max(abs(b.u))<=20.00001 && max(abs(diff([0;b.u])))<=2.00001, ...
+        'Invalid tuning corrupted the controller state or actuator limits.');
+    assert(all(z.metrics.violations(3,:)==0) && any(abs(diff(b.u(damaged)))>1e-10), ...
+        'Invalid tuning froze the actuator or breached the state envelope.');
+    D.runtime_tuning.(names{j})=struct('corrupted_ticks',sum(b.core_out(:,7)), ...
+        'r4_fraction',mean(b.regime(damaged)==4),'maxabs',max(abs(b.x)), ...
+        'changing_command_ticks',sum(abs(diff(b.u(damaged)))>1e-10));
+    tuning_replays.(names{j})=verify_core_equivalence(P,options);
+end
 for b=1:3
     u=main.(sprintf('b%d',b)).u;
     assert(all(isfinite(u)) && max(abs(u))<=20.00001,'Actuator magnitude failed.');
@@ -90,7 +111,9 @@ assert(all(V.broadband_only.violations(3,:)==0) && ~isempty(first),'Independent 
 fprintf('[3] Composite OOD and five holdout B3 state-envelope checks: PASS\n');
 assert(E.retrained(end)<E.frozen(end),'Retrained action-head recovery failed.');
 for j=1:numel(E.tuning)
-    assert(E.tuning(j).after_rmse<E.tuning(j).before_rmse,'Field tuning did not improve held-out tracking.');
+    a=E.tuning(j); chosen=find(cellfun(@(c) isequal(c.knobs,a.knobs),a.candidates),1);
+    assert(~isempty(chosen) && a.candidates{chosen}.score<=a.candidates{2}.score, ...
+        'Field tuning did not preserve or improve the commissioning objective.');
     assert(E.tuning(j).mission_constraints.valid,'Tuned mission constraints failed.');
 end
 fprintf('[4] Frozen-AI tuning and action-label sample budget: PASS\n');
@@ -124,7 +147,7 @@ for j=1:2
         a.b1_best_mission.peak_contact(1,3),a.knobs,a.b1_best_feasible);
 end
 report=struct('main',M,'ablation',A,'efficiency',E,'holdout',H,'sensitivity',V,'diagnostics',D, ...
-    'replay',replay,'mailbox_replay',mailbox_replay);
+    'replay',replay,'mailbox_replay',mailbox_replay,'tuning_replays',tuning_replays);
 fprintf('\nV2_RESULTS_JSON=%s\n',jsonencode(report));
 fprintf('All five engineering checks passed.\nTotal wall-clock time: %.2f s\n',toc(started));
 

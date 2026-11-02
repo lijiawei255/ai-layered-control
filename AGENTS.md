@@ -37,7 +37,7 @@ LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 
 | Order | Duty |
 | :---: | :--- |
-| 0 | Invalid fast inputs/settings hold; malformed slow mailboxes latch corruption and run closed-loop R4 using valid sensors. |
+| 0 | Invalid fast inputs/configuration hold; invalid field knobs or slow mailboxes latch corruption and run closed-loop R4 using valid sensors. |
 | 1 | Select R4 when the state envelope or velocity look-ahead trips, with hysteresis. |
 | 2 | Latch independent physics-residual OOD veto with release hysteresis. |
 | 3 | Latch low confidence or explicit R4 abstention; clear only on a confident normal regime. |
@@ -54,6 +54,7 @@ it is not a switch-only filter. Magnitude limiting precedes hardware slew limiti
 Nominal feedforward is deterministic and shared by B1/B3 normal banks.
 R4 always uses zero reference, fixed bank gains and no feedforward, independently of field tuning.
 Its integral and anti-windup use the same zero-state error; `ff_scale[3]` is ignored.
+Invalid field knobs use internal nominal scales (1,1,1), including normal-bank tracking integrators.
 The nominal residual predictor is frozen independently of supervisor weights.
 
 ## 3. Plain-text source map
@@ -93,6 +94,7 @@ State and reference share units; derivatives share units per second.
 Residuals and macro-features are dimensionless after device-defined normalization.
 Specify the fallback objective and measurable output limits before tuning controllers.
 Choose state coordinates whose zero is the commissioned safe fallback point.
+The upstream planner or reference governor must limit `r` to the state safety envelope before calling the core.
 The benchmark's radians, torques and mechanical reference are one interface example.
 
 ### Step 2 — Commission the nominal fast loop
@@ -118,7 +120,8 @@ Set `valid=False` on any state, contact, actuator or device-specific constraint 
 Each candidate must cover load/stiction and contact conditions, including harmonic and ramped references.
 Constrain contact force, gate-veto fraction and R4 occupancy; repeat those checks after tuning.
 The helper rejects invalid/nonfinite scores and retains `current` when all candidates fail.
-It always tests six gain/damping pairs: (0.75,1), (1,1), (1.25,1), (2,1), (1.25,0.5), (1.25,0.75).
+Test gains {0.75,1,1.25,2} at damping 1, then damping {0.5,0.75} at the best feasible first-stage gain.
+If the first stage has no feasible trial, use the current gain for the second stage: six trials in total.
 The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
 veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 runs and a 40 s mission
@@ -126,6 +129,7 @@ veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 ru
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
 Gain and damping must lie in [0.10,4.0]; safety margin in [0.10,1.0], so tuning only tightens the envelope.
+These are input-validity bounds; closed-loop suitability requires the constrained trials above.
 Record trial duration and host computation time separately; freeze AI throughout the search.
 A new physical domain requires a new signal/model/controller definition before calibration.
 
@@ -145,6 +149,8 @@ while preserving the real age. This selects deterministic fallback and also reco
 A fresh frame restores eligibility only after the core's clean recovery cooldown, 300 ms here.
 Native `GATE_HOLD_LATENCY` holds the last actuator command, not mechanical position.
 Do not describe a held torque, current or stimulation command as a held physical state.
+Persistent fast-sensor failure requires a hardware-enforced maximum HOLD duration and safe shutdown
+(safe torque off, STO, for a drive); the C core does not supply that independent hardware function.
 
 ## 6. Three equal application examples
 

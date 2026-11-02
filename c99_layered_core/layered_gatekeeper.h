@@ -7,10 +7,10 @@
  * The whole point of this module is that it is boring to deploy and boring to
  * certify:
  *   - no floating-point library functions, no dynamic memory (malloc-free),
- *     no OS calls, no recursion -> strict O(1) Worst-Case Execution Time;
- *   - the only include is <stdint.h>, so it compiles on
- *     gcc / clang / arm-none-eabi-gcc / Keil MDK / IAR without a single flag
- *     beyond -std=c99 -pedantic -Wall -Wextra ;
+ *     no OS calls, no recursion; bounded, data-independent O(1) control flow;
+ *     target WCET is established by measurement;
+ *   - the only include is <stdint.h>; select C99 mode on the target compiler
+ *     and verify its floating-point behavior and build options;
  *   - fixed, statically-sized state (LayeredState_t), safe for 1 kHz ISRs;
  *   - sticky black-box fault audit bitmask for post-incident forensics
  *     with explicit gate decisions.
@@ -21,7 +21,7 @@
  *        |  mailbox: regime in {1,2,3}, confidence in [0,1], heartbeat
  *        v
  *   THIS MODULE (1 kHz, deterministic, 88 B state + 132 B config + 12 B tuning)
- *        - fast-input firewall; corrupt slow mailboxes request closed-loop R4
+ *        - fast-input firewall; bad slow mailboxes/tuning request closed-loop R4
  *        - heartbeat watchdog: survives 10 Hz jitter / dropped frames
  *        - physics-residual + confidence veto: explicit ABSTENTION
  *        - predictive state-envelope veto: selects fixed-gain R4
@@ -204,10 +204,12 @@ void Layered_Init(LayeredState_t *state,
  * allocation, no library calls.
  *
  * 0. SPLIT INPUT FIREWALL
- *    Invalid configuration/tuning or nonfinite fast inputs (x, x_dot, r,
+ *    Invalid configuration or nonfinite fast inputs (x, x_dot, r,
  *    r_dot, u_ff, physics_residual) hold the last command without advancing
  *    controller state. Negative residual is invalid; signed state/reference
  *    and command quantities are valid.
+ *    Invalid tuning is replaced locally by (1,1,1) for every bank and the
+ *    state envelope, and forces closed-loop R4. Caller settings are unchanged.
  *    Invalid slow mailbox fields (nonfinite values, regime outside [1,4],
  *    confidence outside [0,1], negative age) force explicit R4 abstention.
  *    Valid sensors still run the fast closed loop, including envelope/OOD

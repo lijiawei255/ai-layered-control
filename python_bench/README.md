@@ -40,15 +40,16 @@ Freeze these parameters, then call `auto_field_tune(evaluate, current)`.
 The trial callback returns `(measured_cost, valid)`; reject constraint violations.
 Include load/stiction and contact trials, contact-force limits, veto fraction and R4 occupancy.
 Invalid candidates cannot win, and an entirely invalid search returns the current knobs.
-The fixed six-trial grid is (0.75,1), (1,1), (1.25,1), (2,1), (1.25,0.5), (1.25,0.75)
-for gain/damping; every candidate retains the commissioned safety-margin scale.
+The six-trial search tests gains {0.75,1,1.25,2} at damping 1, then damping {0.5,0.75}
+at the best feasible first-stage gain (current gain if none qualifies). Safety margin stays fixed.
 Gain/damping lie in [0.10,4.0], margin in [0.10,1.0]. R4 ignores these gain scalings,
 trajectory references and feedforward; it uses fixed feedback toward the safe zero.
 
 Frame age advances every tick from the source timestamp.
 On timeout the adapter sends R4 with zero confidence while retaining the real age.
 C's native HOLD retains an actuator command; the device fallback defines the desired physical behavior.
-Malformed slow mailbox fields run closed-loop R4 with `corrupted=1`; valid fast sensors remain active.
+Malformed slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`.
+Invalid knobs use internal nominal scales; invalid configuration or fast sensors retain native HOLD.
 Count safety violations from true/measured state, independently of gate activity.
 
 The template commissions three viscous-load classes from measured velocity changes and applied effort.

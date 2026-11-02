@@ -187,10 +187,11 @@ if ~isempty(P.classifier)
     cfg.min_ai_confidence=P.classifier.trip; cfg.confidence_clear_ratio=P.classifier.clear;
 end
 ckeys=fieldnames(cfg); for j=1:numel(ckeys), cfg.(ckeys{j})=single(cfg.(ckeys{j})); end
-tune=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
+tuning=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
 logs=zeros(n,14); macro=zeros(ceil(n/100),5);
 age=zeros(n,1);
 CI=zeros(n,9*double(o.log_core)); CO=zeros(n,7*double(o.log_core));
+CT=zeros(n,3*double(o.log_core)); integrators_finite=true;
 for k=1:n
     r=c.r(k); rd=c.rd(k); rdd=c.rdd(k);
     [pr,ym,yd,res]=probe_step(pr,x+c.noise(k)+c.sfault(k)+c.spike(k),u0,r,nom,dt,o.probe_spikes);
@@ -234,9 +235,11 @@ for k=1:n
         if c.t(k)>=o.corrupt_slow_at, ci=NaN; end
         residual=res; if ~o.ood_gate, residual=0.; end
         input=single([mai,ci,age(k),residual,ym,yd,r,rd,uff]);
+        tune=tuning(min(k,size(tuning,1)),:);
         [core,result]=core_step(core,cfg,tune,input);
+        integrators_finite=integrators_finite && all(isfinite(core.integ));
         u=result(1); gate=result(3); reg=result(4);
-        if o.log_core, CI(k,:)=double(input); CO(k,:)=double(result); end
+        if o.log_core, CI(k,:)=double(input); CO(k,:)=double(result); CT(k,:)=double(tune); end
     end
     sx=x; sxm=xm; p=c.p(k,:); peak=0.; stuck=0;
     if c.fault(k) && ~wasflex, xm=x; vm=v; wasflex=true; end
@@ -253,6 +256,7 @@ for k=1:n
     logs(k,:)=[sx,u,gate,reg,peak,stuck,res,conf,pr.hf,ai,ym,sxm,yd,integ]; u0=u;
 end
 B=struct('log',logs,'macro',macro,'calls',calls,'core_in',CI,'core_out',CO, ...
+    'core_tuning',CT,'integrators_finite',integrators_finite, ...
     'age',age, ...
     'x',logs(:,1),'u',logs(:,2),'gate',logs(:,3),'regime',logs(:,4), ...
     'residual',logs(:,7),'confidence',logs(:,8),'contact_force',logs(:,5));
@@ -306,8 +310,8 @@ mailbox_bad=any(~isfinite(in(1:3))) || any(abs(in(1:3))>single(3e38)) || ...
 fields={'dt_s','outer_timeout_s','max_physics_residual','residual_clear_ratio', ...
  'min_ai_confidence','confidence_clear_ratio','state_safety_limit','safety_trip_ratio', ...
  'safety_clear_ratio','safety_predict_s','u_max','u_slew_max_per_s','blend_alpha','integ_limit','windup_tau_s'};
-values=[t(:);c.kp;c.kd;c.ki;c.ff_scale;zeros(numel(fields),1,'single')];
-for j=1:numel(fields), values(19+j)=c.(fields{j}); end
+values=[c.kp;c.kd;c.ki;c.ff_scale;zeros(numel(fields),1,'single')];
+for j=1:numel(fields), values(16+j)=c.(fields{j}); end
 bad=bad || any(~isfinite(values)) || any(abs(values)>single(3e38));
 bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
     c.state_safety_limit<=0 || c.u_max<=0 || c.u_slew_max_per_s<=0 || ...
@@ -316,13 +320,16 @@ bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
     c.min_ai_confidence<0 || c.min_ai_confidence>1 || ...
     c.confidence_clear_ratio<c.min_ai_confidence || c.confidence_clear_ratio>1 || ...
     c.safety_trip_ratio<=0 || c.safety_trip_ratio>1 || c.safety_clear_ratio<0 || ...
-    c.safety_clear_ratio>c.safety_trip_ratio || any(t<single(.1)) || ...
-    t(1)>4 || t(2)>4 || t(3)>1;
+    c.safety_clear_ratio>c.safety_trip_ratio;
 if bad
     st.fault=bitor(st.fault,uint32(16)); st.recovery=double(c.ood_recovery_cooldown_ticks);
     out=[double(st.u_applied),double(st.u_target),1,st.regime,double(st.blend),double(st.fault),1]; return;
 end
-if mailbox_bad, st.fault=bitor(st.fault,uint32(16)); end
+tuning_bad=any(~isfinite(t)) || any(abs(t)>single(3e38)) || ...
+    any(t<single(.1)) || t(1)>4 || t(2)>4 || t(3)>1;
+if tuning_bad, t=single([1 1 1]); end
+outer_bad=mailbox_bad || tuning_bad;
+if outer_bad, st.fault=bitor(st.fault,uint32(16)); end
 dt=abs(c.dt_s); du=abs(c.u_slew_max_per_s)*dt;
 limit=abs(c.state_safety_limit*t(3)); xa=abs(in(5)); pred=xa+abs(c.safety_predict_s)*abs(in(6));
 if st.safety
@@ -336,8 +343,8 @@ elseif abs(in(4))>c.max_physics_residual
     st.ood=true; st.fault=bitor(st.fault,uint32(2));
 end
 mailbox=1+(in(1)>=1.5)+(in(1)>=2.5)+(in(1)>=3.5);
-if mailbox_bad, mailbox=4; end
-if mailbox_bad || in(2)<c.min_ai_confidence || in(1)>=3.5
+if outer_bad, mailbox=4; end
+if outer_bad || in(2)<c.min_ai_confidence || in(1)>=3.5
     st.conf=true; st.fault=bitor(st.fault,uint32(4));
 elseif in(2)>=c.confidence_clear_ratio && in(1)<3.5
     st.conf=false;
@@ -390,7 +397,7 @@ if gate~=1
 end
 if reg~=old, st.dwell=0; else, st.dwell=st.dwell+1; end
 st.regime=reg;
-out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault),double(mailbox_bad)];
+out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault),double(outer_bad)];
 end
 
 function y=clamp(x,lo,hi)

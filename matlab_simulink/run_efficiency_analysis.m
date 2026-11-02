@@ -20,29 +20,21 @@ for j=1:numel(E.samples)
     E.nominal(j)=a.metrics.rmse(2,1); E.frozen(j)=b.metrics.rmse(2,2);
     E.retrained(j)=c.metrics.rmse(2,2);
 end
-grid=[.75 1 1;1 1 1;1.25 1 1;2 1 1;1.25 .5 1;1.25 .75 1];
 for j=1:2
-    drift=[.35 .5]; drift=drift(j); started=tic; candidates=cell(1,6); b1_candidates=cell(1,6);
-    for k=1:6
-        candidates{k}=evaluate(P,drift,3,grid(k,:));
-        b1_candidates{k}=evaluate(P,drift,1,grid(k,:));
-    end
-    costs=cellfun(@(a) a.score,candidates); valid=cellfun(@(a) a.valid,candidates);
-    costs(~valid)=Inf; [best,chosen]=min(costs); knobs=[1 1 1];
-    if isfinite(best), knobs=grid(chosen,:); end
+    drift=[.35 .5]; drift=drift(j); started=tic;
+    [candidates,knobs]=search(P,drift,3);
+    [b1_candidates,b1_knobs]=search(P,drift,1);
     b1_costs=cellfun(@(a) a.score,b1_candidates); [~,best_b1]=min(b1_costs);
-    b1_valid=cellfun(@(a) a.valid,b1_candidates); b1_safe_costs=b1_costs; b1_safe_costs(~b1_valid)=Inf;
-    [b1_safe,b1_deploy]=min(b1_safe_costs); b1_knobs=[1 1 1];
-    if isfinite(b1_safe), b1_knobs=grid(b1_deploy,:); end
+    b1_best_knobs=b1_candidates{best_b1}.knobs;
     valid=struct('branches',[1 3],'scenario',1,'duration',6,'seed',811, ...
         'drift',drift,'ood',false,'amplitude',.43);
     before=sim_core_engine(P,valid); valid.branches=3; valid.tuning=knobs; after=sim_core_engine(P,valid);
-    Q=P; Q.baseline=P.baseline.*grid(best_b1,[1 2 1]); valid.branches=1;
+    Q=P; Q.baseline=P.baseline.*b1_best_knobs([1 2 1]); valid.branches=1;
     b1_best=sim_core_engine(Q,valid);
     mission=sim_core_engine(P,struct('branches',3,'seed',811,'drift',drift,'tuning',knobs));
     b1_mission=sim_core_engine(Q,struct('branches',1,'seed',811,'drift',drift));
     E.tuning(j)=struct('drift',drift,'knobs',knobs,'b1_deployment_knobs',b1_knobs, ...
-        'b1_best_knobs',grid(best_b1,:),'b1_best_feasible',b1_candidates{best_b1}.valid, ...
+        'b1_best_knobs',b1_best_knobs,'b1_best_feasible',b1_candidates{best_b1}.valid, ...
         'before_rmse',before.metrics.rmse(3,2),'after_rmse',after.metrics.rmse(3,2), ...
         'b1_rmse',before.metrics.rmse(1,2),'b1_best_rmse',b1_best.metrics.rmse(1,2), ...
         'before_tv',before.metrics.tv(3,2),'after_tv',after.metrics.tv(3,2), ...
@@ -64,6 +56,17 @@ end
 E.matlab_action_us=toc(started)*100; assert(isfinite(checksum));
 assert(all(isfinite([E.tuning.after_rmse])) && all([E.tuning.after_breach]==0),'Unsafe field-tuning validation.');
 if opts.make_figure, draw_efficiency(E,opts.assets_dir); end
+end
+
+function [candidates,knobs]=search(P,drift,branch)
+gains=[.75 1 1.25 2]; damping=[.5 .75]; knobs=[1 1 1]; best=Inf;
+candidates=cell(1,6); anchor=knobs(1);
+for k=1:6
+    if k<=4, trial=[gains(k) 1 1]; else, trial=[anchor damping(k-4) 1]; end
+    a=evaluate(P,drift,branch,trial); candidates{k}=a;
+    if a.valid && a.score<best, best=a.score; knobs=trial; end
+    if k==4, anchor=knobs(1); end
+end
 end
 
 function a=evaluate(P,drift,branch,knobs)
