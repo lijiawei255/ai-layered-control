@@ -40,8 +40,9 @@ Freeze these parameters, then call `auto_field_tune(evaluate, current)`.
 The trial callback returns `(measured_cost, valid)`; reject constraint violations.
 Include load/stiction and contact trials, contact-force limits, veto fraction and R4 occupancy.
 Invalid candidates cannot win, and an entirely invalid search returns the current knobs.
-The six-trial search tests gains {0.75,1,1.25,2} at damping 1, then damping {0.5,0.75}
-at the best feasible first-stage gain (current gain if none qualifies). Safety margin stays fixed.
+The fixed six-trial joint grid uses gain/damping pairs `(0.75,1)`, `(1,1)`, `(1.25,1)`,
+`(2,1)`, `(1.25,0.5)` and `(1.25,0.75)`. Safety margin stays fixed.
+Each pair is evaluated independently: an infeasible higher-damping trial does not exclude its lower-damping counterpart.
 Gain/damping lie in [0.10,4.0], margin in [0.10,1.0]. R4 ignores these gain scalings,
 trajectory references and feedforward; it uses fixed feedback toward the safe zero.
 

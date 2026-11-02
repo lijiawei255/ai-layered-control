@@ -110,10 +110,14 @@ assert(all(D.free_energy_ratio<.01) && all(D.free_peak_ratio<1.01),'Free structu
 assert(all(V.broadband_only.violations(3,:)==0) && ~isempty(first),'Independent broadband veto failed.');
 fprintf('[3] Composite OOD and five holdout B3 state-envelope checks: PASS\n');
 assert(E.retrained(end)<E.frozen(end),'Retrained action-head recovery failed.');
+expected_improvement=[.187 .165];
 for j=1:numel(E.tuning)
     a=E.tuning(j); chosen=find(cellfun(@(c) isequal(c.knobs,a.knobs),a.candidates),1);
     assert(~isempty(chosen) && a.candidates{chosen}.score<=a.candidates{2}.score, ...
         'Field tuning did not preserve or improve the commissioning objective.');
+    assert(isequal(a.knobs,[1.25 .5 1]) && ...
+        abs(1-a.after_rmse/a.before_rmse-expected_improvement(j))<.005, ...
+        'Joint field-tuning validation differs from the commissioned benchmark.');
     assert(E.tuning(j).mission_constraints.valid,'Tuned mission constraints failed.');
 end
 fprintf('[4] Frozen-AI tuning and action-label sample budget: PASS\n');

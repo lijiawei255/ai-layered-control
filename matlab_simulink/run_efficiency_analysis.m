@@ -59,13 +59,12 @@ if opts.make_figure, draw_efficiency(E,opts.assets_dir); end
 end
 
 function [candidates,knobs]=search(P,drift,branch)
-gains=[.75 1 1.25 2]; damping=[.5 .75]; knobs=[1 1 1]; best=Inf;
-candidates=cell(1,6); anchor=knobs(1);
+grid=[.75 1;1 1;1.25 1;2 1;1.25 .5;1.25 .75];
+knobs=[1 1 1]; best=Inf; candidates=cell(1,6);
 for k=1:6
-    if k<=4, trial=[gains(k) 1 1]; else, trial=[anchor damping(k-4) 1]; end
+    trial=[grid(k,:) 1];
     a=evaluate(P,drift,branch,trial); candidates{k}=a;
     if a.valid && a.score<best, best=a.score; knobs=trial; end
-    if k==4, anchor=knobs(1); end
 end
 end
 

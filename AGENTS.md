@@ -120,8 +120,8 @@ Set `valid=False` on any state, contact, actuator or device-specific constraint 
 Each candidate must cover load/stiction and contact conditions, including harmonic and ramped references.
 Constrain contact force, gate-veto fraction and R4 occupancy; repeat those checks after tuning.
 The helper rejects invalid/nonfinite scores and retains `current` when all candidates fail.
-Test gains {0.75,1,1.25,2} at damping 1, then damping {0.5,0.75} at the best feasible first-stage gain.
-If the first stage has no feasible trial, use the current gain for the second stage: six trials in total.
+Evaluate six fixed joint (gain, damping) candidates: (0.75,1), (1,1), (1.25,1), (2,1),
+(1.25,0.5), (1.25,0.75). Each pair is evaluated independently under the same constraints.
 The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
 veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 runs and a 40 s mission

@@ -46,23 +46,23 @@ RMSE compares reference and true state at the same tick. TV is the within-stage 
 
 **Zero-retraining unit adaptation.** The classifier stays frozen. These independent S2 validations use a 6 s trajectory of amplitude 0.43 rad, seed 811, shared by all controllers. They are separate from the 10 s S2 window above. “+35% / +50% unit drift” means **inertia change plus strong stiction**, not inertia alone; amplified friction dominates this fixture's S2 error. RMSE is in rad and TV in N·m.
 
-| Unit drift | B1 factory | B1 equal-budget S2-best (infeasible) | B3 factory (1,1,1) | B3 feasible tuning (1,0.5,1) | B3 RMSE change | B3 TV: before → after |
+| Unit drift | B1 factory | B1 equal-budget S2-best (infeasible) | B3 factory (1,1,1) | B3 feasible tuning (1.25,0.5,1) | B3 RMSE reduction | B3 TV: before → after |
 |---|---|---|---|---|---|---|
-| +35% | 0.016682 | 0.007751 | 0.020331 | 0.021810 | +7.3% | 1249.03 → 779.21 |
-| +50% | 0.023648 | 0.009317 | 0.027846 | 0.024543 | -11.9% | 1254.20 → 785.96 |
+| +35% | 0.016682 | 0.007751 | 0.020331 | 0.016522 | 18.7% | 1249.03 → 864.10 |
+| +50% | 0.023648 | 0.009317 | 0.027846 | 0.023253 | 16.5% | 1254.20 → 902.48 |
 
-B3 selects **`(1,0.5,1)`**, in `gain / damping / safety margin` order. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
+B3 selects **`(1.25,0.5,1)`**, in `gain / damping / safety margin` order. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
 
 | Unit drift | Candidate | S3 peak / N | S3 TV / N·m | S3 veto fraction | S3 R4 fraction | Mission violation ticks |
 |---|---|---|---|---|---|---|
-| +35% | B3 (1,0.5,1) | 16.12 | 2012.49 | 0.00% | 0.00% | 0 |
+| +35% | B3 (1.25,0.5,1) | 17.93 | 2061.94 | 0.00% | 0.00% | 0 |
 | +35% | B1 (2,1,1) | 75.51 | 16372.36 | 0.00% | 0.00% | 1397 |
-| +50% | B3 (1,0.5,1) | 16.72 | 2012.40 | 0.00% | 0.00% | 0 |
+| +50% | B3 (1.25,0.5,1) | 18.65 | 2061.46 | 0.00% | 0.00% | 0 |
 | +50% | B1 (2,1,1) | 75.49 | 16347.53 | 0.00% | 0.00% | 1031 |
 
-Each branch receives the same six-trial coordinate search: gains `{0.75,1,1.25,2}` at damping 1, then damping `{0.5,0.75}` at the best feasible first-stage gain. If no first-stage trial qualifies, the second stage uses the current gain. Safety margin stays at 1. Each 40 s trial includes sinusoidal and ramped references, stiction, contact and OOD. Acceptance requires zero state violations, S1 RMSE < 0.01 rad, and in each normal stage peak contact < 20 N, veto fraction ≤ 5% and R4 occupancy ≤ 10%. The objective is measured S2 error. All six B1 candidates fail the joint constraints; the helper retains current knobs if none qualifies.
+Each branch receives the same six fixed joint gain/damping candidates: `(0.75,1)`, `(1,1)`, `(1.25,1)`, `(2,1)`, `(1.25,0.5)`, `(1.25,0.75)`; safety margin stays at 1. Each pair is evaluated independently. Each 40 s trial includes sinusoidal and ramped references, stiction, contact and OOD. Acceptance requires zero state violations, S1 RMSE < 0.01 rad, and in each normal stage peak contact < 20 N, veto fraction ≤ 5% and R4 occupancy ≤ 10%. The objective is measured S2 error. All six B1 candidates fail the joint constraints; the helper retains current knobs if none qualifies.
 
-The search takes **240 s of device trajectories per branch and unit**, followed by **12 s paired S2 validation + 40 s full-mission validation**. Host computation time is reported separately. Accepted B3 tuning reduces measured error on the search trajectory by **4.4% / 4.6%**. Independent S2 validation RMSE increases **7.3%** on the +35% unit and decreases **11.9%** on the +50% unit; both remain above factory B1. Both units meet the measured contact budget with zero normal-stage veto/R4 occupancy. Coordinate search does not explore lower damping at gains rejected in its first stage, and does not guarantee lower error on an independent trajectory. B3 accepts position error during contact and stops reference tracking in R4; S4 RMSE is not a safety ranking.
+The search takes **240 s of device trajectories per branch and unit**, followed by **12 s paired S2 validation + 40 s full-mission validation**. Host computation time is reported separately. Accepted B3 tuning reduces independent S2 validation RMSE by **18.7% / 16.5%**. The tuned errors are slightly below factory B1 while meeting the measured contact budget, with zero normal-stage veto/R4 occupancy. B3 accepts position error during contact and stops reference tracking in R4; S4 RMSE is not a safety ranking.
 
 **Command smoothing explains much of B3's TV advantage.** Giving B1 the identical per-tick low-pass coefficient `alpha = 0.3` reduces TV substantially but leaves excessive contact force:
 

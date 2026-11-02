@@ -784,12 +784,13 @@ def selftest():
     trials = []
     def evaluate(knobs):
         trials.append(knobs)
-        return (knobs[0]-2)**2 + (knobs[1]-.5)**2, True
-    assert auto_field_tune(evaluate) == (2., .5, 1)
-    assert len(trials) == 6 and trials[-2:] == [(2., .5, 1), (2., .75, 1)]
+        return (knobs[0]-1.25)**2 + (knobs[1]-.5)**2, knobs[:2] != (1.25, 1.)
+    assert auto_field_tune(evaluate, (.9,.8,.7)) == (1.25, .5, .7)
+    assert trials == [(.75,1.,.7), (1.,1.,.7), (1.25,1.,.7), (2.,1.,.7), (1.25,.5,.7), (1.25,.75,.7)]
     assert auto_field_tune(lambda _: (math.nan, False), (.9,.8,.7)) == (.9,.8,.7)
+    assert auto_field_tune(lambda _: (math.inf, True), (.9,.8,.7)) == (.9,.8,.7)
     print(f'PASS: 6000 frames; gate/regime/fault exact; max|du|={maxerr:.3g}')
-    print('PASS: four mid-run tuning faults; zero HOLD/breaches, finite nominal integrators and clean recovery; adaptive gain/damping search')
+    print('PASS: four mid-run tuning faults; zero HOLD/breaches, finite nominal integrators and clean recovery; fixed six-candidate joint search')
 
 def physics_checks():
     for drive in (0.5, 1.01):
@@ -856,6 +857,10 @@ def main():
     assert m['B1']['S3']['peak_N'] > 20 and m['B3']['S3']['peak_N'] < 20
     assert m['B1']['S4']['breach'] > 0 and m['B2']['S4']['breach'] > 0
     assert all(row['search_cost_after'] <= row['search_cost_before'] for row in tune)
+    for row, expected in zip(tune, (.187, .165)):
+        assert row['knobs'] == [1.25, .5, 1.]
+        assert abs(1 - row['after']['rmse']/row['before']['rmse'] - expected) < .005
+        assert row['before']['breach'] == row['after']['breach'] == 0
     assert all((s['breach'] == 0 for row in tune for s in row['mission'].values()))
     assert all(row['mission'][stage]['peak_N'] < 20 and row['mission'][stage]['veto_rate'] <= .05
                and row['mission'][stage]['safe'] <= 1000

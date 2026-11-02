@@ -59,13 +59,13 @@ def auto_calibrate(samples, labels):
 def auto_field_tune(evaluate, current=(1, 1, 1)):
     """Six bounded trials; device-side validity includes every operating regime."""
     best, score = current, float("inf")
-    for stage in (0, 1):
-        grid = [(g, 1.) for g in (.75, 1., 1.25, 2.)] if stage == 0 else [(best[0], d) for d in (.5, .75)]
-        for gain, damping in grid:
-            candidate = (gain, damping, current[2])
-            cost, valid = evaluate(candidate)
-            if valid and np.isfinite(cost) and cost < score:
-                best, score = candidate, cost
+    grid = ((.75, 1.), (1., 1.), (1.25, 1.),
+            (2., 1.), (1.25, .5), (1.25, .75))
+    for gain, damping in grid:
+        candidate = (gain, damping, current[2])
+        cost, valid = evaluate(candidate)
+        if valid and np.isfinite(cost) and cost < score:
+            best, score = candidate, cost
     return best
 
 def classify(features, model):
