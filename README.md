@@ -59,6 +59,14 @@ The key v1.1.0 detail is the **orthogonal residual probe**:
 
 The gate receives `max(res_fast, res_hf_gated)`. This is why 20× broadband measurement noise (S3) does not trip the OOD veto, while a 42 Hz structural resonance does.
 
+### Engineering-systems division of labour
+
+This is not a bid for a larger single-point model. It is a structural division of labour: the **10 Hz slow loop** is given the job AI is actually good at — qualitative pattern recognition and coarse semantic classification in a dimensionless feature space — and is deliberately kept away from high-frequency continuous control, where an end-to-end model can overfit the old machine's inverse-dynamics manifold, jitter under edge inference, and hallucinate a confident command in an unseen OOD condition. The **1 kHz fast loop** is given the job deterministic control is good at — continuous high-rate regulation, quantitative drift absorption, and hard-real-time safety — with an O(1) gate and a minimal physics-residual probe enforcing the envelope.
+
+### Why a synthetic isomorphic benchmark?
+
+As a general architecture reference, the repository deliberately uses a **parameterised synthetic nonlinear plant** as a controlled stress test. On a real production line or clinical device one cannot safely and repeatably inject an unseen structural resonance (Stage 4) to measure an end-to-end model's destructive envelope breach, cannot lock a unit to exactly +35 % parameter drift, and cannot sweep `N = 15…2000` calibration samples for a clean counterfactual ablation. The synthetic benchmark makes those counterfactuals exact and reproducible; the domain presets are isomorphic mappings, not claims of hardware validation.
+
 ## 2. Headline numbers
 
 Industrial reference preset, 40 s, 4 stages, 1 kHz inner loop, three branches on the identical plant, reference, noise realisation and fault schedule:
@@ -93,7 +101,7 @@ Industrial reference preset, 40 s, 4 stages, 1 kHz inner loop, three branches on
 
 The oracle is the ideal-classifier bound; the deployed classifier is within 2 % of its S1–S3 RMSE (0.00700 vs 0.00710). The stage-forced dynamic passes the `<0.8 ×` fixed-bank criterion (`0.00710 / 0.00935 = 0.759`) and the 40 s criterion.
 
-## 4. Paired sample complexity (Panel A)
+## 4. Paired sample complexity (Figure 2, Panel A)
 
 Both learners receive the **same N paired samples from the nominal unit** (`drift = 0`); the test deployment is the same unit at 0 % drift and a +35 % drifted unit. The oracle is the same 495-term continuous head retrained on +35 % drifted data.
 
@@ -139,7 +147,7 @@ Success criteria:
 | model | `matlab_simulink/ai_layered_control_bench.slx` rebuilt (built-in blocks only) if Simulink is installed and the model is not open with unsaved edits |
 | exit code | `0` |
 
-If Simulink is not installed, the numeric benchmark and all five checks still run; the `.slx` step prints a skip line. A loaded model with unsaved edits is never closed or overwritten.
+If Simulink is not installed, the numeric benchmark and all five checks still run; the `.slx` step prints a skip line.
 
 ### C99 core regression test
 
@@ -148,6 +156,15 @@ cd c99_layered_core
 gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe layered_gatekeeper.c test_gatekeeper_standalone.c
 .\test_gatekeeper_standalone.exe
 $LASTEXITCODE
+```
+
+Linux / macOS (bash / zsh):
+
+```bash
+cd c99_layered_core
+cc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone layered_gatekeeper.c test_gatekeeper_standalone.c
+./test_gatekeeper_standalone
+echo $?
 ```
 
 Expected: `SUMMARY: n_pass=116, n_fail=0`, exit code 0, no compiler diagnostics.
@@ -176,6 +193,25 @@ python python_bench/run_benchmark.py
 The entry tries to compile `c99_layered_core/layered_gatekeeper.c` with `ctypes` (Windows `.dll`, macOS `.dylib`, Linux `.so`); if no compiler is present it prints one line and falls back to the pure-Python/NumPy gatekeeper mirror. `--no-c` forces the mirror; `--selftest` replays 500 deterministic frames through both implementations and requires exact gate/regime and `|du| <= 1e-5`.
 
 The **1 kHz C99 gatekeeper is frame-for-frame equivalent** between the MATLAB engine and the Python implementation (`--selftest` max `|du| = 1.55e-07 < 1e-6`). The standalone Python benchmark's 10 Hz outer probe uses adaptive noise floors and a confidence EMA; therefore its B3 S1–S4 RMSE is **0.0090 / 0.0053 / 0.0343 / 0.0873**, OOD veto **9.0 ms** (< 10 ms), and its safety-violation tick count is **0** in every stage. Those Python-run numbers intentionally differ from the MATLAB 40 s table; the gate semantics and C core do not.
+
+### Reusable core vs benchmark harness
+
+| Role | Files | What to do |
+| :--- | :--- | :--- |
+| **[REUSABLE CORE]** | `c99_layered_core/layered_gatekeeper.c/.h` + `python_bench/minimal_template.py` | Copy these into the target project. The template is a 10 Hz + 1 kHz copy-paste skeleton; it loads the C core via `ctypes` or falls back to a minimal Python gate. |
+| **[BENCHMARK HARNESS]** | `matlab_simulink/run_all_benchmarks.m`, `matlab_simulink/sim_core_engine.m`, `python_bench/run_benchmark.py` | Reproduces the 40 s paper/repo figures. **Do not copy the synthetic plant into production.** |
+
+`python_bench/minimal_template.py` has exactly three replacement slots:
+
+1. `[USER-PLUGIN-SLOT 1]` — `read_plant_and_reference(t)`: real sensor `(q, dq)` and reference `(q_ref, dq_ref, ddq_ref)`;
+2. `[USER-PLUGIN-SLOT 2]` — `compute_nominal_residual(q, dq, u_prev)`: the domain's minimal nominal-physics residual probe;
+3. `[USER-PLUGIN-SLOT 3]` — `slow_loop_10hz_step(...)`: 4-D dimensionless macro-features, margin × proximity confidence, S3 residual guard, coarse `ai_regime ∈ {1,2,3,4}`.
+
+It runs a one-second, 1 kHz closed-loop demo and exits with `[OK] Minimal layered control loop completed (0 safety violations)`:
+
+```powershell
+python python_bench/minimal_template.py
+```
 
 ### Simulink model as a standalone artifact
 
@@ -222,7 +258,9 @@ ai-layered-control/
 │   ├── verify_core_equivalence.m
 │   └── ai_layered_control_bench.slx    generated artifact
 ├── python_bench/
-│   ├── run_benchmark.py                ctypes C core or NumPy fallback
+│   ├── minimal_template.py             98-line reusable copy-paste skeleton
+│   ├── run_benchmark.py                ctypes C core or NumPy fallback (40 s harness)
+│   ├── README.md                       reusable-core / harness distinction
 │   └── requirements.txt
 └── assets/                             three generated 240 dpi figures
 ```

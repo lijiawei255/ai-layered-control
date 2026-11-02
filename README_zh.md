@@ -59,6 +59,14 @@ v1.1.0 的关键细节是**正交残差探针**：
 
 门控接收 `max(res_fast, res_hf_gated)`。因此 20 倍宽带测量噪声（S3）不会触发 OOD，而 42 Hz 结构谐振会。
 
+### 工程系统论的职责解耦
+
+本架构不是去卷更大的单点模型，而是从工程系统论出发做结构层分工：**10 Hz 慢环 AI** 发挥其“模式识别与定性语义归类”的长处，仅在无量纲空间做粗粒度工况选择题，规避端到端 AI 在高频连续控制中易过拟合旧机台逆动力学流形、推理抖动及 OOD 强行乱输出的短板；**1 kHz 快环确定性 C99 核心**发挥其“高频连续调节、定量漂移吸收与硬实时安全兜底”的长处，以常数时间 O(1) 门控与极简物理残差探针锁死安全边界。
+
+### 为什么采用合成同构基准？
+
+作为通用架构参考库，本仓库蓄意采用**参数化合成非线性被控对象**作为受控压力测试（Controlled Stress-Testing）。在真实工业产线或临床设备上，无法安全、可重复地注入极端未见共振故障（Stage 4）来检验端到端模型的越界破坏力，也无法精确锁定 `+35%` 参数漂移或精确扫描 `N = 15..2000` 样本复杂度来做严格的反事实消融（Ablation）。合成基准让这些反事实精确、可复现；三个域预设是同构映射，不是硬件验证结论。
+
 ## 2. 主指标
 
 工业参考预设，40 s，4 阶段，1 kHz 内环；三条支路使用相同对象、参考、噪声实现与故障时序：
@@ -93,7 +101,7 @@ v1.1.0 的关键细节是**正交残差探针**：
 
 oracle 是理想分类器的上界；实际分类器 S1–S3 RMSE 与上界相差 2% 以内（0.00700 对 0.00710，略优）。stage-forced 动态满足 `<0.8 ×` 固定 bank 判据（`0.00710 / 0.00935 = 0.759`）与 40 s 判据。
 
-## 4. 成对样本复杂度（Panel A）
+## 4. 成对样本复杂度（图 2 左子图，Panel A）
 
 两个学习器**严格共用同一批名义机组（drift = 0）的 N 个成对样本**；部署在 0% 漂移与 +35% 漂移的同一机组上。oracle 是同一 495 项连续头改用 +35% 漂移数据训练：
 
@@ -139,7 +147,7 @@ matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 | 模型 | 有 Simulink 且模型无未保存编辑时，重建 `matlab_simulink/ai_layered_control_bench.slx` |
 | 退出码 | `0` |
 
-没有 Simulink 时，数值基准与五项检查仍全部运行，`.slx` 步骤打印 skip。已加载且有未保存编辑的模型绝不被关闭或覆盖。
+没有 Simulink 时，数值基准与五项检查仍全部运行，`.slx` 步骤打印 skip。
 
 ### C99 核心回归测试
 
@@ -148,6 +156,15 @@ cd c99_layered_core
 gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe layered_gatekeeper.c test_gatekeeper_standalone.c
 .\test_gatekeeper_standalone.exe
 $LASTEXITCODE
+```
+
+Linux / macOS（bash / zsh）：
+
+```bash
+cd c99_layered_core
+cc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone layered_gatekeeper.c test_gatekeeper_standalone.c
+./test_gatekeeper_standalone
+echo $?
 ```
 
 期望：`SUMMARY: n_pass=116, n_fail=0`，退出码 0，无编译诊断。
@@ -176,6 +193,25 @@ python python_bench/run_benchmark.py
 入口优先用 `ctypes` 编译 `c99_layered_core/layered_gatekeeper.c`（Windows `.dll`、macOS `.dylib`、Linux `.so`）；没有编译器时打印一行提示并回退到纯 Python/NumPy 门控镜像。`--no-c` 强制镜像；`--selftest` 用 500 个确定性随机帧比较两套实现，要求 gate/regime 完全一致且 `|du| <= 1e-5`。
 
 **1 kHz C99 门控核在 MATLAB 与 Python 中逐帧完全等价**（`--selftest` 误差 `max|du| = 1.55e-07 < 1e-6`）。Python 独立基准的 10 Hz 外环探针采用自适应噪声底与置信度 EMA，因此其 B3 S1–S4 RMSE 为 **0.0090 / 0.0053 / 0.0343 / 0.0873**，OOD 弃权延迟 **9.0 ms**（<10 ms），各阶段安全越界采样点均为 **0**。这些 Python 运行数字有意与 MATLAB 40 s 表不同；门控语义与 C 核心相同。
+
+### 可复用核心 vs 基准脚手架
+
+| 角色 | 文件 | 用法 |
+| :--- | :--- | :--- |
+| **[REUSABLE CORE]** | `c99_layered_core/layered_gatekeeper.c/.h` + `python_bench/minimal_template.py` | 直接拷贝进目标工程。模板是 10 Hz + 1 kHz 的可复制骨架；自动 `ctypes` 加载 C 核，无编译器时回退最小 Python 门控。 |
+| **[BENCHMARK HARNESS]** | `matlab_simulink/run_all_benchmarks.m`、`matlab_simulink/sim_core_engine.m`、`python_bench/run_benchmark.py` | 仅用于复现 40 s 论文/仓库图。**不要把合成被控对象拷入生产工程。** |
+
+`python_bench/minimal_template.py` 只有三个替换插槽：
+
+1. `[USER-PLUGIN-SLOT 1]` — `read_plant_and_reference(t)`：真实传感器 `(q, dq)` 与参考 `(q_ref, dq_ref, ddq_ref)`；
+2. `[USER-PLUGIN-SLOT 2]` — `compute_nominal_residual(q, dq, u_prev)`：目标域的极简名义物理残差探针；
+3. `[USER-PLUGIN-SLOT 3]` — `slow_loop_10hz_step(...)`：4 维无量纲宏观特征、margin × proximity 置信度、S3 残差守卫、粗粒度 `ai_regime ∈ {1,2,3,4}`。
+
+运行一秒、1 kHz 闭环演示，成功输出 `[OK] Minimal layered control loop completed (0 safety violations)`：
+
+```powershell
+python python_bench/minimal_template.py
+```
 
 ### `.slx` 独立运行
 
@@ -222,7 +258,9 @@ ai-layered-control/
 │   ├── verify_core_equivalence.m
 │   └── ai_layered_control_bench.slx    生成产物
 ├── python_bench/
-│   ├── run_benchmark.py                ctypes C 核心或 NumPy 回退
+│   ├── minimal_template.py             98 行可复用复制骨架
+│   ├── run_benchmark.py                ctypes C 核心或 NumPy 回退（40 s 基准）
+│   ├── README.md                       可复用核心 / 脚手架区分
 │   └── requirements.txt
 └── assets/                             三张生成的 240 dpi 图
 ```

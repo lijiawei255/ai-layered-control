@@ -52,7 +52,11 @@ mkdir(tmp);
 cleaner = onCleanup(@() local_rmdir(tmp)); %#ok<NASGU>
 infile  = fullfile(tmp, 'trace.txt');
 outfile = fullfile(tmp, 'c_out.txt');
-exe     = fullfile(tmp, 'verify_core_equivalence.exe');
+if ispc
+    exe = fullfile(tmp, 'verify_core_equivalence.exe');
+else
+    exe = fullfile(tmp, 'verify_core_equivalence');
+end
 
 % --- 3. write config + input trace ---------------------------------------
 fid = fopen(infile, 'w');
