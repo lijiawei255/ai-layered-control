@@ -2,7 +2,6 @@ function report = verify_core_equivalence(P, opts)
 %VERIFY_CORE_EQUIVALENCE Replay 40,000 identical input frames through C99.
 if nargin<1, P=load_domain_profile(); end
 if nargin<2, opts=struct(); end
-if isempty(P.classifier), P.classifier=calibrate_coarse_classifier(P); end
 here=fileparts(mfilename('fullpath'));
 core=fullfile(here,'..','c99_layered_core','layered_gatekeeper.c');
 harness=fullfile(here,'..','c99_layered_core','verify_core_equivalence.c');
@@ -12,9 +11,9 @@ for j=1:numel(candidates)
     [status,~]=system(sprintf('"%s" --version',candidates{j}));
     if status==0, compiler=candidates{j}; break; end
 end
-if isempty(compiler)
-    report=struct('status','skipped'); fprintf('SKIP: no C99 compiler found.\n'); return;
-end
+assert(~isempty(compiler),'verify_core_equivalence:compiler', ...
+    'No C99 compiler found. Set CC or put gcc, cc or clang on PATH.');
+if isempty(P.classifier), P.classifier=calibrate_coarse_classifier(P); end
 opts.branches=3; opts.log_core=true; out=sim_core_engine(P,opts);
 CI=out.b3.core_in; CO=out.b3.core_out; N=size(CI,1); cfg=out.config;
 tmp=tempname; mkdir(tmp); cleaner=onCleanup(@() rmdir(tmp,'s'));
@@ -24,8 +23,9 @@ fid=fopen(infile,'w'); fprintf(fid,'%d\n',N);
 fields={'dt_s','outer_timeout_s','max_physics_residual','residual_clear_ratio', ...
  'min_ai_confidence','confidence_clear_ratio','state_safety_limit','safety_trip_ratio', ...
  'safety_clear_ratio','safety_predict_s','u_max','u_slew_max_per_s','blend_alpha', ...
- 'integ_limit','windup_tau_s','min_dwell_ticks','ood_recovery_cooldown_ticks'};
+ 'integ_limit','windup_tau_s'};
 for j=1:numel(fields), fprintf(fid,'%.9g ',double(single(cfg.(fields{j})))); end
+fprintf(fid,'%u %u ',uint32(cfg.min_dwell_ticks),uint32(cfg.ood_recovery_cooldown_ticks));
 fprintf(fid,'%.9g ',double(single([cfg.kp;cfg.kd;cfg.ki;cfg.ff_scale])));
 trace=[out.b3.core_tuning,CI];
 bits=reshape(typecast(single(trace(:)),'uint32'),size(trace));

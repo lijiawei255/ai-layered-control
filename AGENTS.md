@@ -49,6 +49,7 @@ LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 
 Priority is envelope, residual, confidence, then native latency HOLD.
 All bank integrators track the actually applied command, including inactive banks.
+Dwell and diagnostic counters saturate at UINT32_MAX; they never wrap.
 `blend_alpha` smooths the controller target on every control tick after initialization;
 it is not a switch-only filter. Magnitude limiting precedes hardware slew limiting.
 Nominal feedforward is deterministic and shared by B1/B3 normal banks.
@@ -100,6 +101,7 @@ The benchmark's radians, torques and mechanical reference are one interface exam
 ### Step 2 — Commission the nominal fast loop
 
 Copy the C99 core unchanged and define the four controller banks in the device adapter.
+Preserve `LICENSE` and its MIT copyright and permission notice when copying or distributing the core.
 Commission the nominal model, deterministic feedforward and independent innovation probe.
 Verify command magnitude/slew bounds, corruption handling, gate priorities and recovery.
 Measure target execution time separately from host ctypes call time.

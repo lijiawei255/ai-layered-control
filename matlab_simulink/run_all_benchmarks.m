@@ -97,6 +97,7 @@ for b=1:3
 end
 assert(main.b2.calls==40000 && all(M.rmse(:,1)<.01),'Nominal accuracy or action rate failed.');
 assert(D.lcg_last==.16194512567017227,'LCG sequence differs.');
+assert(D.counter_bounds,'Counter saturation boundaries failed.');
 fprintf('[1] Equal 1 kHz action rate, nominal tracking and actuator bounds: PASS\n');
 assert(M.rmse(2,2)>M.rmse(1,2) && M.rmse(3,2)<.03,'S2 transfer result failed.');
 assert(M.peak_contact(1,3)>20 && M.peak_contact(3,3)<20 && M.tv(3,3)<M.tv(1,3),'Contact tradeoff failed.');

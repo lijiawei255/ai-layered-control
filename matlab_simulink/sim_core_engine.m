@@ -187,6 +187,8 @@ if ~isempty(P.classifier)
     cfg.min_ai_confidence=P.classifier.trip; cfg.confidence_clear_ratio=P.classifier.clear;
 end
 ckeys=fieldnames(cfg); for j=1:numel(ckeys), cfg.(ckeys{j})=single(cfg.(ckeys{j})); end
+cfg.min_dwell_ticks=uint32(P.cfg.min_dwell_ticks);
+cfg.ood_recovery_cooldown_ticks=uint32(P.cfg.ood_recovery_cooldown_ticks);
 tuning=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
 logs=zeros(n,14); macro=zeros(ceil(n/100),5);
 age=zeros(n,1);
@@ -271,6 +273,7 @@ end
 
 function D=physical_probes(P)
 nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
+D.counter_bounds=counter_bounds(P.cfg);
 sequence=lcg(18,1000); D.lcg_last=sequence(end);
 D.sensor_hz=[12 18 37 83 137]; D.sensor_detect_ms=nan(1,5);
 for j=1:5
@@ -297,10 +300,47 @@ for j=1:3
 end
 end
 
+function passed=counter_bounds(c)
+keys=fieldnames(c); for j=1:numel(keys), c.(keys{j})=single(c.(keys{j})); end
+maximum=intmax('uint32'); c.min_dwell_ticks=maximum;
+t=single([1 1 1]); input=single([1 1 0 0 0 0 0 0 0]); base=core_init();
+counts={'step_count','safety_veto_count','ood_veto_count','low_confidence_veto_count', ...
+    'latency_hold_count','corrupted_frame_count'};
+for j=1:numel(counts), base.(counts{j})=maximum-uint32(1); end
+base.dwell=maximum-uint32(1); st=base;
+for j=1:2, st=core_step(st,c,t,input); end
+assert(st.dwell==maximum && st.step_count==maximum,'Normal counters wrapped.');
+request=input; request(1)=2; st=base; st.dwell=maximum-uint32(2);
+[st,out]=core_step(st,c,t,request);
+assert(out(4)==1 && st.dwell==maximum-uint32(1),'Maximum dwell switched too early.');
+[st,out]=core_step(st,c,t,request);
+assert(out(4)==2 && st.dwell==0,'Maximum dwell did not accept its boundary tick.');
+st=base; st.dwell=maximum; [~,out]=core_step(st,c,t,request);
+assert(out(4)==2,'Saturated dwell blocked a normal switch.');
+for threshold=0:1
+    q=c; q.min_dwell_ticks=uint32(threshold); [~,out]=core_step(core_init(),q,t,request);
+    assert(out(4)==2,'Zero/one-tick dwell delayed a normal switch.');
+end
+frames=repmat(input,7,1); frames(1,5)=2; frames(2,4)=2; frames(3,2)=0;
+frames(4,3)=c.outer_timeout_s+c.dt_s/2; frames(5,2)=NaN; frames(6,5)=NaN;
+targets=counts([2 3 4 5 6 6 6]);
+for j=1:size(frames,1)
+    st=base; q=c; if j==7, q.dt_s=single(NaN); end
+    for k=1:2
+        st.safety=false; st.ood=false; st.conf=false;
+        st=core_step(st,q,t,frames(j,:));
+    end
+    assert(st.(targets{j})==maximum && st.step_count==maximum,'Diagnostic counters wrapped.');
+end
+passed=true;
+end
+
 function st=core_init()
 st=struct('u_applied',single(0),'u_target',single(0),'integ',zeros(4,1,'single'), ...
     'blend',single(0),'started',false,'regime',1,'ood',false,'safety',false, ...
-    'conf',false,'dwell',0,'recovery',0,'fault',uint32(0));
+    'conf',false,'dwell',uint32(0),'recovery',uint32(0),'fault',uint32(0), ...
+    'step_count',uint32(0),'safety_veto_count',uint32(0),'ood_veto_count',uint32(0), ...
+    'low_confidence_veto_count',uint32(0),'latency_hold_count',uint32(0),'corrupted_frame_count',uint32(0));
 end
 
 function [st,out]=core_step(st,c,t,in)
@@ -322,35 +362,47 @@ bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
     c.safety_trip_ratio<=0 || c.safety_trip_ratio>1 || c.safety_clear_ratio<0 || ...
     c.safety_clear_ratio>c.safety_trip_ratio;
 if bad
-    st.fault=bitor(st.fault,uint32(16)); st.recovery=double(c.ood_recovery_cooldown_ticks);
+    st.fault=bitor(st.fault,uint32(16)); st.recovery=uint32(c.ood_recovery_cooldown_ticks);
+    st.corrupted_frame_count=st.corrupted_frame_count+uint32(1);
+    st.step_count=st.step_count+uint32(1);
     out=[double(st.u_applied),double(st.u_target),1,st.regime,double(st.blend),double(st.fault),1]; return;
 end
 tuning_bad=any(~isfinite(t)) || any(abs(t)>single(3e38)) || ...
     any(t<single(.1)) || t(1)>4 || t(2)>4 || t(3)>1;
 if tuning_bad, t=single([1 1 1]); end
 outer_bad=mailbox_bad || tuning_bad;
-if outer_bad, st.fault=bitor(st.fault,uint32(16)); end
+if outer_bad
+    st.fault=bitor(st.fault,uint32(16));
+    st.corrupted_frame_count=st.corrupted_frame_count+uint32(1);
+end
 dt=abs(c.dt_s); du=abs(c.u_slew_max_per_s)*dt;
 limit=abs(c.state_safety_limit*t(3)); xa=abs(in(5)); pred=xa+abs(c.safety_predict_s)*abs(in(6));
 if st.safety
     if xa<c.safety_clear_ratio*limit && pred<c.safety_clear_ratio*limit, st.safety=false; end
 elseif xa>c.safety_trip_ratio*limit || pred>limit
     st.safety=true; st.fault=bitor(st.fault,uint32(8));
+    st.safety_veto_count=st.safety_veto_count+uint32(1);
 end
 if st.ood
     if abs(in(4))<c.residual_clear_ratio*c.max_physics_residual, st.ood=false; end
 elseif abs(in(4))>c.max_physics_residual
     st.ood=true; st.fault=bitor(st.fault,uint32(2));
+    st.ood_veto_count=st.ood_veto_count+uint32(1);
 end
 mailbox=1+(in(1)>=1.5)+(in(1)>=2.5)+(in(1)>=3.5);
 if outer_bad, mailbox=4; end
+conf_before=st.conf;
 if outer_bad || in(2)<c.min_ai_confidence || in(1)>=3.5
     st.conf=true; st.fault=bitor(st.fault,uint32(4));
 elseif in(2)>=c.confidence_clear_ratio && in(1)<3.5
     st.conf=false;
 end
+if st.conf && ~conf_before, st.low_confidence_veto_count=st.low_confidence_veto_count+uint32(1); end
 stale=isfinite(in(3)) && abs(in(3))<=single(3e38) && in(3)>c.outer_timeout_s;
-if stale, st.fault=bitor(st.fault,uint32(1)); st.recovery=double(c.ood_recovery_cooldown_ticks); end
+if stale
+    st.fault=bitor(st.fault,uint32(1)); st.recovery=uint32(c.ood_recovery_cooldown_ticks);
+    if in(3)-c.outer_timeout_s<=dt, st.latency_hold_count=st.latency_hold_count+uint32(1); end
+end
 old=st.regime;
 if st.safety, gate=4; reg=4;
 elseif st.ood, gate=2; reg=4;
@@ -362,13 +414,13 @@ else
         st.recovery=st.recovery-1; reg=4;
     elseif mailbox==old
         reg=old;
-    elseif st.dwell+1>=c.min_dwell_ticks
+    elseif st.dwell+uint32(1)>=c.min_dwell_ticks
         reg=double(mailbox);
     else
         reg=old;
     end
 end
-if st.safety || st.ood || st.conf, st.recovery=double(c.ood_recovery_cooldown_ticks); end
+if st.safety || st.ood || st.conf, st.recovery=uint32(c.ood_recovery_cooldown_ticks); end
 if gate~=1
     e=in(7)-in(5); ed=in(8)-in(6);
     bank=zeros(4,1,'single');
@@ -395,8 +447,9 @@ if gate~=1
     end
     st.u_applied=command; st.started=true;
 end
-if reg~=old, st.dwell=0; else, st.dwell=st.dwell+1; end
+if reg~=old, st.dwell=uint32(0); else, st.dwell=st.dwell+uint32(1); end
 st.regime=reg;
+st.step_count=st.step_count+uint32(1);
 out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault),double(outer_bad)];
 end
 

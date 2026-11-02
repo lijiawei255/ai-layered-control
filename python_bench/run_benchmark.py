@@ -67,6 +67,10 @@ class PythonGatekeeper:
         return -v if v < 0.0 else v
 
     @staticmethod
+    def _inc_sat(v):
+        return min(v + 1, 4294967295)
+
+    @staticmethod
     def _clampf(v, lo, hi):
         if v != v:
             v = 0.0
@@ -111,9 +115,9 @@ class PythonGatekeeper:
         corrupt |= physics_residual < 0
         if corrupt:
             self.fault_audit_bitmask |= FAULT_NAN
-            self.corrupted_frame_count += 1
+            self.corrupted_frame_count = self._inc_sat(self.corrupted_frame_count)
             self.recovery_ticks = cfg['ood_recovery_cooldown_ticks']
-            self.step_count += 1
+            self.step_count = self._inc_sat(self.step_count)
             return (self.u_applied, GATE_HOLD_LATENCY, self.regime, self.blend, self.fault_audit_bitmask, 1, self.u_target)
         tuning_bad = not (.1 <= tune['gain_scale'] <= 4 and .1 <= tune['damping_scale'] <= 4 and .1 <= tune['safety_margin_scale'] <= 1)
         if tuning_bad:
@@ -122,7 +126,7 @@ class PythonGatekeeper:
                        or not 1 <= ai_regime <= 4 or not 0 <= ai_confidence <= 1 or outer_age_s < 0)
         if mailbox_bad:
             self.fault_audit_bitmask |= FAULT_NAN
-            self.corrupted_frame_count += 1
+            self.corrupted_frame_count = self._inc_sat(self.corrupted_frame_count)
             ai_regime, ai_confidence = 4.0, 0.0
         snap = self.control_started == 0
         conf_before = self.conf_latched
@@ -141,7 +145,7 @@ class PythonGatekeeper:
                 self.safety_latched = 0
         elif x_abs > cfg['safety_trip_ratio'] * limit_eff or predicted_abs > limit_eff:
             self.safety_latched = 1
-            self.safety_veto_count += 1
+            self.safety_veto_count = self._inc_sat(self.safety_veto_count)
             self.fault_audit_bitmask |= FAULT_ENVELOPE
         residual_abs = self._absf(physics_residual)
         if self.ood_latched:
@@ -149,7 +153,7 @@ class PythonGatekeeper:
                 self.ood_latched = 0
         elif residual_abs > cfg['max_physics_residual']:
             self.ood_latched = 1
-            self.ood_veto_count += 1
+            self.ood_veto_count = self._inc_sat(self.ood_veto_count)
             self.fault_audit_bitmask |= FAULT_OOD
         mailbox_regime = self._mailbox_regime(ai_regime)
         if ai_confidence < cfg['min_ai_confidence'] or self._mailbox_abstains(ai_regime):
@@ -159,13 +163,13 @@ class PythonGatekeeper:
             self.conf_latched = 0
         conf_veto = self.conf_latched
         if conf_veto and (not conf_before):
-            self.low_confidence_veto_count += 1
+            self.low_confidence_veto_count = self._inc_sat(self.low_confidence_veto_count)
         latency_hold = -finite <= outer_age_s <= finite and outer_age_s > cfg['outer_timeout_s']
         if latency_hold:
             self.fault_audit_bitmask |= FAULT_LATENCY
             self.recovery_ticks = cfg['ood_recovery_cooldown_ticks']
             if outer_age_s - cfg['outer_timeout_s'] <= dt_eff:
-                self.latency_hold_count += 1
+                self.latency_hold_count = self._inc_sat(self.latency_hold_count)
         veto_active = self.safety_latched != 0 or self.ood_latched != 0 or conf_veto != 0
         if self.safety_latched:
             gate = GATE_VETO_ENVELOPE
@@ -186,7 +190,7 @@ class PythonGatekeeper:
                 regime = REGIME_SAFE
             elif mailbox_regime == self.regime:
                 regime = self.regime
-            elif self.dwell_ticks + 1 >= cfg['min_dwell_ticks']:
+            elif self._inc_sat(self.dwell_ticks) >= cfg['min_dwell_ticks']:
                 regime = mailbox_regime
             else:
                 regime = self.regime
@@ -257,9 +261,9 @@ class PythonGatekeeper:
         if regime != self.regime:
             self.dwell_ticks = 0
         else:
-            self.dwell_ticks += 1
+            self.dwell_ticks = self._inc_sat(self.dwell_ticks)
         self.regime = regime
-        self.step_count += 1
+        self.step_count = self._inc_sat(self.step_count)
         return (out_u, gate, regime, out_blend, self.fault_audit_bitmask, int(mailbox_bad), out_u_target)
 
 def _quintic(tau):
@@ -736,6 +740,14 @@ def selftest():
     for k in ('min_dwell_ticks', 'ood_recovery_cooldown_ticks'):
         cfg[k] = int(cfg[k])
     c = Core(cfg)
+    for count in (0, 8, 10):
+        try:
+            c.step(*([0.] * count))
+        except TypeError:
+            pass
+        else:
+            raise AssertionError('Core.step must require exactly nine input fields')
+    assert c.state.step_count == 0
     p = PythonGatekeeper(cfg, dict(gain_scale=1.0, damping_scale=1.0, safety_margin_scale=1.0))
     r = lcg(2026, 6000 * 6).reshape(6000, 6)
     maxerr = 0.0
@@ -751,6 +763,31 @@ def selftest():
         assert a[1:3] == b[1:3] and a[4:6] == b[4:6], (k, a, b)
         maxerr = max(maxerr, abs(a[0] - b[0]))
     assert maxerr < 0.0001, maxerr
+    maximum = 4294967295
+    for threshold, dwell, expected in ((0,0,2), (1,0,2), (150,maximum,2),
+                                      (maximum,maximum-2,1), (maximum,maximum-1,2), (maximum,maximum,2)):
+        q = dict(cfg, min_dwell_ticks=threshold)
+        c = Core(q); p = PythonGatekeeper(q, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+        c.state.dwell_ticks = p.dwell_ticks = dwell
+        a, b = c.step(2,1,0,0,0,0,0,0,0), p.step(2,1,0,0,0,0,0,0,0)
+        assert a[2] == b[2] == expected and c.state.dwell_ticks == p.dwell_ticks
+    c = Core(cfg); p = PythonGatekeeper(cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    counters = ('dwell_ticks', 'step_count', 'safety_veto_count', 'ood_veto_count',
+                'low_confidence_veto_count', 'latency_hold_count', 'corrupted_frame_count')
+    for name in counters:
+        setattr(c.state, name, maximum-1); setattr(p, name, maximum-1)
+    clean = (1.,1.,0.,0.,0.,0.,0.,0.,0.)
+    fault = (math.nan,1.,cfg['outer_timeout_s']+.5*cfg['dt_s'],2.,1.1,0.,0.,0.,0.)
+    for frame in (clean, clean, fault, clean, fault, clean, fault):
+        frame = tuple(float(np.float32(v)) for v in frame)
+        a, b = c.step(*frame), p.step(*frame)
+        assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
+        assert all(getattr(c.state,name) == getattr(p,name) for name in counters)
+    assert all(getattr(c.state,name) == maximum for name in counters[1:]) and a[4] == 31
+    for _ in range(2):
+        a, b = c.step(1,1,0,0,math.nan,0,0,0,0), p.step(1,1,0,0,math.nan,0,0,0,0)
+        assert a[1] == b[1] == GATE_HOLD_LATENCY
+    assert c.state.step_count == p.step_count == c.state.corrupted_frame_count == p.corrupted_frame_count == maximum
     for bad in (float('nan'), float('inf'), -float('inf')):
         q = dict(CFG)
         q['kp'] = [bad, *CFG['kp'][1:]]
@@ -790,6 +827,7 @@ def selftest():
     assert auto_field_tune(lambda _: (math.nan, False), (.9,.8,.7)) == (.9,.8,.7)
     assert auto_field_tune(lambda _: (math.inf, True), (.9,.8,.7)) == (.9,.8,.7)
     print(f'PASS: 6000 frames; gate/regime/fault exact; max|du|={maxerr:.3g}')
+    print('PASS: uint32 counter saturation, dwell boundary semantics and nine-field step contract')
     print('PASS: four mid-run tuning faults; zero HOLD/breaches, finite nominal integrators and clean recovery; fixed six-candidate joint search')
 
 def physics_checks():

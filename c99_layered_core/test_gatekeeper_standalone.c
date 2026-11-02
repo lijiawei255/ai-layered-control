@@ -2012,6 +2012,72 @@ static void test_runtime_tuning_faults(void)
           "runtime tuning: invalid fast measurement still takes the HOLD firewall");
 }
 
+static void test_counter_boundaries(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    LayeredInput_t in = {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f};
+    LayeredInput_t bad;
+    LayeredOutput_t out;
+    int i, immediate = 0;
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    st.dwell_ticks = UINT32_MAX - 1u; st.step_count = UINT32_MAX - 1u;
+    for (i = 0; i < 3; ++i) out = Layered_Step(&st, &cfg, &tun, &in);
+    check(st.dwell_ticks == UINT32_MAX && st.step_count == UINT32_MAX && out.gate == GATE_NORMAL,
+          "counter boundary: normal dwell and tick counts saturate without changing control");
+    in.ai_regime = 2.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.regime == REGIME_HIGH_LOAD_DAMPED && st.dwell_ticks == 0u,
+          "counter boundary: saturated dwell still permits a normal bank switch");
+    for (i = 0; i < 2; ++i) {
+        cfg.min_dwell_ticks = (uint32_t)i;
+        Layered_Init(&st, &cfg, &tun);
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        immediate += out.regime == REGIME_HIGH_LOAD_DAMPED;
+    }
+    check(immediate == 2, "counter boundary: dwell thresholds zero and one switch on the first tick");
+    cfg.min_dwell_ticks = UINT32_MAX;
+    Layered_Init(&st, &cfg, &tun); st.dwell_ticks = UINT32_MAX - 2u;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.regime == REGIME_NOMINAL && st.dwell_ticks == UINT32_MAX - 1u,
+          "counter boundary: maximum dwell threshold waits until its final tick");
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.regime == REGIME_HIGH_LOAD_DAMPED && st.dwell_ticks == 0u,
+          "counter boundary: maximum dwell threshold switches at MAX minus one");
+    Layered_Init(&st, &cfg, &tun); st.dwell_ticks = UINT32_MAX;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.regime == REGIME_HIGH_LOAD_DAMPED,
+          "counter boundary: maximum dwell threshold accepts a saturated count");
+
+    build_config(&cfg); cfg.ood_recovery_cooldown_ticks = 0u;
+    in.ai_regime = 1.0f; bad = in;
+    bad.ai_regime = make_nan(); bad.x = 1.1f; bad.physics_residual = 2.0f;
+    bad.outer_age_s = cfg.outer_timeout_s + cfg.dt_s * 0.5f;
+    Layered_Init(&st, &cfg, &tun);
+    st.step_count = st.corrupted_frame_count = UINT32_MAX - 1u;
+    st.safety_veto_count = st.ood_veto_count = UINT32_MAX - 1u;
+    st.low_confidence_veto_count = st.latency_hold_count = UINT32_MAX - 1u;
+    for (i = 0; i < 3; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &bad);
+        if (i < 2) (void)Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(st.step_count == UINT32_MAX && st.corrupted_frame_count == UINT32_MAX &&
+          st.safety_veto_count == UINT32_MAX && st.ood_veto_count == UINT32_MAX &&
+          st.low_confidence_veto_count == UINT32_MAX && st.latency_hold_count == UINT32_MAX,
+          "counter boundary: repeated fault episodes saturate all diagnostic counters");
+    check(out.gate == GATE_VETO_SAFETY_ENVELOPE && out.regime == REGIME_SAFE_FALLBACK &&
+          out.corrupted && out.fault_audit_bitmask == 31u,
+          "counter boundary: saturation preserves gate priority and all sticky fault bits");
+    bad.x = make_nan();
+    for (i = 0; i < 2; ++i) out = Layered_Step(&st, &cfg, &tun, &bad);
+    check(out.gate == GATE_HOLD_LATENCY && st.step_count == UINT32_MAX &&
+          st.corrupted_frame_count == UINT32_MAX,
+          "counter boundary: fast-input firewall counters also remain saturated");
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -2056,6 +2122,7 @@ int main(void)
     test_settings_bounds();
     test_safe_bank_and_r3();
     test_runtime_tuning_faults();
+    test_counter_boundaries();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

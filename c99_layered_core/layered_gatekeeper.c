@@ -66,6 +66,11 @@ static int lg_is_finite(float v)
     return (v >= -LAYERED_FINITE_LIMIT) && (v <= LAYERED_FINITE_LIMIT);
 }
 
+static uint32_t lg_inc_sat(uint32_t value)
+{
+    return (value < UINT32_MAX) ? value + 1u : value;
+}
+
 static int lg_config_is_corrupt(const LayeredConfig_t *c)
 {
     int i;
@@ -332,9 +337,9 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
      * must never count towards "consecutive clean ticks". */
     if (lg_fast_input_is_corrupt(input) || lg_config_is_corrupt(config)) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
-        state->corrupted_frame_count++;
+        state->corrupted_frame_count = lg_inc_sat(state->corrupted_frame_count);
         state->recovery_ticks = config->ood_recovery_cooldown_ticks;
-        state->step_count++;
+        state->step_count = lg_inc_sat(state->step_count);
 
         out.u = state->u_applied;
         out.u_target = state->u_target;
@@ -352,7 +357,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     outer_corrupt = tuning_corrupt || lg_mailbox_is_corrupt(input);
     if (outer_corrupt) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
-        state->corrupted_frame_count++;
+        state->corrupted_frame_count = lg_inc_sat(state->corrupted_frame_count);
     }
 
     snap = (state->control_started == 0);
@@ -379,7 +384,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     } else if (x_abs > config->safety_trip_ratio * limit_eff ||
                predicted_abs > limit_eff) {
         state->safety_latched = 1;
-        state->safety_veto_count++;
+        state->safety_veto_count = lg_inc_sat(state->safety_veto_count);
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_ENVELOPE_BREACH;
     }
 
@@ -391,7 +396,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         }
     } else if (residual_abs > config->max_physics_residual) {
         state->ood_latched = 1;
-        state->ood_veto_count++;
+        state->ood_veto_count = lg_inc_sat(state->ood_veto_count);
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_OOD_RESIDUAL;
     }
 
@@ -418,7 +423,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     if (conf_veto && !conf_before) {
         /* Diagnostics only: one count per veto EPISODE (rising edge of the
          * latch), never one per held tick. */
-        state->low_confidence_veto_count++;
+        state->low_confidence_veto_count = lg_inc_sat(state->low_confidence_veto_count);
     }
 
     /* ---------------- 4. heartbeat watchdog ----------------------------- */
@@ -438,7 +443,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
          * timeout; later ticks of the same episode overshoot by more than a
          * period and are not counted again. */
         if ((input->outer_age_s - config->outer_timeout_s) <= dt_eff) {
-            state->latency_hold_count++;
+            state->latency_hold_count = lg_inc_sat(state->latency_hold_count);
         }
     }
 
@@ -470,7 +475,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             regime = REGIME_SAFE_FALLBACK;
         } else if (mailbox_regime == state->regime) {
             regime = state->regime;
-        } else if ((state->dwell_ticks + 1u) >= config->min_dwell_ticks) {
+        } else if (lg_inc_sat(state->dwell_ticks) >= config->min_dwell_ticks) {
             regime = mailbox_regime; /* dwell satisfied: accept the switch */
         } else {
             regime = state->regime;  /* anti-chatter: keep the old regime */
@@ -574,7 +579,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     if (regime != state->regime) {
         state->dwell_ticks = 0u;
     } else {
-        state->dwell_ticks++;
+        state->dwell_ticks = lg_inc_sat(state->dwell_ticks);
     }
     state->regime = regime;
 
@@ -583,7 +588,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     out.fault_audit_bitmask = state->fault_audit_bitmask;
     out.corrupted = outer_corrupt;
 
-    state->step_count++;
+    state->step_count = lg_inc_sat(state->step_count);
     return out;
 }
 

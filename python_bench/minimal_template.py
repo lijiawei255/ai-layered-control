@@ -41,8 +41,8 @@ class Core:
         self.cfg = Config(**{n: (F * 4)(*v) if n in BANK_FIELDS else v for n, v in cfg.items()})
         self.tuning, self.state = Tuning(*tuning), State()
         self.lib.Layered_Init(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning))
-    def step(self, *frame):
-        inp = Input(*frame)
+    def step(self, ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff):
+        inp = Input(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff)
         out = self.lib.Layered_Step(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning), ctypes.byref(inp))
         return out.u, out.gate, out.regime, out.blend, out.fault_audit_bitmask, out.corrupted, out.u_target
 
