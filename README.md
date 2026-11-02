@@ -2,16 +2,22 @@
 
 [![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-brightgreen)](https://github.com/lijiawei255/ai-layered-control/tree/main)
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
-[![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#6-reproduce)
+[![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-reproduce)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent guide](AGENTS.md)
 
-**A general reference architecture for slow qualitative AI, fast deterministic control, and adaptation without AI retraining.** The slow loop selects a regime or explicitly abstains. A zero-dependency C99 core owns the actuator at 1 kHz.
+**Let AI identify the situation. Let deterministic control own the actuator.** A portable fast-slow reference architecture: 10 Hz qualitative supervision, a 1 kHz C99 feedback loop, and field tuning with the AI frozen.
 
-Three application families motivate the same separation: **industrial WAAM / PLC servo**, **edge VLA / fast-slow robotics**, and **closed-loop aDBS / SCS neuromodulation**. They are examples of a common control contract, open to other systems with scarce samples, unit variation, intermittent contact, uncertain context and strict output constraints.
+## 1. AI can be slow. Control authority must be clear.
 
-## 1. Three competing control paths
+Bringing AI into industrial arms, CNC / additive manufacturing (WAAM), or closed-loop neuromodulation (Parkinson's aDBS, spinal cord stimulation / SCS) raises a question beyond prediction accuracy: who decides what the actuator does every millisecond? A slow model that understands context plus a fast neural action head improves responsiveness. When the learned policy still owns continuous commands, three deployment problems remain:
+
+- **Tight hardware budgets.** Action inference must fit the compute and memory available to an MCU or PLC control task; implantable devices also face strict power limits.
+- **Different hardware, different physics.** Joint stiction, load changes or electrode-interface drift can move a new device away from the learned relationship, producing steady error or chatter.
+- **Faults need an explicit exit.** Unseen structural resonance, strong artifacts and corrupted model outputs need an independent veto and fallback path. Predicting a continuous command does not provide that contract by itself.
+
+**Inference bandwidth is not execution authority.** This repository provides a device-side software gateway for AI control permissions. The slow loop answers only “which regime?” (`1..3`) or “abstain” (`4`). An independent probe derives veto evidence from time-aligned nominal-model innovation and measurement spikes. An **ANSI C99 core with only 88 bytes of state and zero dynamic allocation** owns the 1 kHz command, closed-loop fallback and physical tuning knobs. The supervisor can change while the execution contract stays fixed.
 
 ```mermaid
 flowchart TB
@@ -29,7 +35,7 @@ flowchart TB
         residual["physics_residual"]
         innovation --> channels --> residual
     end
-    subgraph fast["1 kHz · ANSI C99 gatekeeper · 88 B state"]
+    subgraph fast["1 kHz · ANSI C99 gatekeeper · 88 B state · 9 core duties"]
         direction LR
         firewall["Input firewall and bounds<br/>Invalid fast sensors/config: HOLD<br/>Invalid mailbox/knobs: closed-loop R4"]
         gates["Veto priority<br/>25 ms envelope look-ahead > OOD residual<br/>> low confidence / abstention > 350 ms timeout<br/>Normal-regime dwell: 150 ms<br/>Clean recovery cooldown: 300 ms"]
@@ -76,7 +82,64 @@ flowchart TB
     style adapt fill:#fffcf6,stroke:#dfcfaf
 ```
 
-The device adapter computes `outer_age_s = now - source_timestamp` on every fast tick. The spike channel reads the measured signal directly; the broadband channel evaluates nominal-model innovation.
+Diagram timings are benchmark defaults. The device adapter computes `outer_age_s = now - source_timestamp` on every fast tick. The spike channel reads the measured signal directly; the broadband channel evaluates nominal-model innovation.
+
+## 2. What to reuse: Human & Agent Quickstart
+
+| Reusable files | What you take into your system |
+|---|---|
+| **[1] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h)** | Zero-dependency ANSI C99 control and safety gatekeeper: 88 B state / 132 B configuration / 12 B tuning; connect it to an MCU, PLC or RTOS cyclic task |
+| **[2] [minimal_template.py](python_bench/minimal_template.py)** | A standalone 114-line fast-slow skeleton with `auto_calibrate` and `auto_field_tune`; replace `SLOT 1..3` to connect your device |
+
+When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
+
+**Port with an AI coding assistant (Cursor / Claude Code / Codex):** ask the Agent to read [AGENTS.md](AGENTS.md) and replace `SLOT 1..3` in the [minimal template](python_bench/minimal_template.py) using your device contract, connecting auto-calibration and field tuning in roughly a hundred lines of adapter code.
+
+From the repository root, run the minimal skeleton first (Python 3 and a C99 compiler on `CC` or `PATH`), then the full benchmark when ready:
+
+```powershell
+python -m pip install -r python_bench/requirements.txt
+python python_bench/minimal_template.py
+python python_bench/run_benchmark.py
+```
+
+### Three steps to port
+
+1. **Define and connect.** Specify units, the safe zero and output limits; commission the nominal model and controller bank, then connect sensors, references and the actuator.
+2. **Calibrate from small samples.** Run `auto_calibrate` on measured macro-features to build regime prototypes and confidence thresholds.
+3. **Freeze AI and field-tune.** Use `auto_field_tune` with constrained cross-condition trials, then validate the selected knobs on independent trajectories.
+
+Initialize once; on each fast tick, populate all nine input fields and call `Layered_Step`:
+
+```c
+LayeredState_t state;
+LayeredConfig_t config;
+FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
+LayeredInput_t input;
+/* Populate config and input from the commissioned device interface. */
+Layered_Init(&state, &config, &field_tuning);
+LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
+```
+
+### Three integration examples, an open device interface
+
+Three application families motivate the same separation: **industrial WAAM / PLC servo**, **edge VLA / fast-slow robotics**, and **closed-loop aDBS / SCS neuromodulation**. They are examples of a common control contract, open to other systems with scarce samples, unit variation, intermittent contact, uncertain context and strict output constraints.
+
+| Application example | Slow qualitative decision | Device adapter and deterministic fast-loop connection |
+|---|---|---|
+| Industrial WAAM / PLC servo | Process, inter-layer thermal load and contact regime | Connect process, servo / wire-feed laws and actuator constraints; implement force sensing and hard force limits in the device layer; field-tune for a new batch |
+| Edge VLA / fast-slow robotics | Task and environment-contact class | Connect 1 kHz torque / impedance laws; absorb joint-stiction differences through feedback and tuning; use envelope vetoes and fallback to handle state-limit risks |
+| Closed-loop neuromodulation: aDBS / SCS | Brain biomarkers for aDBS; posture / activity (lying, walking, coughing) and interface state for SCS | Define a first-order stimulation-current / evoked-response (ECAP) recruitment model and artifact probe for SCS, and a biomarker-specific law for aDBS; validate individual knobs within device output / timing limits and clinically established comfort bounds |
+
+These are **device-adaptation directions**. ECAP feedback is an SCS integration example; aDBS uses its own brain-signal measures. For interface context, see [Saluda ECAP closed-loop SCS](https://www.saludamedical.com/international/evoke-eva/) and [Medtronic adaptive DBS](https://news.medtronic.com/2025-02-24-Medtronic-earns-U-S-FDA-approval-for-the-worlds-first-Adaptive-deep-brain-stimulation-system-for-people-with-Parkinsons).
+
+A new physical domain needs new units, limits, control laws and probes. A new unit in the same domain can retain the classifier for moderate parameter shifts such as the benchmark's compound unit drift. Large pure-inertia shifts, for example beyond +75%, can change closed-loop feature scales; rerun the 36-window calibration when that occurs.
+
+See [AGENTS.md](AGENTS.md), the [domain mapping guide](docs/domain_mapping_guide.md), and the [systems engineering rationale](docs/systems_engineering_manifesto_en.md). Deployment code does not accept stage labels, fault frequency or simulator truth.
+
+## 3. Evidence: three control paths, one physical fixture
+
+### 3.1 The three control paths
 
 | Branch | Slow context | Continuous actuator command at 1 kHz |
 |---|---|---|
@@ -88,7 +151,9 @@ B1 and B3 receive the **same nominal feedforward in normal operation**. All bran
 
 Learning-based fast-slow systems are an active engineering direction; [Helix 02](https://www.figure.ai/news/helix-02) is one example. B2 is a reproducible representative of the continuous-action route, not a reproduction of that system. The design horizon is **2027+ deployment across constrained devices**.
 
-## 2. Four-stage benchmark and field tuning
+### 3.2 Four-stage comparison
+
+S1 tests nominal tracking, S2 load and stiction drift, S3 intermittent contact and measurement noise, and S4 an unseen compound fault.
 
 40 s, four 10 s stages, a 1 ms control period and two 0.5 ms physical substeps. Actuator limits are **20 N·m** and **2,000 N·m/s**. The state envelope is **|x| ≤ 1 rad**; S3's contact-force budget is **20 N**, using a 0.25 m lever arm.
 
@@ -111,6 +176,8 @@ RMSE compares reference and true state at the same tick. TV is the within-stage 
 
 ![Four-stage comparison](assets/benchmark_4stages_showdown.png)
 
+### 3.3 Frozen AI, field-tuned hardware
+
 **Zero-retraining unit adaptation.** The classifier stays frozen. These independent S2 validations use a 6 s trajectory of amplitude 0.43 rad, seed 811, shared by all controllers. They are separate from the 10 s S2 window above. “+35% / +50% unit drift” means **inertia change plus strong stiction**, not inertia alone; amplified friction dominates this fixture's S2 error. RMSE is in rad and TV in N·m.
 
 | Unit drift | B1 factory | B1 equal-budget S2-best (infeasible) | B3 factory (1,1,1) | B3 feasible tuning (1.25,0.5,1) | B3 RMSE reduction | B3 TV: before → after |
@@ -123,7 +190,7 @@ The search takes **240 s of device trajectories per branch and unit**, followed 
 ![Sample budgets, field tuning, contact constraints and storage](assets/efficiency_and_generalization.png)
 
 <details>
-<summary><b>📊 Explore: equal-budget counterfactuals, command smoothing and physical fixture</b></summary>
+<summary><b>📊 Details: equal-budget counterfactuals, command smoothing and physical fixture</b></summary>
 
 B3 selects **`(1.25,0.5,1)`**, in `gain / damping / safety margin` order. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
 
@@ -175,7 +242,7 @@ R4 uses **zero reference, fixed gains and zero feedforward**, independently of a
 
 </details>
 
-## 3. Mode necessity and independent protection
+### 3.4 Mode ablation and independent protection
 
 Fixed-bank ablations retain the **same fast safety gates**. Dynamic classification and physical rules read only measured features. All six variants below have zero state-envelope violations.
 
@@ -193,7 +260,7 @@ The fixed-bank results expose the load/contact tradeoff. Rules and the prototype
 The independent physics probe monitors spikes and broadband innovation; the fast loop uses it for explicit OOD abstention. The first spike of the compound fault triggers a veto in the same control tick.
 
 <details>
-<summary><b>🔍 Explore: contact/noise separation, phase scans and fault-injection boundaries</b></summary>
+<summary><b>🔍 Details: contact/noise separation, wall phases, fault injection and interface boundaries</b></summary>
 
 **Contact recognition persists at nominal noise.** The fourth feature accumulates signed nominal-model residual power relative to residual load energy, with an activation threshold and release memory for intermittent contact. It reads measured acceleration, velocity and applied command, not noise RMS or the wall schedule. The other features describe tracking error, effort and slow innovation. With S3 noise reduced to nominal, both supervisors still select R3 and meet the contact budget:
 
@@ -217,9 +284,17 @@ Five independent noise/phase runs give B1/B2 S4 violations of **777–899 / 622�
 
 S4's unstable nonlinear trajectories are sensitive to floating-point roundoff: cross-platform comparisons preserve the scale of violation counts and allow differences in the last decimals, rather than requiring identical unstable trajectories.
 
+#### Interface, multi-axis and timeout conventions
+
+The nine core duties are input/settings validation, predictive envelope veto, residual veto, confidence/abstention veto, heartbeat watchdog, minimum dwell, recovery cooldown, controller-bank execution with anti-windup and output limits, and sticky fault reporting. Each integrator tracks the applied command; magnitude is clamped before slew. Dwell and diagnostic counters saturate at `UINT32_MAX`. C ABI and signatures remain fixed.
+
+**Invalid slow mailboxes or field knobs select closed-loop R4**, set `corrupted` and latch the existing corruption fault bit; envelope and residual vetoes retain priority. Invalid fast signals or configuration retain the native command-HOLD path. Invalid knobs are internally replaced by `(1,1,1)` while R4 runs, keeping normal-bank tracking integrators finite. Signed state, reference, velocity and feedforward values are valid; only the normalized residual must be nonnegative. Gain and damping knobs lie in **[0.10,4.0]**; safety margin lies in **[0.10,1.0]** and can only tighten the envelope. These ranges define input validity, not a closed-loop stability guarantee; admissible operating gains come from constrained `auto_field_tune` trials. R4 ignores knob scaling, trajectory references and feedforward.
+
+Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share read-only configuration only where units and limits agree; coupled constraints belong in the device adapter. On a **350 ms** slow-loop timeout the adapter sends explicit R4 abstention and preserves real frame age. Clean recovery passes through the core's **300 ms** cooldown. Native C `HOLD` freezes the **actuator command**, not mechanical position.
+
 </details>
 
-## 4. Small-sample commissioning and resource accounting
+### 3.5 Small-sample commissioning, resources and domain mappings
 
 `auto_calibrate(samples, labels)` builds three four-dimensional prototypes and confidence parameters from **36 labeled macro-windows**, twelve from each of three 10 s commissioning probes. The model has **15 stored scalars**: twelve prototype values, a distance-decay coefficient and two confidence thresholds.
 
@@ -234,50 +309,9 @@ S4's unstable nonlinear trajectories are sensitive to floating-point roundoff: c
 
 FP32 bytes are a storage calculation; numerical RBF runs use FP64. State RAM, model storage and code size are separate quantities. Python reports RBF and C-call host times, including ctypes overhead; they are not target WCET. The core uses only `<stdint.h>`, fixed-size arithmetic and no heap, I/O, libm or mutable globals.
 
-## 5. Port the contract to a new system
-
-**Port with an AI coding assistant (Cursor / Claude Code / Codex):** ask the Agent to read [AGENTS.md](AGENTS.md) and replace `SLOT 1..3` in the [minimal template](python_bench/minimal_template.py) using your device contract, connecting auto-calibration and field tuning in roughly a hundred lines of adapter code.
-
-1. **Define and connect.** Specify units, the safe zero and output limits; commission the nominal model and controller bank, then connect sensors, references and the actuator.
-2. **Calibrate from small samples.** Run `auto_calibrate` on measured macro-features to build regime prototypes and confidence thresholds.
-3. **Freeze AI and field-tune.** Use `auto_field_tune` with constrained cross-condition trials, then validate the selected knobs on independent trajectories.
-
-When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
-
-| Application example | Slow qualitative decision | Deterministic fast loop |
-|---|---|---|
-| Industrial WAAM / PLC servo | Process, load and contact regime | Process/servo law, actuator constraints, field tuning |
-| Edge VLA / fast-slow robotics | Task and environment context | Torque/impedance law, disturbance handling, fallback |
-| Closed-loop aDBS / SCS | Biomarker and interface-state class | Device-defined control law, output envelope and timing |
-
 ![Three mappings of the common control contract](assets/domain_profiles_comparison.png)
 
-A new physical domain needs new units, limits, control laws and probes. A new unit in the same domain can retain the classifier for moderate parameter shifts such as the benchmark's compound unit drift. Large pure-inertia shifts, for example beyond +75%, can change closed-loop feature scales; rerun the 36-window calibration when that occurs.
-
-```c
-LayeredState_t state;
-LayeredConfig_t config;
-FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
-LayeredInput_t input;
-/* Populate config and input from the commissioned device interface. */
-Layered_Init(&state, &config, &field_tuning);
-LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
-```
-
-<details>
-<summary><b>🔧 Explore: core interface, multi-axis instances and timeout contract</b></summary>
-
-The nine core duties are input/settings validation, predictive envelope veto, residual veto, confidence/abstention veto, heartbeat watchdog, minimum dwell, recovery cooldown, controller-bank execution with anti-windup and output limits, and sticky fault reporting. Each integrator tracks the applied command; magnitude is clamped before slew. Dwell and diagnostic counters saturate at `UINT32_MAX`. C ABI and signatures remain fixed.
-
-**Invalid slow mailboxes or field knobs select closed-loop R4**, set `corrupted` and latch the existing corruption fault bit; envelope and residual vetoes retain priority. Invalid fast signals or configuration retain the native command-HOLD path. Invalid knobs are internally replaced by `(1,1,1)` while R4 runs, keeping normal-bank tracking integrators finite. Signed state, reference, velocity and feedforward values are valid; only the normalized residual must be nonnegative. Gain and damping knobs lie in **[0.10,4.0]**; safety margin lies in **[0.10,1.0]** and can only tighten the envelope. These ranges define input validity, not a closed-loop stability guarantee; admissible operating gains come from constrained `auto_field_tune` trials. R4 ignores knob scaling, trajectory references and feedforward.
-
-Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share read-only configuration only where units and limits agree; coupled constraints belong in the device adapter. On a **350 ms** slow-loop timeout the adapter sends explicit R4 abstention and preserves real frame age. Clean recovery passes through the core's **300 ms** cooldown. Native C `HOLD` freezes the **actuator command**, not mechanical position.
-
-</details>
-
-See [AGENTS.md](AGENTS.md), the [domain mapping guide](docs/domain_mapping_guide.md), and the [systems engineering rationale](docs/systems_engineering_manifesto_en.md). Deployment code does not accept stage labels, fault frequency or simulator truth.
-
-## 6. Reproduce
+### 3.6 Reproduce
 
 Python 3 + the existing NumPy/matplotlib requirements; C99 compiler for the core-backed path:
 

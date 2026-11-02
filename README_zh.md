@@ -2,16 +2,22 @@
 
 [![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-brightgreen)](https://github.com/lijiawei255/ai-layered-control/tree/main)
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
-[![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#6-复现)
+[![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-完整复现)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent 指引](AGENTS.md)
 
-**面向慢速定性 AI、快环确定性控制与 AI 零重训适配的通用参考架构。** 慢环只选择工况或显式弃权，零依赖 C99 核在 1 kHz 独占执行器。
+**让 AI 判断工况，让确定性控制核掌握执行权。** 一套可移植的快慢分层控制参考架构：10 Hz 定性监督、1 kHz C99 闭环，以及冻结 AI 后的现场旋钮整定。
 
-三类应用共同体现这一分工：**工业增材 WAAM／PLC 伺服**、**边缘 VLA／快慢分层机器人**、**闭环 aDBS／SCS 神经调控**。它们是同一控制契约的实例；任何面临小样本、跨设备差异、间歇接触、上下文不确定性与严格输出约束的系统，都可以按此契约建立适配层。
+## 1. AI 可以慢，控制权必须清楚
 
-## 1. 三条控制路线
+把 AI 接入工业机械臂、数控／增材制造（WAAM）或闭环神经调控（帕金森 aDBS、脊髓电刺激 SCS），难点不只在于识别是否准确，还在于每毫秒由谁决定执行器输出。“慢大模型理解环境、快小网络连续出指令”提升了响应速度，但如果底层执行权仍交给学习策略，部署还要跨过三道工程门槛：
+
+- **硬件预算紧。** 快速动作网络的算力与存储需求，需要装进 MCU／PLC 的控制任务预算；医疗植入设备还受到严格的功耗约束。
+- **换机器会变样。** 新关节的静摩擦死区、负载变化或电极接口偏移，会改变模型面对的物理关系，带来稳态偏差或抖振。
+- **故障时需要明确退出。** 未见过的结构共振、强伪迹或损坏的模型输出，都需要独立的否决和回退路径；预测一个连续指令本身不提供这份保障。
+
+**推理带宽 ≠ 执行权限。** 本仓库把 AI 接口做成设备侧的控制权限网关：慢环只回答“用哪个档位”（`1..3`）或“我弃权”（`4`）。独立物理探针根据时间对齐的标称模型新息与测量尖峰提供否决依据；**仅 88 字节状态、零动态内存的 ANSI C99 控制核**掌握 1 kHz 输出、闭环安全回退与物理调参旋钮。慢环可以替换，执行契约保持不变。
 
 ```mermaid
 flowchart TB
@@ -29,7 +35,7 @@ flowchart TB
         residual["physics_residual"]
         innovation --> channels --> residual
     end
-    subgraph fast["1 kHz · ANSI C99 门控核心 · 88 B 状态"]
+    subgraph fast["1 kHz · ANSI C99 门控核心 · 88 B 状态 · 九项职责"]
         direction LR
         firewall["输入防火墙与边界校验<br/>快环传感器/配置非法：HOLD<br/>慢环邮箱/旋钮非法：闭环 R4"]
         gates["否决优先级<br/>25 ms 前瞻安全包络 > OOD 残差<br/>> 低置信/显式弃权 > 350 ms 超时<br/>正常档位驻留：150 ms<br/>连续清洁恢复冷却：300 ms"]
@@ -76,7 +82,64 @@ flowchart TB
     style adapt fill:#fffcf6,stroke:#dfcfaf
 ```
 
-设备适配层在每个快环 tick 计算 `outer_age_s = now - source_timestamp`。尖峰通道直接读取测量信号，宽频通道计算标称模型新息。
+图中时序为本基准默认配置。设备适配层在每个快环 tick 计算 `outer_age_s = now - source_timestamp`。尖峰通道直接读取测量信号，宽频通道计算标称模型新息。
+
+## 2. 拿走什么，怎样接入：Human & Agent Quickstart
+
+| 可复用文件 | 直接拿走的能力 |
+|---|---|
+| **[1] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h)** | 零依赖 ANSI C99 控制与安全门控核：88 B 状态 / 132 B 配置 / 12 B 旋钮，可接入 MCU、PLC 或 RTOS 的周期任务 |
+| **[2] [minimal_template.py](python_bench/minimal_template.py)** | 114 行独立快慢环骨架，内置 `auto_calibrate` 与 `auto_field_tune`；替换 `SLOT 1..3` 接入自定义设备 |
+
+复制 C99 核心时，请一并保留 [LICENSE](LICENSE) 中的 MIT 版权与许可声明。
+
+**AI 编程助手（Cursor / Claude Code / Codex）一键移植**：直接让 Agent 阅读 [AGENTS.md](AGENTS.md)，并按设备契约替换 [极简模板](python_bench/minimal_template.py) 中的 `SLOT 1..3`，在百行左右的适配代码中接入新设备的自动建档与旋钮整定。
+
+从仓库根目录先跑最小骨架（Python 3 与可在 `CC` 或 `PATH` 找到的 C99 编译器），再按需运行完整基准：
+
+```powershell
+python -m pip install -r python_bench/requirements.txt
+python python_bench/minimal_template.py
+python python_bench/run_benchmark.py
+```
+
+### 三步移植
+
+1. **定义并接线。** 约定单位、安全零点与输出限制，建立标称模型和控制器组，接入传感器、参考及执行器。
+2. **小样本建档。** 从可测宏观特征运行 `auto_calibrate`，建立工况原型与置信阈值。
+3. **冻结 AI，现场整定。** 运行跨工况约束试验，以 `auto_field_tune` 选择旋钮，并在独立轨迹上验证。
+
+初始化一次；随后在每个快环周期填充完整的九字段输入并调用 `Layered_Step`：
+
+```c
+LayeredState_t state;
+LayeredConfig_t config;
+FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
+LayeredInput_t input;
+/* Populate config and input from the commissioned device interface. */
+Layered_Init(&state, &config, &field_tuning);
+LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
+```
+
+### 三类接入示例，开放的设备接口
+
+三类应用共同体现这一分工：**工业增材 WAAM／PLC 伺服**、**边缘 VLA／快慢分层机器人**、**闭环 aDBS／SCS 神经调控**。它们是同一控制契约的实例；任何面临小样本、跨设备差异、间歇接触、上下文不确定性与严格输出约束的系统，都可以按此契约建立适配层。
+
+| 应用实例 | 慢环定性决策 | 设备适配层与确定性快环的接入抓手 |
+|---|---|---|
+| 工业 WAAM／PLC 伺服 | 工艺、层间热负载与接触工况 | 接入过程量、伺服／送丝调节律与执行器约束；接触力测量和硬限制由设备层实现，换批次用旋钮整定 |
+| 边缘 VLA／快慢机器人 | 任务与环境接触类别 | 接入 1 kHz 力矩／阻抗律，用反馈和旋钮吸收关节静摩擦差异，通过状态包络否决与回退处理越界风险 |
+| 闭环神经调控：aDBS／SCS | aDBS 的生物标志物；SCS 的体位／活动（平躺、行走、咳嗽）及接口状态 | 为 SCS 定义刺激电流—诱发电位（ECAP）一阶招募经验关系与伪迹探针；为 aDBS 定义对应生物标志物调节律；在设备规定的输出／时序约束与临床舒适窗内验证个体化旋钮 |
+
+这些是**设备适配方向**。ECAP 反馈对应 SCS 的接入设计，aDBS 使用各自的脑信号指标；两类接口背景分别见 [Saluda ECAP 闭环 SCS](https://www.saludamedical.com/international/evoke-eva/) 与 [Medtronic 自适应 DBS](https://news.medtronic.com/2025-02-24-Medtronic-earns-U-S-FDA-approval-for-the-worlds-first-Adaptive-deep-brain-stimulation-system-for-people-with-Parkinsons)。
+
+全新物理场景需要重新定义单位、限制、控制律与探针；同场景跨机台保留分类器适用于本基准复合漂移这类中度参数偏移；过大的纯惯量变化（例如超过 +75%）可能改变闭环特征尺度，此时需要重新运行 36 窗口标定。
+
+移植细节见 [AGENTS.md](AGENTS.md)、[领域映射指南](docs/domain_mapping_guide.md) 和[系统工程论述](docs/systems_engineering_manifesto_zh.md)。部署控制接口不接收阶段标签、故障频率或仿真器真值。
+
+## 3. 实证基准：三条路线，同一物理试验场
+
+### 3.1 三条控制路线
 
 | 支路 | 慢环上下文 | 1 kHz 连续执行器指令 |
 |---|---|---|
@@ -88,7 +151,9 @@ B1 与 B3 在**正常控制档使用完全相同的标称前馈**。三支路共
 
 学习式快慢系统正在持续演进，[Helix 02](https://www.figure.ai/news/helix-02) 是其中一个实例。B2 是连续动作路线的可复现代表，并非对该系统的复刻。本仓库的设计目标是 **2027 年及之后受限设备上的工程落地**。
 
-## 2. 四阶段基准与现场整定
+### 3.2 四阶段主对比
+
+S1 检验标称跟踪，S2 检验重载与静摩擦漂移，S3 检验间歇接触与测量噪声，S4 检验未知复合故障。
 
 总时长 40 s，每阶段 10 s；控制周期 1 ms，物理积分采用两个 0.5 ms 子步。执行器限制为 **20 N·m** 与 **2,000 N·m/s**。状态包络为 **|x| ≤ 1 rad**；S3 接触力预算为 **20 N**，通过 0.25 m 力臂换算。
 
@@ -110,6 +175,8 @@ RMSE 比较同一 tick 的参考与真实状态。TV 为阶段内指令变化绝
 | S4 | B3 | 0.538412 | 396.60 | 0 | — |
 
 ![四阶段对比](assets/benchmark_4stages_showdown.png)
+
+### 3.3 冻结 AI，跨机台整定
 
 **换机台零重训适配。** 分类器保持冻结。以下独立 S2 验证采用 6 s、幅值 0.43 rad、种子 811 的共同轨迹，与上方 10 s S2 窗口分别统计。“+35%／+50% 复合机台漂移”指**惯量变化＋强静摩擦死区**，不是单独改变惯量；摩擦强化主导此试验场的 S2 误差。RMSE 单位为 rad，TV 单位为 N·m。
 
@@ -175,7 +242,7 @@ R4 固定使用**零参考、原始档位增益与零前馈**，独立于所有�
 
 </details>
 
-## 3. 模态必要性与独立保护
+### 3.4 模态消融与独立保护
 
 固定档位消融保留**同一套快速安全门控**。动态分类器和物理规则只读取可测特征。下面六种配置均为零状态包络越界。
 
@@ -193,7 +260,7 @@ R4 固定使用**零参考、原始档位增益与零前馈**，独立于所有�
 独立物理探针同时监测尖峰与宽频新息，快环据此执行显式 OOD 弃权。完整复合故障的首个尖峰在同一控制 tick 触发否决。
 
 <details>
-<summary><b>🔍 展开查看：接触—噪声解耦验证、多相位扫描与故障注入边界</b></summary>
+<summary><b>🔍 展开查看：接触—噪声解耦、多相位扫描、故障注入与接口边界</b></summary>
 
 **标称低噪声下仍能识别接触。** 第四维特征结合带符号的标称模型残差功率与残差负载能量，并设置激活阈值和适配间歇接触的释放记忆；只读取实测加速度、速度及已施加指令，不读取噪声 RMS 或接触墙时序。其余特征描述跟踪误差、出力和慢新息。S3 噪声降回标称后，两种监督器仍能切入 R3 并满足接触力预算：
 
@@ -217,9 +284,17 @@ R4 固定使用**零参考、原始档位增益与零前馈**，独立于所有�
 
 S4 失稳支路处于对浮点舍入敏感的非线性区：跨平台比较保持越界数量级一致，允许末位小数差异，不要求失稳轨迹逐点相同。
 
+#### 接口、多轴与超时约定
+
+核心的九项职责为：输入／配置校验、预测包络否决、物理残差否决、低置信／弃权否决、心跳监视、最小驻留、恢复冷却、带抗饱和和输出限制的控制器组执行、粘性故障记录。每个积分器跟踪实际施加指令；先限幅，再限斜率。驻留与诊断计数器在 `UINT32_MAX` 饱和。C ABI 与函数签名保持固定。
+
+**慢环邮箱或现场旋钮非法时选择闭环 R4**，置位 `corrupted` 并锁存已有损坏输入故障位；包络与残差否决保持更高优先级。快环输入或配置非法时沿用原生指令 HOLD 路径。非法旋钮在内部替换为 `(1,1,1)`，运行 R4 的同时保持正常档位追踪积分器有限。状态、参考、速度与前馈允许为负；只有归一化残差必须非负。增益与阻尼旋钮范围为 **[0.10,4.0]**，安全裕度范围为 **[0.10,1.0]**，只允许收紧包络。这些范围是输入合法性防火墙边界，不是闭环稳定保证；可用增益须由带约束的 `auto_field_tune` 试验确立。R4 忽略旋钮缩放、轨迹参考与前馈。
+
+多轴／多通道采用**独立状态、探针、旋钮与时间戳**。只有单位与限制一致时才共享只读配置，耦合约束由设备适配层处理。慢环超时默认 **350 ms**；适配层发送显式 R4 弃权并保留真实帧龄。新鲜帧恢复后经过 **300 ms** 核心冷却。C 原生 `HOLD` 保持的是**执行器命令**，不是机械位置。
+
 </details>
 
-## 4. 小样本建档与资源核算
+### 3.5 小样本建档、资源与领域映射
 
 `auto_calibrate(samples, labels)` 从三段各 10 s 的建档探测中，各取十二个标注宏观窗口，共 **36 个窗口**，生成三组四维原型与置信参数。模型实际存储 **15 个标量**：十二个原型值、一个距离衰减系数和两个置信阈值。
 
@@ -234,50 +309,9 @@ S4 失稳支路处于对浮点舍入敏感的非线性区：跨平台比较保�
 
 FP32 字节数是存储换算，RBF 数值试验使用 FP64。状态 RAM、模型存储与代码体积分别计量。Python 输出 RBF 与 C 调用主机时间，包含 ctypes 开销，不作为目标设备 WCET。C 核只依赖 `<stdint.h>`，采用固定规模算术，不使用堆、I/O、libm 或可变全局状态。
 
-## 5. 将契约接入新系统
-
-**AI 编程助手（Cursor / Claude Code / Codex）一键移植**：直接让 Agent 阅读 [AGENTS.md](AGENTS.md)，并按设备契约替换 [极简模板](python_bench/minimal_template.py) 中的 `SLOT 1..3`，在百行左右的适配代码中接入新设备的自动建档与旋钮整定。
-
-1. **定义并接线。** 约定单位、安全零点与输出限制，建立标称模型和控制器组，接入传感器、参考及执行器。
-2. **小样本建档。** 从可测宏观特征运行 `auto_calibrate`，建立工况原型与置信阈值。
-3. **冻结 AI，现场整定。** 运行跨工况约束试验，以 `auto_field_tune` 选择旋钮，并在独立轨迹上验证。
-
-复制 C99 核心时，请一并保留 [LICENSE](LICENSE) 中的 MIT 版权与许可声明。
-
-| 应用实例 | 慢环定性决策 | 确定性快环 |
-|---|---|---|
-| 工业 WAAM／PLC 伺服 | 工艺、负载和接触工况 | 过程／伺服调节律、执行器约束、现场整定 |
-| 边缘 VLA／快慢机器人 | 任务与环境上下文 | 力矩／阻抗律、快速扰动处理、回退 |
-| 闭环 aDBS／SCS | 生物标志物和接口状态分类 | 设备定义的调节律、输出包络和时序 |
-
 ![通用控制契约的三类映射](assets/domain_profiles_comparison.png)
 
-全新物理场景需要重新定义单位、限制、控制律与探针；同场景跨机台保留分类器适用于本基准复合漂移这类中度参数偏移；过大的纯惯量变化（例如超过 +75%）可能改变闭环特征尺度，此时需要重新运行 36 窗口标定。
-
-```c
-LayeredState_t state;
-LayeredConfig_t config;
-FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
-LayeredInput_t input;
-/* Populate config and input from the commissioned device interface. */
-Layered_Init(&state, &config, &field_tuning);
-LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
-```
-
-<details>
-<summary><b>🔧 展开查看：核心接口、多轴实例与超时约定</b></summary>
-
-核心的九项职责为：输入／配置校验、预测包络否决、物理残差否决、低置信／弃权否决、心跳监视、最小驻留、恢复冷却、带抗饱和和输出限制的控制器组执行、粘性故障记录。每个积分器跟踪实际施加指令；先限幅，再限斜率。驻留与诊断计数器在 `UINT32_MAX` 饱和。C ABI 与函数签名保持固定。
-
-**慢环邮箱或现场旋钮非法时选择闭环 R4**，置位 `corrupted` 并锁存已有损坏输入故障位；包络与残差否决保持更高优先级。快环输入或配置非法时沿用原生指令 HOLD 路径。非法旋钮在内部替换为 `(1,1,1)`，运行 R4 的同时保持正常档位追踪积分器有限。状态、参考、速度与前馈允许为负；只有归一化残差必须非负。增益与阻尼旋钮范围为 **[0.10,4.0]**，安全裕度范围为 **[0.10,1.0]**，只允许收紧包络。这些范围是输入合法性防火墙边界，不是闭环稳定保证；可用增益须由带约束的 `auto_field_tune` 试验确立。R4 忽略旋钮缩放、轨迹参考与前馈。
-
-多轴／多通道采用**独立状态、探针、旋钮与时间戳**。只有单位与限制一致时才共享只读配置，耦合约束由设备适配层处理。慢环超时默认 **350 ms**；适配层发送显式 R4 弃权并保留真实帧龄。新鲜帧恢复后经过 **300 ms** 核心冷却。C 原生 `HOLD` 保持的是**执行器命令**，不是机械位置。
-
-</details>
-
-移植细节见 [AGENTS.md](AGENTS.md)、[领域映射指南](docs/domain_mapping_guide.md) 和[系统工程论述](docs/systems_engineering_manifesto_zh.md)。部署控制接口不接收阶段标签、故障频率或仿真器真值。
-
-## 6. 复现
+### 3.6 完整复现
 
 Python 3 与现有 NumPy／matplotlib 依赖；C 核路径需要 C99 编译器：
 
