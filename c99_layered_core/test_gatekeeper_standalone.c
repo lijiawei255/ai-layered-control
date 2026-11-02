@@ -167,6 +167,10 @@ static void build_config(LayeredConfig_t *c)
     c->ki[1] = 0.15f;
     c->ki[2] = 0.10f;
     c->ki[3] = 0.05f;
+    c->ff_scale[0] = 1.0f;
+    c->ff_scale[1] = 1.0f;
+    c->ff_scale[2] = 1.0f;
+    c->ff_scale[3] = 1.0f;
 }
 
 static void build_tuning(FieldTuning_t *t, float gain, float damping, float margin)
@@ -854,6 +858,9 @@ static void test_dwell(void)
     check(switches > 0 && min_gap >= (int)cfg.min_dwell_ticks,
           "stage 6 dwell: %d effective regime switches, minimum spacing %d ticks (dwell %u)",
           switches, (min_gap == (1 << 30)) ? -1 : min_gap, (unsigned)cfg.min_dwell_ticks);
+    check(min_gap == (int)cfg.min_dwell_ticks,
+          "stage 6 dwell: the minimum spacing is exactly min_dwell_ticks=%u ticks",
+          (unsigned)cfg.min_dwell_ticks);
     check(switches * 3 <= toggles,
           "stage 6 dwell: %d switches for %d AI regime-change requests (anti-chatter keeps the bank)",
           switches, toggles);
@@ -968,7 +975,6 @@ static void test_firewall(void)
     float saved_blend;
     layered_regime_t saved_regime;
     uint32_t saved_dwell;
-    uint32_t saved_recovery;
     uint32_t saved_corrupt;
     int saved_ood;
     int saved_safety;
@@ -1026,7 +1032,6 @@ static void test_firewall(void)
         saved_blend = st.blend;
         saved_regime = st.regime;
         saved_dwell = st.dwell_ticks;
-        saved_recovery = st.recovery_ticks;
         saved_corrupt = st.corrupted_frame_count;
         saved_ood = st.ood_latched;
         saved_safety = st.safety_latched;
@@ -1050,9 +1055,10 @@ static void test_firewall(void)
               "stage 7 firewall case %d: not a single integrator was updated",
               i + 1);
         check(st.ood_latched == saved_ood && st.safety_latched == saved_safety &&
-              st.dwell_ticks == saved_dwell && st.recovery_ticks == saved_recovery,
-              "stage 7 firewall case %d: no latch, dwell or recovery state was touched",
-              i + 1);
+              st.dwell_ticks == saved_dwell &&
+              st.recovery_ticks == cfg.ood_recovery_cooldown_ticks,
+              "stage 7 firewall case %d: no latch/dwell state was touched, and the recovery cooldown was re-armed to %u",
+              i + 1, (unsigned)st.recovery_ticks);
         check(st.corrupted_frame_count == saved_corrupt + 1u &&
               (st.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0u,
               "stage 7 firewall case %d: corrupted_frame_count=%u and NAN_CORRUPTION latched",
@@ -1512,6 +1518,196 @@ static void test_confidence_latch(void)
 /* main                                                                      */
 /* ========================================================================= */
 
+/* ========================================================================= */
+/* Stage 12: first clean control step snap                                   */
+/* ========================================================================= */
+
+static void test_first_control_step(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    inv_t inv;
+    LayeredInput_t in;
+    LayeredInput_t bad;
+    LayeredOutput_t out;
+
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    inv_reset(&inv);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.r = 0.10f;
+    in.r_dot = 0.0f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.u_ff = 0.0f;
+
+    /* A corrupt first frame must not consume the snap. */
+    Layered_Init(&st, &cfg, &tun);
+    bad = in;
+    bad.x = make_nan();
+    out = Layered_Step(&st, &cfg, &tun, &bad);
+    check(out.corrupted == 1 && st.control_started == 0,
+          "stage 12 first step: a corrupt first frame is rejected and does not consume the snap");
+
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.blend == 1.0f && st.control_started == 1 && out.u > 0.0f,
+          "stage 12 first step: the first clean control step snaps blend to 1 (u=%.6f)",
+          (double)out.u);
+
+    /* A normal first frame also snaps. */
+    Layered_Init(&st, &cfg, &tun);
+    inv_reset(&inv);
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.blend == 1.0f && st.control_started == 1 && out.u > 0.0f,
+          "stage 12 first step: a healthy first frame snaps the command (u=%.6f)",
+          (double)out.u);
+    check(inv.violations == 0,
+          "stage 12 first step: actuator invariants hold on the snap tick");
+}
+
+/* ========================================================================= */
+/* Stage 12b: latency / corrupt frames re-arm the recovery cooldown          */
+/* ========================================================================= */
+
+static void test_cooldown_latency(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    inv_t inv;
+    LayeredInput_t in;
+    LayeredOutput_t out;
+    int i;
+    int fallback_ticks = 0;
+    int fallback_bad = 0;
+    int switched_at = -1;
+
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    inv_reset(&inv);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.r = 0.0f;
+    in.r_dot = 0.0f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.u_ff = 0.0f;
+
+    for (i = 0; i < 200; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+
+    /* OOD burst, then a few clean ticks. */
+    in.physics_residual = 3.0f;
+    for (i = 0; i < 5; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    in.physics_residual = 0.10f;
+    for (i = 0; i < 50; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(st.recovery_ticks > 0u && st.recovery_ticks < cfg.ood_recovery_cooldown_ticks,
+          "stage 12b cooldown: 50 clean ticks consume part of the cooldown (%u left)",
+          (unsigned)st.recovery_ticks);
+
+    /* A latency hold must re-arm the full cooldown. */
+    in.outer_age_s = 0.400f;
+    for (i = 0; i < 3; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(st.recovery_ticks == cfg.ood_recovery_cooldown_ticks &&
+          out.gate == GATE_HOLD_LATENCY,
+          "stage 12b cooldown: 3 stale ticks re-arm the full %u-tick cooldown",
+          (unsigned)cfg.ood_recovery_cooldown_ticks);
+
+    /* Now count the safe fallback ticks; the AI must be re-armed only after
+     * the full cooldown of consecutive clean samples. */
+    in.outer_age_s = 0.005f;
+    in.ai_regime = 2.0f;
+    for (i = 0; i < (int)cfg.ood_recovery_cooldown_ticks + 20; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (switched_at < 0 && out.regime == REGIME_HIGH_LOAD_DAMPED) {
+            switched_at = i;
+        }
+        if (i < (int)cfg.ood_recovery_cooldown_ticks) {
+            if (out.gate == GATE_NORMAL && out.regime == REGIME_SAFE_FALLBACK) {
+                fallback_ticks++;
+            } else {
+                fallback_bad++;
+            }
+        }
+    }
+    check(fallback_bad == 0 && fallback_ticks == (int)cfg.ood_recovery_cooldown_ticks,
+          "stage 12b cooldown: %d/%u clean ticks stay in REGIME_SAFE_FALLBACK",
+          fallback_ticks, (unsigned)cfg.ood_recovery_cooldown_ticks);
+    check(switched_at == (int)cfg.ood_recovery_cooldown_ticks,
+          "stage 12b cooldown: the AI bank is re-armed on tick %d after the last stale tick",
+          switched_at);
+}
+
+/* ========================================================================= */
+/* Stage 12c: per-regime feedforward scale                                   */
+/* ========================================================================= */
+
+static void test_ff_scale(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    inv_t inv;
+    LayeredInput_t in;
+    LayeredOutput_t out;
+    int i;
+
+    build_config(&cfg);
+    cfg.ff_scale[0] = 0.5f;
+    cfg.ff_scale[1] = 0.25f;
+    /* Disable the integrators so the test observes the feedforward gain
+     * directly, without the (correct) inactive-bank tracking term. */
+    cfg.ki[0] = 0.0f;
+    cfg.ki[1] = 0.0f;
+    cfg.ki[2] = 0.0f;
+    cfg.ki[3] = 0.0f;
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    inv_reset(&inv);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.r = 0.40f;
+    in.r_dot = 0.0f;
+    in.x = 0.40f;
+    in.x_dot = 0.0f;
+    in.u_ff = 0.40f;
+
+    for (i = 0; i < 100; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(t_absf(out.u - 0.20f) < 0.02f,
+          "stage 12c ff_scale: bank 1 applies 0.5*u_ff=0.20 (u=%.5f)",
+          (double)out.u);
+
+    /* Request bank 2 and wait out the 150-tick dwell. */
+    in.ai_regime = 2.0f;
+    for (i = 0; i < 250; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(t_absf(out.u - 0.10f) < 0.02f,
+          "stage 12c ff_scale: bank 2 applies 0.25*u_ff=0.10 (u=%.5f)",
+          (double)out.u);
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -1542,6 +1738,11 @@ int main(void)
 
     printf("\n-- stage 11: sticky confidence veto --\n");
     test_confidence_latch();
+
+    printf("\n-- stage 12: first-step snap / latency cooldown / ff_scale --\n");
+    test_first_control_step();
+    test_cooldown_latency();
+    test_ff_scale();
 
     printf("\n-- priority chain + API --\n");
     test_priority();

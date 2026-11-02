@@ -1,8 +1,13 @@
-function mdl = build_simulink_model(out_path)
+function [mdl, status] = build_simulink_model(out_path, opts)
 %BUILD_SIMULINK_MODEL  Programmatically build ai_layered_control_bench.slx
 %
 %   MDL = BUILD_SIMULINK_MODEL() writes the model next to this file and
 %   returns its name.  MDL = BUILD_SIMULINK_MODEL(OUT_PATH) writes it there.
+%   [MDL,STATUS] = ... also returns 'built', 'skipped_dirty' or 'unavailable'.
+%
+%   A loaded model with unsaved edits is NEVER closed or overwritten unless
+%   opts.force is true.  Without Simulink the numeric benchmark remains fully
+%   usable; the caller can skip the model step.
 %
 %   The model is generated with BUILT-IN Simulink blocks only (no MATLAB
 %   Function blocks, no Stateflow, no toolbox blocks, no MEX compiler), so it
@@ -10,8 +15,10 @@ function mdl = build_simulink_model(out_path)
 %
 %     three parallel branches on the same plant and reference:
 %       Branch 1 - fixed PID (nominal baseline)
-%       Branch 2 - end-to-end AI policy with a 100 ms transport delay and a
-%                  10 Hz zero-order hold emulating edge inference latency
+%       Branch 2 - continuous-policy sketch with a 100 ms transport delay and
+%                  a 10 Hz zero-order hold emulating edge inference latency
+%                  (the trained RBF baseline is quantitative code in
+%                  sim_core_engine.m, not a block in this visualization)
 %       Branch 3 - layered architecture: 1 kHz PID with a hard safety
 %                  saturation (the deterministic core)
 %
@@ -25,9 +32,24 @@ if nargin < 1 || isempty(out_path)
     here = fileparts(mfilename('fullpath'));
     out_path = fullfile(here, 'ai_layered_control_bench.slx');
 end
+if nargin < 2 || isempty(opts)
+    opts = struct();
+end
+force = isfield(opts, 'force') && opts.force;
 
 model = 'ai_layered_control_bench';
+if ~license('test', 'Simulink') || exist('sim', 'file') == 0
+    mdl = model;
+    status = 'unavailable';
+    return;
+end
 if bdIsLoaded(model)
+    dirty = strcmp(get_param(model, 'Dirty'), 'on');
+    if dirty && ~force
+        mdl = model;
+        status = 'skipped_dirty';
+        return;
+    end
     close_system(model, 0);
 end
 if exist(out_path, 'file')
@@ -149,6 +171,7 @@ end
 local_sanitize_slx(out_path);
 
 mdl = model;
+status = 'built';
 end
 
 % =========================================================================

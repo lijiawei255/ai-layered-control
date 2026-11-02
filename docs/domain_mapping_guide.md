@@ -22,24 +22,9 @@ files, the code wins — those files are the ground truth (see `AGENTS.md` §2).
 
 ---
 
-## Scope and disclaimer / 适用范围与免责声明
-
-**Scope and disclaimer.** This document is a conceptual mapping guide for a **reference implementation and
-proof-of-concept benchmark**. Every number quoted here comes from a **parameterised synthetic nonlinear
-plant** (second-order drive, Stribeck friction, sensor noise, drift, edge-compute latency, injected OOD
-mode); the three domains reuse that same skeleton with different units and magnitudes. No clinical patient
-data and no production-machine data are used, and nothing here has been validated on hardware. The C core
-borrows defensive embedded-programming principles (zero dynamic allocation, bounded execution steps,
-input sanitisation, fault-bit logging) as a structure reference; the code in this repository is **not**
-certified functional-safety or medical-device firmware. Before applying this mapping to a real
-industrial, robotic or neuromodulation system, run your own FMEA/STPA, hardware-in-the-loop testing and
-the regulatory certification your domain requires.
-
-**适用范围与免责声明。** 本文件是**参考实现与概念验证基准**的概念映射指南。文中所有数字都来自**参数化合成非线性
-被控对象**（二阶传动、Stribeck 摩擦、传感器噪声、漂移、边缘算力时延、注入式 OOD 模态）；三个目标域只是同一骨架在
-不同单位与量级下的复用。不含任何真实患者临床数据或产线机台数据，也没有在硬件上验证。C 核心借鉴防御式嵌入式编程
-原则（零动态分配、有界执行步数、输入清洗、故障位记录）作为结构参考，但本仓库代码**不是**经过认证的功能安全或医疗
-器械固件。把本映射用于真实工业/机器人/神经调控系统之前，必须自行完成 FMEA/STPA、硬件在环测试以及所在领域的法规认证。
+> **Scope / 适用范围：** this guide is a conceptual mapping for the reference implementation. The single
+> binding scope and disclaimer statement is in [`README.md`](../README.md) §9 / [`README_zh.md`](../README_zh.md) §9;
+> the neuromodulation-specific boundary is repeated once at the end of §6.3 below.
 
 ---
 ## Part 0 — One skeleton, three parameter sets / 同一副骨架，三套参数
@@ -291,7 +276,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 
 **B. Deterministic core**
 - [ ] Core compiled on the target toolchain; no heap, no `math.h`, no recursion in the 1 kHz path.
-- [ ] Shipped regression test green on the host: `SUMMARY: n_pass=105, n_fail=0`.
+- [ ] Shipped regression test green on the host: `SUMMARY: n_pass=116, n_fail=0`.
 - [ ] Target port re-proves: `|u| ≤ u_max`, `|Δu| ≤ slew_max·dt_s` on **every** tick, `blend ∈ [0,1]`.
 - [ ] NaN/Inf/out-of-range frame ⇒ hold + `NAN_CORRUPTION` bit, integrators untouched.
 - [ ] Stale heartbeat ⇒ `GATE_HOLD_LATENCY`, command bit-identical to the last applied one.
@@ -301,7 +286,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 - [ ] Nominal plant model frozen at commissioning (no online adaptation of the reference model).
 - [ ] Two residual channels with fast/slow split; only the fast channel vetoes.
 - [ ] 3–6 dimensionless features; class means from ≤ 50 calibration runs; no raw-signal classifier.
-- [ ] Confidence is a margin measure (`d₂/(d₁+d₂)`), not a softmax of an unverifiable logit.
+- [ ] Confidence is a margin × proximity measure (`((d₂−d₁)/(d₂+d₁))·exp(−γ·d₁)`), not a softmax of an unverifiable logit.
 - [ ] Artificial OOD injection ⇒ veto within 10 ms and no envelope breach **in the synthetic benchmark conditions**.
 
 **D. Safety and behaviour**
@@ -328,7 +313,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 
 **B. 确定性核心**
 - [ ] 核心在**目标工具链**上编译通过；1 kHz 路径无堆、无 `math.h`、无递归。
-- [ ] 仓库自带回归测试在主机上全绿：`SUMMARY: n_pass=105, n_fail=0`。
+- [ ] 仓库自带回归测试在主机上全绿：`SUMMARY: n_pass=116, n_fail=0`。
 - [ ] 目标移植重新证明：**每一个** tick 都满足 `|u| ≤ u_max`、`|Δu| ≤ slew_max·dt_s`、`blend ∈ [0,1]`。
 - [ ] NaN/Inf/越界帧 ⇒ 保持指令 + `NAN_CORRUPTION` 位，且积分器未被更新。
 - [ ] 心跳过期 ⇒ `GATE_HOLD_LATENCY`，且指令与上一次实际下发值**逐位相同**。
@@ -338,7 +323,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 - [ ] 名义对象模型在标定后**冻结**（参考模型不做在线自适应）。
 - [ ] 残差快/慢双通道；只有快通道参与否决。
 - [ ] 3–6 维无量纲特征；类均值来自 ≤ 50 次标定；不做原始信号分类器。
-- [ ] 置信度是边际量（`d₂/(d₁+d₂)`），不是无法核验的 logit softmax。
+- [ ] 置信度是边际 × 邻近度量（`((d₂−d₁)/(d₂+d₁))·exp(−γ·d₁)`），不是无法核验的 logit softmax。
 - [ ] 人工注入 OOD ⇒ 10 ms 内弃权，且在**合成基准工况下**安全包络零越界。
 
 **D. 安全与行为**
@@ -416,6 +401,37 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 3. **逐患者重训分类器，或把残差触发调得过紧以致正常伪迹就中断治疗。** 患者适配用三个现场旋钮；触发值应高于良性伪迹尾部
    （99.9 分位）——误弃权会减少治疗时间，是真实的临床伤害。
 
+#### 6.3.1 Neuromodulation stage semantics / 神经调控阶段语义
+
+The same dimensionless core fields (`friction_scale`, `k_scale`, `noise_scale`, per-bank `ff_scale`) map
+onto clinical language, never onto mechanical-arm language:
+
+| Stage | Name | Physical meaning |
+| :--- | :--- | :--- |
+| S1 | **Fast Phasic Biomarker Tracking** | fast phase response (e.g. early beta burst or a rapid posture/target-envelope change), low tissue-block loss; needs the high-bandwidth R1 |
+| S2 | **+35 % Electrode-Tissue Impedance Drift & Activation Threshold Nonlinearity** | across-patient or chronic glial-scar impedance drift plus recruitment dead-zone/hysteresis (the mathematical analogue of the Stribeck term); needs the strongly damped R2 |
+| S3 | **High-Coupling Neural Rebound + EMG/Artifact HF Noise + Telemetry Jitter** | high-coupling rebound stiffness plus EMG/stimulation-artifact noise and 10 Hz wearable telemetry jitter/drops; switches to the low-derivative R3 |
+| S4 | **Unseen OOD Pathological Oscillation & Lead Micro-Dislodgement Spikes** | unseen pathological oscillation plus lead micro-dislodgement transients; the residual probe must veto into `REGIME_SAFE_FALLBACK` within 10 ms |
+
+| 阶段 | 名称 | 物理语义 |
+| :--- | :--- | :--- |
+| S1 | **快速相位生物标记物跟踪** | 快速相位响应（如早期 beta 爆发或体位/靶点包络快变），组织阻滞损耗低；使用高带宽 R1 |
+| S2 | **+35% 电极-组织阻抗漂移与激活阈值非线性** | 跨患者个体差异/慢性胶质瘢痕导致的阻抗漂移 + 招募死区/滞回（Stribeck 项的数学同构）；使用强阻尼 R2 |
+| S3 | **高耦合神经反弹 + EMG/伪迹高频噪声 + 遥测抖动** | 神经回路高耦合反弹刚度 + 肌电/刺激伪迹噪声 + 10 Hz 穿戴式遥测抖动/丢包；切换到低微分 R3 |
+| S4 | **未见 OOD 病理振荡与导联微脱位尖峰** | 未知病理高频振荡 + 导联微脱位瞬态尖峰；残差探针须在 10 ms 内弃权至 `REGIME_SAFE_FALLBACK` |
+
+**Boundary statement / 边界声明.** This neuromodulation preset is a **lumped-parameter synthetic
+nonlinear-dynamics and isomorphic biomarker-envelope model**. It contains no real patient records and is
+not a clinical physiological or pathological model of any specific disease. The C99 core is a
+methodological reference that follows defensive embedded principles (zero dynamic allocation, O(1)
+worst-case execution, NaN firewall, sticky fault audit), but it has not been certified and makes no claim
+of compliance with IEC 62304, ISO 14971, IEC 60601 or IEC 61508. Any clinical implant/wearable
+neuromodulation deployment must add independent hardware charge-balance protection, an external watchdog,
+and complete clinical/regulatory validation. 本神经调控预设是**集总参数合成非线性动力学与同构生物标记物包络模型**，
+不含任何真实患者临床记录，也不构成特定疾病的临床生理/病理模型。C99 核心是方法论参考实现，未经过且不声称具备
+IEC 62304、ISO 14971、IEC 60601 或 IEC 61508 认证；任何临床植入/穿戴式神经调控部署均须配合独立硬件电荷平衡保护、
+硬件看门狗及完整的临床与法规审批验证。
+
 ---
 
 ## Part 7 — Where these numbers come from / 这些数字从哪里来
@@ -427,7 +443,7 @@ envelope inside strict clinical bounds; electrode impedance drifts +35 % between
 | the per-tick execution order and hysteresis behaviour | `c99_layered_core/layered_gatekeeper.c` |
 | how the presets are used in closed loop (observer, features, classifier) | `matlab_simulink/sim_core_engine.m` |
 | sample complexity / drift / compute evidence | `matlab_simulink/run_efficiency_analysis.m` |
-| the four engineering checks and the figures | `matlab_simulink/run_all_benchmarks.m` |
+| the five engineering checks and the figures | `matlab_simulink/run_all_benchmarks.m` |
 | reproducible seeds | four-stage benchmark `seed = 7`, efficiency study `seed = 17`, C regression test uses no `rand()` (see `AGENTS.md` §7) |
 | the rules an AI assistant must not break | `AGENTS.md` |
 

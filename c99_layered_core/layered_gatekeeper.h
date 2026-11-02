@@ -125,6 +125,8 @@ typedef struct {
     float kp[LAYERED_NUM_REGIMES]; /* controller bank: index = regime - 1      */
     float kd[LAYERED_NUM_REGIMES];
     float ki[LAYERED_NUM_REGIMES];
+    float ff_scale[LAYERED_NUM_REGIMES]; /* per-bank gain on the deterministic  */
+                                         /* feedforward u_ff (1.0 = as supplied) */
 } LayeredConfig_t;
 
 /* ------------------------------------------------------------------------- */
@@ -166,6 +168,7 @@ typedef struct {
     float u_target;              /* previous pre-clamp target                   */
     float integ[LAYERED_NUM_REGIMES]; /* one integrator per bank controller     */
     float blend;                 /* bumpless-transfer progress in [0,1]         */
+    int control_started;         /* 0 until the first clean control step        */
     layered_regime_t regime;     /* last effective regime                       */
     int ood_latched;             /* sticky OOD veto                             */
     int safety_latched;          /* sticky safety-envelope veto                 */
@@ -187,7 +190,8 @@ typedef struct {
 
 /* Zeroes the state and puts the core in a defined, safe starting condition.
  * Safe starting condition = NOMINAL regime, no latches, no fault bits,
- * u = 0, blend = 0, recovery cooldown expired, dwell counter = 0. */
+ * u = 0, blend = 0, control_started = 0, recovery cooldown expired, dwell
+ * counter = 0. */
 void Layered_Init(LayeredState_t *state,
                   const LayeredConfig_t *config,
                   const FieldTuning_t *tuning);
@@ -201,16 +205,18 @@ void Layered_Init(LayeredState_t *state,
  *    [1,4], confidence outside [0,1], negative residual/age) is rejected:
  *      - LAYERED_FAULT_BIT_NAN_CORRUPTION is latched,
  *      - corrupted_frame_count is incremented,
- *      - controller state / integrators are NOT updated (no NaN poisoning),
- *      - the last applied command is held (fail-safe hold, same as a stale
- *        heartbeat), and the output is flagged corrupted = 1.
+ *      - controller state / integrators / dwell counter / latches are NOT
+ *        updated and the last applied command is held (fail-safe hold),
+ *      - the recovery cooldown IS re-armed: a corrupt frame is not a clean
+ *        sample, so it can never count towards "500 consecutive clean ticks",
+ *      - the output is flagged corrupted = 1.
  *    ai_regime == 4 is *not* corruption: it is an explicit AI abstention and
  *    is handled as GATE_VETO_LOW_CONFIDENCE.
  *
  * 1. DECISION PRIORITY (highest first, evaluated every clean step):
  *      a) GATE_VETO_SAFETY_ENVELOPE : |x| > safety_trip_ratio*limit_eff, or
- *         |x| + safety_predict_s*|x_dot| > limit_eff.  Sticky until |x| and
- *         the prediction recede below the clear ratios.
+ *         |x| + safety_predict_s*|x_dot| > limit_eff.  Sticky: it clears only
+ *         when BOTH |x| and the prediction are below safety_clear_ratio*limit.
  *         -> latches LAYERED_FAULT_BIT_ENVELOPE_BREACH.
  *      b) GATE_VETO_OOD_RESIDUAL    : residual above threshold. Sticky until
  *         it recedes below residual_clear_ratio*threshold.
@@ -228,31 +234,37 @@ void Layered_Init(LayeredState_t *state,
  *
  * 2. ANTI-CHATTER DWELL TIME
  *    A transition between two *normal* regimes (1,2,3) is only applied after
- *    the current regime has been held for min_dwell_ticks samples.  Before
- *    that the previous regime is kept (the gate stays GATE_NORMAL).  This is
- *    what stops 1->2->1->2 mode ping-ponging on a noisy boundary.
+ *    the current regime has been held for min_dwell_ticks samples.  The
+ *    counter counts the current tick as well: the earliest switch is exactly
+ *    min_dwell_ticks ticks after the previous switch.  Before that the
+ *    previous regime is kept (the gate stays GATE_NORMAL).  This is what
+ *    stops 1->2->1->2 mode ping-ponging on a noisy boundary.
  *
  * 3. POST-FAULT RECOVERY COOLDOWN
- *    Whenever any veto is active the core runs REGIME_SAFE_FALLBACK and
- *    re-arms ood_recovery_cooldown_ticks.  After the fault clears the core
- *    keeps REGIME_SAFE_FALLBACK (gate GATE_NORMAL, no veto) until that many
+ *    Whenever the gate is not GATE_NORMAL - any veto, a latency hold, or a
+ *    corrupt frame - the core runs/reports the safe fallback and re-arms
+ *    ood_recovery_cooldown_ticks.  After the fault clears the core keeps
+ *    REGIME_SAFE_FALLBACK (gate GATE_NORMAL, no veto) until that many
  *    CONSECUTIVE clean samples have elapsed; only then is the AI regime
  *    switching re-enabled.  A single clean tick is never enough.
  *
  * 4. CONTROLLER BANK + ANTI-WINDUP + BUMPLESS TRANSFER
- *    u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + input->u_ff
+ *    u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + ff_scale[i]*u_ff
  *    (i = regime-1; i = 3 for the safety fallback; gains scaled by
  *    FieldTuning_t).  u_ff is the deterministic feedforward command produced
  *    by the commissioning model / trajectory generator, so the plant-inverse
- *    term stays white-box and is never produced by the AI.
+ *    term stays white-box and is never produced by the AI.  ff_scale[i] is a
+ *    per-bank commissioned gain on that same white-box term; it is not an AI
+ *    output and does not change the feedforward's deterministic origin.
  *    EVERY controller in the bank owns an integrator and EVERY integrator is
  *    continuously back-calculated toward the ACTUAL clamped actuator output
  *    (tracking anti-windup with windup_tau_s), so an inactive controller can
  *    never accumulate hidden windup and a later switch releases no energy.
- *    The pre-clamp target follows u_pid[i] through a first-order filter with
- *    coefficient blend_alpha, so a regime switch never produces a command
- *    step larger than blend_alpha * u_max.  Finally the command is hard
- *    clamped in magnitude and slew rate.
+ *    On the first clean control step the pre-clamp target snaps to the active
+ *    bank output and blend = 1, so the command does not ramp up from zero.
+ *    On later steps it follows u_pid[i] through a first-order filter with
+ *    coefficient blend_alpha, and a bank switch restarts blend at 0.  Finally
+ *    the command is hard clamped in magnitude and slew rate.
  */
 LayeredOutput_t Layered_Step(LayeredState_t *state,
                              const LayeredConfig_t *config,

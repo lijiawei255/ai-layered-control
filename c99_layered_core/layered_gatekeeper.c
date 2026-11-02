@@ -145,7 +145,7 @@ static float lg_pid_output(const LayeredConfig_t *config,
     return (config->kp[bank] * tuning->gain_scale) * e
          + (config->kd[bank] * tuning->damping_scale) * ed
          + (config->ki[bank] * tuning->gain_scale) * integ
-         + u_ff;
+         + config->ff_scale[bank] * u_ff;
 }
 
 /* Tracking anti-windup (back-calculation) for ONE integrator.
@@ -197,6 +197,7 @@ void Layered_Init(LayeredState_t *state,
     state->integ[2] = 0.0f;
     state->integ[3] = 0.0f;
     state->blend = 0.0f;
+    state->control_started = 0;
     state->regime = REGIME_NOMINAL;
     state->ood_latched = 0;
     state->safety_latched = 0;
@@ -271,10 +272,13 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     /* Nothing below this block runs for a corrupt frame: no integrator, no
      * latch, no blend, no dwell counter is touched.  The actuator simply
      * stays where it is (fail-safe hold) and the sticky NAN_CORRUPTION bit
-     * records that this IPC frame must be investigated. */
+     * records that this IPC frame must be investigated.  The recovery
+     * cooldown is re-armed because a corrupt frame is not a clean sample; it
+     * must never count towards "consecutive clean ticks". */
     if (lg_frame_is_corrupt(input)) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
         state->corrupted_frame_count++;
+        state->recovery_ticks = config->ood_recovery_cooldown_ticks;
         state->step_count++;
 
         out.u = state->u_applied;
@@ -287,7 +291,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         return out;
     }
 
-    snap = (state->step_count == 0u);
+    snap = (state->control_started == 0);
     conf_before = state->conf_latched;
 
     u_max = lg_absf(config->u_max);
@@ -358,6 +362,11 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     if (latency_hold) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LATENCY_TIMEOUT;
 
+        /* A stale heartbeat is not a clean sample: re-arm the recovery
+         * cooldown so the AI can only be re-armed after a fresh run of
+         * consecutive clean ticks. */
+        state->recovery_ticks = config->ood_recovery_cooldown_ticks;
+
         /* Diagnostics only: count one hold EPISODE, not every held tick.  The
          * age of a live heartbeat grows by exactly one inner period per tick,
          * so the first stale tick is the one where the age crosses the
@@ -396,7 +405,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             regime = REGIME_SAFE_FALLBACK;
         } else if (mailbox_regime == state->regime) {
             regime = state->regime;
-        } else if (state->dwell_ticks >= config->min_dwell_ticks) {
+        } else if ((state->dwell_ticks + 1u) >= config->min_dwell_ticks) {
             regime = mailbox_regime; /* dwell satisfied: accept the switch */
         } else {
             regime = state->regime;  /* anti-chatter: keep the old regime */
@@ -479,6 +488,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
                      e, dt_eff, u_pid3, u_cmd, windup_tau, integ_limit);
 
         state->u_applied = u_cmd;
+        state->control_started = 1;
 
         out.u = u_cmd;
         out.u_target = state->u_target;

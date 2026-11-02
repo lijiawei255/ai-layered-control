@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you find this reference architecture or benchmark useful in your research or engineering projects, please cite it as below."
 type: software
 title: "ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control"
-abstract: "A lightweight Simulink and ANSI C99 reference architecture demonstrating fast/slow loop decoupling, coarse-grained semantic regime classification, nominal physics residual OOD abstention, and deterministic fallback across Industrial Control, Edge VLA, and Closed-Loop Neuromodulation."
+abstract: "A lightweight ANSI C99, Python, and MATLAB/Simulink reference architecture demonstrating fast/slow loop decoupling, coarse-grained semantic regime classification, nominal physics residual OOD abstention, and deterministic safety fallback across Industrial WAAM, Edge VLA, and Closed-Loop Neuromodulation."
 authors:
   - family-names: "Li"
     given-names: "Jiawei"
@@ -10,7 +10,7 @@ authors:
 repository-code: "https://github.com/lijiawei255/ai-layered-control"
 url: "https://github.com/lijiawei255/ai-layered-control"
 license: MIT
-version: 1.0.0
+version: 1.1.0
 date-released: "2026-11-02"
 keywords:
   - "control-systems"
@@ -20,3 +20,6 @@ keywords:
   - "ood-detection"
   - "vision-language-action"
   - "neuromodulation"
+  - "python"
+  - "fast-slow-decoupling"
+  - "wire-arc-additive-manufacturing"

@@ -19,9 +19,9 @@ Reference implementation and proof-of-concept benchmark only — see **§9 Scope
 | Question | Answer |
 | :--- | :--- |
 | What is this? | A layered closed-loop architecture: a **10 Hz coarse AI classifier** that only picks one of **3 semantic regimes**, an **independent physics-residual probe** that can **abstain**, and a **1 kHz zero-heap C99 gatekeeper + controller bank** that actually owns the actuator. |
-| What is *not* here? | No continuous `u(t) = π_θ(x(t))` policy, no neural network weights, no training loop, no MEX, no toolbox, no `.mat` files, no large binaries. |
+| What is *not* here? | The **layered path** has no continuous `u(t) = π_θ(x(t))` policy and never lets AI touch `u`/`u_ff`; the benchmark additionally runs a trained RBF end-to-end baseline for comparison. No committed weights or datasets, no MEX, no toolbox, no `.mat` files, no large binaries. |
 | Where is the truth? | `c99_layered_core/layered_gatekeeper.h` → `.c` → `matlab_simulink/sim_core_engine.m` → `matlab_simulink/load_domain_profile.m` (see §2). |
-| How do I know it works? | One command (§4): the four engineering checks print `[1] … PASS` through `[4] … PASS` and the run ends with `All four engineering checks passed.`; the C test prints `SUMMARY: n_pass=105, n_fail=0`. |
+| How do I know it works? | One command (§4): the five engineering checks print `[1] … PASS` through `[5] … PASS` and the run ends with `All five engineering checks passed.`; the C test prints `SUMMARY: n_pass=116, n_fail=0`. |
 | How do I port it? | Follow the four-step playbook in §3. |
 
 **中文小结：** 本仓库是"粗粒度慢环 AI + 确定性快环 C99 核心"的参考架构。AI 只做 3 类模态分类，
@@ -60,9 +60,7 @@ Abstention is a *decision with a name*, not a silent clamp.
 * Enforced by: `LayeredInput_t::physics_residual`, `max_physics_residual`, `residual_clear_ratio`
   (hysteresis), `ood_latched`, `conf_latched`, the sticky audit bit
   `LAYERED_FAULT_BIT_OOD_RESIDUAL`, and the priority chain inside `Layered_Step` (§1.3, item 2).
-* In the MATLAB engine the probe is two-channel (`matlab_simulink/sim_core_engine.m`, `local_run_layered`):
-  a fast channel `|innovation − LP(innovation)| / res_fast_scale` for OOD transients and a slow channel
-  `|LP(innovation)| / res_slow_scale` for drift. Only the fast channel vetoes.
+* In the MATLAB engine the probe is **three-channel** (`matlab_simulink/sim_core_engine.m`, `local_run_layered`): a **spike channel** (median-5 deviation), a **narrowband HF resonance channel** at the profile OOD mode, and a **slow LP channel** used only as a classifier feature. The gate receives `max(res_fast, res_hf_gated)`; only the spike/HF channels veto.
 * Consequence: an OOD event is *supposed* to look like "gate changes state, command stays sane", never
   like "output explodes".
 
@@ -141,8 +139,8 @@ earlier).
 | 2 | `c99_layered_core/layered_gatekeeper.c` | the **execution order** | what actually happens per tick, in which order, with which hysteresis; the only mutable state is the struct you pass in |
 | 3 | `matlab_simulink/sim_core_engine.m` | the **closed-loop meaning** | the 3-branch / 4-stage benchmark and a line-by-line MATLAB mirror of the C core (`local_core_step`), plus the residual probe, observer and coarse classifier |
 | 4 | `matlab_simulink/load_domain_profile.m` | the **physical numbers** | every constant for the three domains, in real units: inertia, friction, actuator limits, safety envelope, noise, drift, latency, OOD fault, gatekeeper timings, classifier class means |
-| 5 | `c99_layered_core/test_gatekeeper_standalone.c` | the **behavioral spec** | 105 C checks across 9+ stages: priority chain, dwell, cooldown, firewall, anti-windup, `FieldTuning_t`, feedforward, confidence latch |
-| 6 | `matlab_simulink/run_all_benchmarks.m` | the **acceptance gate** | the four engineering checks and the three 240 dpi figures |
+| 5 | `c99_layered_core/test_gatekeeper_standalone.c` | the **behavioral spec** | 116 C checks across 9+ stages: priority chain, dwell, cooldown, firewall, anti-windup, `FieldTuning_t`, feedforward, confidence latch |
+| 6 | `matlab_simulink/run_all_benchmarks.m` | the **acceptance gate** | the five engineering checks and the three 240 dpi figures |
 | 7 | `matlab_simulink/run_efficiency_analysis.m` | the **data/compute claims** | sample complexity (Panel A), zero-retraining drift sweep (Panel B), compute/memory footprint (Panel C) |
 | 8 | `matlab_simulink/build_simulink_model.m` | the **`.slx` definition** | the model is generated from this file; this is what the `.slx` actually contains |
 
@@ -164,14 +162,20 @@ ai-layered-control/
 ├── c99_layered_core/                  # deployable core: C99, zero dependency, no heap
 │   ├── layered_gatekeeper.h           # contract      (read first)
 │   ├── layered_gatekeeper.c           # implementation (read second)
-│   └── test_gatekeeper_standalone.c   # 105-check regression test
+│   └── test_gatekeeper_standalone.c   # 116-check regression test
 ├── matlab_simulink/                   # benchmark + domain presets + model builder
 │   ├── load_domain_profile.m
 │   ├── sim_core_engine.m
 │   ├── run_efficiency_analysis.m
 │   ├── build_simulink_model.m
 │   ├── run_all_benchmarks.m           # one-click acceptance run
+│   ├── calibrate_coarse_classifier.m
+│   ├── train_continuous_policy.m
+│   ├── verify_core_equivalence.m
 │   └── ai_layered_control_bench.slx   # generated artifact (do not treat as source)
+├── python_bench/
+│   ├── run_benchmark.py               # ctypes C core or NumPy fallback
+│   └── requirements.txt
 └── assets/                            # three 240 dpi figures (produced by run_all_benchmarks)
     ├── benchmark_4stages_showdown.png
     ├── efficiency_and_generalization.png
@@ -204,14 +208,16 @@ parallel branches. Practical consequences for an agent:
 
 Plain-text sources — C99 (`c99_layered_core/`), MATLAB (`matlab_simulink/`) and Markdown (`docs/`,
 `README*.md`, this file) — plus **one generated Simulink model** and **three generated 240 dpi figures**.
-There are no learned weights and no datasets: the coarse classifier is a table of 3 class means over 4
-features plus 4 feature scales (16 numbers), and everything else is commissioned physics. If your port
-starts producing weights, checkpoints or logs, keep them outside this repository.
+No weights are committed: the Branch 2 RBF is fitted deterministically at run time from a synthetic
+nominal-unit rollout, and the coarse-classifier prototypes plus confidence threshold are fitted by
+`calibrate_coarse_classifier.m` from three short closed-loop probes. The repository ships sources, one
+generated model and three generated figures; if your port produces weights, checkpoints or logs, keep
+them outside this repository.
 
 **中文小结（纯文本真值地图）：** 阅读顺序 `.h` → `.c` → `sim_core_engine.m` → `load_domain_profile.m`；
 `.slx` 由 `build_simulink_model.m` 生成（参数已内联，`clearvars` 后可直接运行），仅含内置 Simulink 模块，
 是可视化产物——**不要**去解析它。仓库内容 = 纯文本源码 + 一个生成的 `.slx` + 三张 240 dpi 图；
-没有任何学习权重或数据集（分类器只有 16 个数）。
+RBF 权重与分类器原型都在运行时由确定性标定生成，不提交权重或数据集。
 
 ---
 
@@ -251,14 +257,14 @@ right before the **AI**. Each step lists *what to read*, *what to change*, and *
   3. Keep the sticky fault bits: persist them if the platform has non-volatile storage; they are your
      incident report.
 * **Verify (signals):**
-  * rebuild and run the shipped regression test — expect `SUMMARY: n_pass=105, n_fail=0` and exit code 0;
+  * rebuild and run the shipped regression test — expect `SUMMARY: n_pass=116, n_fail=0` and exit code 0;
   * on the target: `|u| ≤ u_max` and `|u[k] − u[k−1]| ≤ slew_max·dt_s` on **every** tick (not on average);
   * `blend ∈ [0, 1]`; `u` is finite even after injecting NaN/Inf into the mailbox;
   * a deliberate stale heartbeat produces `GATE_HOLD_LATENCY` with a **bit-identical** held command.
 
 ### Step 3 — Build only the two things the AI is allowed to do: normalized features + residual probe
 
-* **Read:** `matlab_simulink/sim_core_engine.m` (`local_run_layered`: observer, two-channel residual,
+* **Read:** `matlab_simulink/sim_core_engine.m` (`local_run_layered`: observer, three-channel residual,
   feature EMAs, `local_classify`), and in `matlab_simulink/load_domain_profile.m` the fields
   `ai.feature_scales`, `ai.prototypes`, `ai.res_fast_scale`, `ai.res_slow_scale`, `ai.lp_tau_s`,
   `ai.window_tau_s`, `observer.*`.
@@ -268,10 +274,8 @@ right before the **AI**. Each step lists *what to read*, *what to change*, and *
   2. Choose 3–6 **dimensionless** features (divide by amplitude, actuator limit, velocity scale …).
   3. Compute the class means from a **small** calibration set. In the shipped study the coarse
      classifier reaches its full deployment accuracy by **N = 40** calibration runs (87.5 % at N = 15);
-     the class means in `load_domain_profile.m` were recovered from a 40-run grid.
-  4. Attach a **margin-based confidence** (the reference uses `d₂/(d₁+d₂)` where `d₁/d₂` are the
-     distances to the nearest and runner-up prototype — confidence collapses exactly where the
-     classification is ambiguous).
+     the prototypes and threshold are generated by `calibrate_coarse_classifier.m` from three short closed-loop stage probes.
+  4. Attach a **margin x proximity confidence** (`margin = (d2-d1)/(d2+d1)`, `proximity = exp(-gamma*d1)`); both ambiguity and novelty collapse the confidence.
 * **Verify (signals):** regime stays correct per stage; confidence visibly collapses during the OOD
   stage; the fast residual crosses `max_physics_residual` within a few milliseconds of fault onset
   (the benchmark criterion is veto latency < 10 ms).
@@ -283,7 +287,7 @@ right before the **AI**. Each step lists *what to read*, *what to change*, and *
   `run_efficiency_analysis.m`.
 * **Change / do:**
   1. Enter the three field knobs per unit/patient; never touch the class means.
-  2. Reproduce the four engineering checks **on your plant** (drift robustness, latency decoupling,
+  2. Reproduce the five engineering checks **on your plant** (drift robustness, latency decoupling,
      OOD abstention, data/compute efficiency).
   3. Record the sticky fault bits during commissioning; they become your regression baseline.
 * **Verify (signals):** the three knobs move the command in the expected direction (monotone in
@@ -346,7 +350,7 @@ right before the **AI**. Each step lists *what to read*, *what to change*, and *
 
 **中文小结（四步菜谱）：**
 ① 先冻结契约与单位（把 `LayeredInput_t` 的 9 个字段接到你的栈上，先只打日志验证）；
-② 原样移植 1 kHz 核心，只改调用/执行器/日志的胶水层，先跑通 105 项回归测试；
+② 原样移植 1 kHz 核心，只改调用/执行器/日志的胶水层，先跑通 116 项回归测试；
 ③ 只做两件 AI 允许做的事——归一化无量纲特征 + 名义残差探针（3–6 维特征；实测粗分类 N=40 次标定即达满精度、N=15 时 87.5%；边际置信度）；
 ④ 接入现场三旋钮 + 四项工程检查，之后冻结 AI。三种目标栈（PLC/C++ 伺服、ROS2/Python VLA 机械臂、STM32/FPGA 神经调控）的要点见 §3.1–§3.3。
 
@@ -379,22 +383,21 @@ Success criteria — all of them:
 
 | Signal | Expected |
 | :--- | :--- |
-| four check lines | `[1] S2 drift robustness … PASS`, `[2] S3 latency decoupling … PASS`, `[3] S4 OOD abstention and envelope safety … PASS`, `[4] Data and compute efficiency: PASS …` |
-| final line | `All four engineering checks passed.` |
-| timing block | `=== TIMING (wall clock, this MATLAB process) ===` with a `total wall-clock time: <n> s` line; on the reference laptop (R2024b) a **cold `matlab -batch`** totals ≈27 s (23–28 s observed across runs, load-dependent), of which ≈11 s is the one-off Simulink model build / first load; in an **already-warm MATLAB session** the same work takes ≈9–10 s |
+| five check lines | `[1] S2 drift robustness … PASS`, `[2] S3 latency decoupling … PASS`, `[3] S4 OOD abstention and envelope safety … PASS`, `[4] Paired data and compute efficiency: PASS …`, `[5] Mode necessity: PASS …` |
+| final line | `All five engineering checks passed.` |
+| timing block | `=== TIMING (wall clock, this MATLAB process) ===` with a `total wall-clock time: <n> s` line; in the reference R2024b session the acceptance run measured **32.56 s** total (1.93 s model, 7.86 s four-stage, 4.18 s efficiency, 7.89 s ablation/probes, 10.69 s cross-domain); a cold `matlab -batch` adds the one-off Simulink/model load |
 | figures | `assets/benchmark_4stages_showdown.png`, `assets/efficiency_and_generalization.png`, `assets/domain_profiles_comparison.png` rewritten, 240 dpi (within the 200–300 dpi budget) |
 | model | `matlab_simulink/ai_layered_control_bench.slx` rebuilt (built-in blocks only) |
 | exit code | `0` — the script raises an error (non-zero exit) if any check fails |
 
-The `[1/5] … [4/5]` lines are progress markers for the four work blocks; the acceptance verdict is the
-`[1]`–`[4]` check block that follows them. What the run does, in order: (1) builds the `.slx` and
+The `[1/5] … [5/5]` lines are progress markers for the five work blocks; the acceptance verdict is the
+`[1]`–`[5]` check block that follows them. What the run does, in order: (1) builds the `.slx` and
 smoke-tests it for 0.1 s; (2) runs the 40 s four-stage benchmark on the industrial reference profile and
 evaluates checks 1–3; (3) runs the data/drift/compute efficiency study and evaluates check 4; (4) runs
 all three domain presets and writes the cross-domain figure; (5) prints a Markdown metrics table.
 
 The 40 s benchmark is: `dt = 1 ms`, 3 branches × 4 stages × 10 s —
-S1 nominal, S2 cross-unit +35 % drift + non-smooth Stribeck boundary, S3 edge compute scarcity
-(10 Hz, 60–120 ms jitter, dropped frames), S4 unseen OOD structural resonance + sensor outliers.
+S1 fast light-load tracking, S2 +35 % load/Stribeck, S3 contact/HF noise/edge latency, S4 unseen OOD resonance and spikes.
 
 ### 4.3 C99 core regression test (independent of MATLAB)
 
@@ -411,12 +414,12 @@ Success criteria:
 | Signal | Expected |
 | :--- | :--- |
 | every check line of the test log | starts with `[PASS]` (no `[FAIL]`, no `[INV ]` violation report) |
-| last line | `SUMMARY: n_pass=105, n_fail=0` |
+| last line | `SUMMARY: n_pass=116, n_fail=0` |
 | `$LASTEXITCODE` | `0` |
 | compiler diagnostics | none (the module compiles warning-free with `-pedantic -Wall -Wextra`) |
 
 The test is fully deterministic (no `rand()`, no `<math.h>`; the reference sine is generated with a
-Taylor-series rotation matrix), so the same 105 checks and the same numbers reproduce everywhere. It
+Taylor-series rotation matrix), so the same 116 checks and the same numbers reproduce everywhere. It
 covers: the 40 s mission schedule, priority chain, anti-chatter dwell, post-fault cooldown, NaN/Inf/
 out-of-range firewall, tracking anti-windup across a saturated bank switch, the three `FieldTuning_t`
 knobs, deterministic feedforward `u_ff`, the sticky confidence latch, global actuator invariants, and the
@@ -452,9 +455,9 @@ matlab -batch "cd('matlab_simulink'); build_simulink_model();"
 ```
 
 **中文小结（运行与验收）：** 一条命令 `matlab -batch "cd('matlab_simulink'); run_all_benchmarks"` 完成建模、40 s 四阶段基准、
-效率实验、三域对比与三张 240 dpi 图；成功判据是 `[1]`–`[4]` 四项检查全部 `PASS`、末行 `All four engineering checks passed.`、退出码 0。
-参考机实测：冷启动 `matlab -batch` 全程约 27 秒（实测 23–28 秒，随负载变化；其中约 9–12 秒是 Simulink 首次建模型/加载的一次性开销）；预热会话约 9–10 秒。
-C 核心用 gcc 编译后运行，判据是 `SUMMARY: n_pass=105, n_fail=0` 且退出码 0。`.slx` 参数已内联，`clearvars` 后可独立运行。
+效率实验、三域对比与三张 240 dpi 图；成功判据是 `[1]`–`[5]` 五项检查全部 `PASS`、末行 `All five engineering checks passed.`、退出码 0。
+参考机本次实测 `run_all_benchmarks` 总耗时 **32.56 s**（模型 1.93 s、四阶段 7.86 s、效率 4.18 s、消融/探针 7.89 s、三域 10.69 s）；冷启动 `matlab -batch` 另加一次 Simulink 加载开销。
+C 核心用 gcc 编译后运行，判据是 `SUMMARY: n_pass=116, n_fail=0` 且退出码 0。`.slx` 参数已内联，`clearvars` 后可独立运行。
 
 ---
 
@@ -489,7 +492,7 @@ C 核心用 gcc 编译后运行，判据是 `SUMMARY: n_pass=105, n_fail=0` 且�
     bit so a field engineer can see *why*. The architecture's debuggability depends on "every
     non-normal tick has a name".
 11. **Do not remove determinism from the benchmark.** Fixed seeds, no `rand()` in the C test, no
-    wall-clock dependence in the metrics. Reproducible numbers are what makes the four engineering
+    wall-clock dependence in the metrics. Reproducible numbers are what makes the five engineering
     checks meaningful.
 
 **中文小结（常见坑）：** 只用 `matlab -batch`（不引入任何 GUI 依赖）；模型只用内置 Simulink 模块（无 MEX/无工具箱）；
@@ -554,7 +557,7 @@ Constraints:
   - Every new physical constant goes into matlab_simulink/load_domain_profile.m with units,
     next to the existing presets, never scattered in the engine.
   - Re-run the acceptance commands from AGENTS.md section 4 and paste the exact output lines
-    (the four engineering checks + the C test summary). If a check cannot hold for the new
+    (the five engineering checks + the C test summary). If a check cannot hold for the new
     domain, say so and explain why instead of loosening the threshold.
 ```
 
@@ -577,13 +580,13 @@ Constraints:
 | Field tuning knobs | 3 (`gain_scale`, `damping_scale`, `safety_margin_scale`) |
 | Anti-chatter dwell | 150 ms (`min_dwell_ticks = 150` at 1 kHz; 2 frames at 10 Hz in Panel A) |
 | Post-fault recovery cooldown | 500 ms (`ood_recovery_cooldown_ticks = 500` at 1 kHz) |
-| Residual / confidence hysteresis | trip 1.0 → clear 0.80 (residual); trip below 0.45 → clear at 0.55 (confidence) |
+| Residual / confidence hysteresis | residual trip 1.0 → clear 0.80; confidence uses the calibrated `margin x exp(-gamma*d1)` value (industrial commissioning threshold in the 1e-5 range, printed by `calibrate_coarse_classifier`; the C test separately exercises 0.45/0.55 synthetic frames) |
 | Safety envelope | trip at 90 % of limit, clear at 75 %, look-ahead 60 ms via `\|ẋ\|` |
 | Bumpless transfer | `blend_alpha = 0.10` per tick (regime switch restarts it) |
 | OOD veto latency | criterion < 10 ms; measured **2.0 ms** in the shipped run |
-| C regression test | **105 checks, 0 failures** (`SUMMARY: n_pass=105, n_fail=0`) |
-| Full MATLAB acceptance run | **≈27 s** cold `matlab -batch` (23–28 s observed across runs; ≈11 s of it one-off Simulink model build / first load); **≈9–10 s** in an already-warm session; four engineering checks PASS; three 240 dpi figures; `.slx` rebuilt |
-| Sample complexity (Panel A) | Scoring: the damping ratio actually applied must stay within **10 %** of the closed-loop optimum for that operating point, after the 150 ms regime dwell; deployment at 0 % and +35 % drift. **Layered** (deployed at +35 % drift): 87.5 / 100 / 100 / 100 / 100 / 100 / 100 % for N = 15 / 40 / 120 / 250 / 500 / 1000 / 2000 calibration runs. **Continuous policy** (trained on nominal-unit data only): 28.1 / 81.2 / 100 / 100 / 100 / 100 / 100 % at 0 % deployment, but 3.1 / 0 / 0 / 0 / 0 / 0 / 0 % at +35 % deployment. |
+| C regression test | **116 checks, 0 failures** (`SUMMARY: n_pass=116, n_fail=0`) |
+| Full MATLAB acceptance run | **≈33 s** in this MATLAB session (measured 32.56 s; cold `matlab -batch` adds the one-off Simulink/model load); five engineering checks PASS; three 240 dpi figures; `.slx` rebuilt |
+| Sample complexity (Panel A) | Paired nominal-only samples; layered at +35 % drift: 100 % at N = 15 / 40 / 120 / 500 / 2000. Continuous nominal-only at +35 % drift: 3.1 / 0 / 3.1 / 6.2 / **0.0 %**. Drifted-data oracle at +35 %: 59.4 / 71.9 / **100** / 100 / 100 %. Continuous nominal-only at 0 % drift: 78.1 / 84.4 / 96.9 / 100 / 100 %. |
 | Compute / memory (analytic, shipped model) | ≈1.0 × 10⁵ fewer MAC/s and ≈2.5 × 10³ less memory than a 1.2 M-parameter policy evaluated at 1 kHz (the shipped check requires at least 10³× compute reduction) |
 | Cross-unit drift robustness | 0 → +50 % uncalibrated drift with the AI **frozen** (Panel B of the efficiency study) |
 | Reproducibility | four-stage benchmark `seed = 7` (`sim_core_engine.m`), efficiency study `seed = 17` (`run_efficiency_analysis.m`), C regression test uses no `rand()`; identical numbers on the same MATLAB release |
@@ -601,16 +604,16 @@ Constraints:
 | `c99_layered_core/layered_gatekeeper.h` | the contract; read it before asking any question about behavior |
 | `matlab_simulink/run_all_benchmarks.m` | the acceptance gate and the metrics table |
 
-### 8.1 Sister project — `jev-tune`
+### 8.1 Sister project — [jev-tune](https://github.com/lijiawei255/jev-tune)
 
-[`jev-tune`](https://github.com/lijiawei255/jev-tune) works one level down: it concentrates on
+[jev-tune](https://github.com/lijiawei255/jev-tune) works one level down: it concentrates on
 **continuous parameter-layer tuning inside a single controller**, with a C99 safety-boundary fallback
 underneath. This repository steps up to the **discrete structural layer** — semantic regime
 classification across operating conditions, calibration from a few dozen runs, compute decoupling
 between the two time scales, and explicit OOD refusal. Read together, they form one engineering-systems
 exploration of closed-loop control from the parameter layer up to the structural layer.
 
-**中文小结（姊妹项目）：** `jev-tune` 解决"单一控制器内部的连续参数层整定 + C99 安全边界兜底"；
+**中文小结（姊妹项目）：** [jev-tune](https://github.com/lijiawei255/jev-tune) 解决"单一控制器内部的连续参数层整定 + C99 安全边界兜底"；
 本仓库上移到离散结构层（跨工况语义分类、极小样本标定、算力解耦、OOD 显式拒识）。两者合起来构成
 从参数层到结构层的工程系统论闭环控制探索。
 

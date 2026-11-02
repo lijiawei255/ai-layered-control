@@ -64,11 +64,12 @@ P.units       = struct('state', 'rad', 'rate', 'rad/s', 'input', 'N*m', ...
 P.dt          = 1e-3;          % 1 kHz deterministic inner loop
 P.stages.edges = [0 10 20 30 40];
 P.stages.names = { ...
-    'Stage 1 - nominal distribution', ...
-    'Stage 2 - cross-unit +35% drift and non-smooth boundary', ...
-    'Stage 3 - edge compute scarcity (10 Hz, 60-120 ms jitter)', ...
-    'Stage 4 - unseen OOD structural resonance and sensor outliers'};
-P.stages.short = {'S1 nominal', 'S2 drift', 'S3 latency', 'S4 OOD'};
+    'Stage 1 - Fast Torch/Axis Tracking (Light Deposition Load)', ...
+    'Stage 2 - +35% Layer-Heat Equivalent Load Drift and Wire-Feed Stribeck Friction', ...
+    'Stage 3 - Arc/Contact Stiffness + Arc-Voltage HF Noise + Fieldbus Latency', ...
+    'Stage 4 - Unseen Structural Resonance and Sensor Spikes'};
+P.stages.short = {'S1 fast tracking', 'S2 +35% load/Stribeck', ...
+                  'S3 arc/contact + HF noise', 'S4 OOD resonance'};
 
 % --- reference trajectory ------------------------------------------------
 % Point-to-point (quintic S-curve) moves with dwells: dwell segments are where
@@ -109,9 +110,9 @@ P.sensor.deriv_tau_s = 0.012;  % s, derivative low-pass time constant
 P.ctrl.fn_hz     = 3.0;        % Hz, target closed-loop bandwidth
 P.ctrl.zeta       = 0.80;      % target closed-loop damping ratio
 P.ctrl.int_ratio  = 6.0;       % Ki = Kp*wn/int_ratio
-P.ctrl.bank_rel   = [1.00 1.00 1.00; ...   % regime 1: nominal
-                     1.40 1.80 5.00; ...   % regime 2: high-load damped
-                     0.90 1.50 1.30; ...   % regime 3: boundary compliant
+P.ctrl.bank_rel   = [8.00 1.50 1.00; ...   % regime 1: high-bandwidth light-load tracking
+                     1.35 4.50 12.00; ...  % regime 2: heavy-load damped / anti-stiction
+                     4.00 0.20 8.00; ...   % regime 3: compliant low-D, contact feedforward
                      1.00 3.00 0.00];      % regime 4: safe fallback (PD only)
 P.b1.rel          = [0.55 0.60 0.35];      % Branch 1: conservative fixed PID
 P.b2.rel          = [0.80 1.00 0.00];      % Branch 2: overfitted continuous AI
@@ -126,19 +127,16 @@ P.ai.confidence_clear  = 0.55;     % hysteresis to clear the confidence veto
 P.ai.window_tau_s      = 0.25;     % s, EMA window for error/effort features
 P.ai.window_tau_v_s    = 0.50;     % s, slower EMA for the velocity feature
 P.ai.lp_tau_s          = 0.15;     % s, slow (drift) residual channel
-P.ai.res_fast_scale    = 0.050;    % normalization of the fast residual channel
-P.ai.res_slow_scale    = 0.050;    % normalization of the slow residual channel
+P.ai.res_fast_scale    = 0.100;    % normalization of the median-5 spike channel
+P.ai.res_slow_scale    = 0.050;    % normalization of the slow (drift) channel
+P.ai.res_hf_scale      = 0.025;    % normalization of the narrowband HF channel
+P.ai.confidence_gamma  = [];       % calibrated from the probe d1 distribution
+P.ai.auto_calibrate    = true;     % prototypes are commissioned, never hard-coded
 P.ai.feature_scales    = [P.ref.amp, P.act.u_max, 1.0, ...
                           P.ref.amp*2*pi*P.ref.f1_hz*2.0];
 P.ai.regime_names      = {'REGIME_NOMINAL', 'REGIME_HIGH_LOAD_DAMPED', ...
                           'REGIME_BOUNDARY_COMPLIANT', 'REGIME_SAFE_FALLBACK'};
-% Class means of the coarse classifier, in normalized feature units
-% [rms(error)/amp, rms(u)/u_max, slow residual, rms(xd)/v_scale].
-% Recovered from the 40-sample coarse calibration grid (see
-% run_efficiency_analysis.m Panel A for the sample-complexity study).
-P.ai.prototypes        = [0.012 0.096 0.002 0.650; ...
-                          0.018 0.150 0.200 0.650; ...
-                          0.045 0.200 0.120 0.650];
+P.ai.prototypes        = [];       % filled by calibrate_coarse_classifier
 
 % --- gatekeeper ----------------------------------------------------------
 P.gate.blend_alpha = 0.10;     % per-step bumpless transfer coefficient (1 kHz)
@@ -173,7 +171,11 @@ P.ood.res_hz      = 42.0;      % Hz, unmodelled parasitic structural mode
 P.ood.res_zeta    = 0.03;      % modal damping
 P.ood.res_cu      = 12.0;      % mode excitation from actuator command
 P.ood.res_cx      = 8.0;       % mode excitation from motion
-P.ood.res_kq      = 0.004;     % mode -> plant force coupling
+P.ood.res_kq      = 0.008;     % mode -> plant force coupling
+P.ood.res_ky      = 100.0;      % mode -> position-measurement coupling
+P.ood.res_kick    = 1.0;       % deterministic fault-onset impulse into qdot
+P.ood.res_hf_bw_hz = 8.0;     % narrowband probe bandwidth around the mode
+P.ood.res_hf_window_s = 0.004;% RMS energy window of the HF probe
 P.ood.spike_first_s = 0.002;   % s after onset, deterministic first outlier
 P.ood.spike_prob  = 0.004;     % outliers per 1 ms sample (4 per second)
 P.ood.spike_amp   = 0.20;      % rad, outlier amplitude
@@ -200,11 +202,12 @@ P.units   = struct('state', 'rad', 'rate', 'rad/s', 'input', 'N*m', ...
 P.dt           = 1e-3;
 P.stages.edges = [0 10 20 30 40];
 P.stages.names = { ...
-    'Stage 1 - nominal pick-and-place distribution', ...
-    'Stage 2 - unknown payload (+35% inertia) and contact boundary', ...
-    'Stage 3 - on-robot edge NPU: 10 Hz, 60-120 ms jitter', ...
-    'Stage 4 - unseen structural resonance and sensor faults'};
-P.stages.short = {'S1 nominal', 'S2 drift', 'S3 latency', 'S4 OOD'};
+    'Stage 1 - High-Speed Free-Space Motion (Light Payload)', ...
+    'Stage 2 - +35% Payload Drift and Joint Static Friction', ...
+    'Stage 3 - Contact Stiffness Step + Vision/Force HF Noise + 10 Hz Edge Inference Jitter', ...
+    'Stage 4 - Unseen Structural Resonance and Sensor Spikes'};
+P.stages.short = {'S1 free-space', 'S2 +35% payload', ...
+                  'S3 contact + HF noise', 'S4 OOD resonance'};
 
 P.ref.mode    = 'trapezoid';
 P.ref.amp     = 0.60;
@@ -237,9 +240,9 @@ P.sensor.deriv_tau_s = 0.006;
 P.ctrl.fn_hz    = 4.0;
 P.ctrl.zeta     = 0.85;
 P.ctrl.int_ratio = 6.0;
-P.ctrl.bank_rel = [1.00 1.00 1.00; ...
-                   1.40 1.80 5.00; ...
-                   0.90 1.50 1.30; ...
+P.ctrl.bank_rel = [8.00 1.50 1.00; ...
+                   1.35 4.50 12.00; ...
+                   4.00 0.20 8.00; ...
                    1.00 3.00 0.00];
 P.b1.rel = [0.55 0.60 0.35];
 P.b2.rel = [0.80 1.00 0.00];
@@ -253,16 +256,17 @@ P.ai.confidence_clear = 0.55;
 P.ai.window_tau_s    = 0.25;
 P.ai.window_tau_v_s  = 0.50;
 P.ai.lp_tau_s        = 0.15;
-P.ai.res_fast_scale  = 0.060;
+P.ai.res_fast_scale  = 0.120;
 P.ai.res_slow_scale  = 0.060;
+P.ai.res_hf_scale    = 0.030;
+P.ai.confidence_gamma = [];
+P.ai.auto_calibrate  = true;
 P.ai.feature_scales  = [P.ref.amp, P.act.u_max, 1.0, ...
                         P.ref.amp*2*pi*P.ref.f1_hz*2.0];
 P.ai.regime_names    = {'REGIME_NOMINAL', 'REGIME_HIGH_LOAD_DAMPED', ...
                         'REGIME_BOUNDARY_COMPLIANT', 'REGIME_SAFE_FALLBACK'};
-% Class means of the coarse classifier are set per domain in FINALIZE_PROFILE
-% from the measured feature clusters of each preset (kept out of the preset
-% body so the numbers cannot drift away from the code that produces them).
-P.ai.prototypes      = zeros(3,4);
+% Class means are commissioned by calibrate_coarse_classifier.
+P.ai.prototypes      = [];
 
 P.gate.blend_alpha = 0.10;
 P.gate.integ_ratio = 0.50;
@@ -290,7 +294,11 @@ P.ood.res_hz      = 38.0;
 P.ood.res_zeta    = 0.03;
 P.ood.res_cu      = 10.0;
 P.ood.res_cx      = 7.0;
-P.ood.res_kq      = 0.004;
+P.ood.res_kq      = 0.008;
+P.ood.res_ky      = 100.0;
+P.ood.res_kick    = 1.0;
+P.ood.res_hf_bw_hz = 8.0;
+P.ood.res_hf_window_s = 0.004;
 P.ood.spike_first_s = 0.002;
 P.ood.spike_prob  = 0.004;
 P.ood.spike_amp   = 0.22;
@@ -317,11 +325,12 @@ P.units   = struct('state', 'norm.', 'rate', '1/s', 'input', 'norm.', ...
 P.dt           = 1e-3;
 P.stages.edges = [0 10 20 30 40];
 P.stages.names = { ...
-    'Stage 1 - nominal patient responder', ...
-    'Stage 2 - +35% impedance drift and scar-tissue boundary', ...
-    'Stage 3 - sub-mW edge compute: 10 Hz, 60-120 ms jitter', ...
-    'Stage 4 - unseen artefact / lead res                          -onance'};
-P.stages.short = {'S1 nominal', 'S2 drift', 'S3 latency', 'S4 OOD'};
+    'Stage 1 - Fast Phasic Biomarker Tracking', ...
+    'Stage 2 - +35% Electrode-Tissue Impedance Drift and Activation Threshold Nonlinearity', ...
+    'Stage 3 - High-Coupling Neural Rebound + EMG/Artifact HF Noise + Telemetry Jitter', ...
+    'Stage 4 - Unseen OOD Pathological Oscillation and Lead Micro-Dislodgement Spikes'};
+P.stages.short = {'S1 fast phasic', 'S2 +35% impedance', ...
+                  'S3 EMG/artifact + telemetry', 'S4 OOD oscillation'};
 
 P.ref.mode    = 'trapezoid';
 P.ref.amp     = 0.40;
@@ -354,9 +363,9 @@ P.sensor.deriv_tau_s = 0.010;
 P.ctrl.fn_hz    = 1.2;         % deliberately low bandwidth: 1-minute budget
 P.ctrl.zeta     = 0.90;
 P.ctrl.int_ratio = 7.0;
-P.ctrl.bank_rel = [1.00 1.00 1.00; ...
-                   1.40 1.80 5.00; ...
-                   0.90 1.50 1.30; ...
+P.ctrl.bank_rel = [8.00 1.50 1.00; ...
+                   1.35 4.50 12.00; ...
+                   4.00 0.20 8.00; ...
                    1.00 3.00 0.00];
 P.b1.rel = [0.55 0.60 0.35];
 P.b2.rel = [0.60 1.00 0.00];
@@ -370,16 +379,17 @@ P.ai.confidence_clear = 0.55;
 P.ai.window_tau_s    = 0.25;
 P.ai.window_tau_v_s  = 0.50;
 P.ai.lp_tau_s        = 0.15;
-P.ai.res_fast_scale  = 0.050;
+P.ai.res_fast_scale  = 0.100;
 P.ai.res_slow_scale  = 0.050;
+P.ai.res_hf_scale    = 0.025;
+P.ai.confidence_gamma = [];
+P.ai.auto_calibrate  = true;
 P.ai.feature_scales  = [P.ref.amp, P.act.u_max, 1.0, ...
                         P.ref.amp*2*pi*P.ref.f1_hz*2.0];
 P.ai.regime_names    = {'REGIME_NOMINAL', 'REGIME_HIGH_LOAD_DAMPED', ...
                         'REGIME_BOUNDARY_COMPLIANT', 'REGIME_SAFE_FALLBACK'};
-% Class means of the coarse classifier are set per domain in FINALIZE_PROFILE
-% from the measured feature clusters of each preset (kept out of the preset
-% body so the numbers cannot drift away from the code that produces them).
-P.ai.prototypes      = zeros(3,4);
+% Class means are commissioned by calibrate_coarse_classifier.
+P.ai.prototypes      = [];
 
 P.gate.blend_alpha = 0.10;
 P.gate.integ_ratio = 0.50;
@@ -407,7 +417,11 @@ P.ood.res_hz      = 33.0;
 P.ood.res_zeta    = 0.03;
 P.ood.res_cu      = 8.0;
 P.ood.res_cx      = 6.0;
-P.ood.res_kq      = 0.020;
+P.ood.res_kq      = 0.005;
+P.ood.res_ky      = 10.0;
+P.ood.res_kick    = 1.0;
+P.ood.res_hf_bw_hz = 8.0;
+P.ood.res_hf_window_s = 0.004;
 P.ood.spike_first_s = 0.002;
 P.ood.spike_prob  = 0.004;
 P.ood.spike_amp   = 0.40;
@@ -436,14 +450,28 @@ P.ref.phi = P.ref.phi(:)';
 if ~isfield(P.ref, 'mode') || isempty(P.ref.mode)
     P.ref.mode = 'trapezoid';
 end
-if strcmpi(P.ref.mode, 'trapezoid')
-    P.ref.period = 2*(P.ref.dwell_s + P.ref.move_s);
-    P.ref.v_peak = 1.875*P.ref.amp/max(P.ref.move_s, eps);
-    P.ref.v_scale = P.ref.v_peak;
-else
-    P.ref.period = 1/max(P.ref.f1_hz, eps);
-    P.ref.v_scale = P.ref.amp*2*pi*P.ref.f1_hz*2.0;
-end
+
+% ---- v1.1.0 stage schedule ----------------------------------------------
+% S1 is a fast harmonic phasic-tracking segment; S2 is a fast heavy-load
+% reversal; S3 is contact/rebound + strong HF measurement noise; S4 is the
+% unseen OOD segment.  The phase offsets make every stage boundary continuous
+% at r = +A, rd = 0.
+P.ref.stage_mode     = {'harmonic','trapezoid','trapezoid','trapezoid'};
+P.ref.stage_amp      = P.ref.amp*ones(1,4);
+P.ref.stage_f1_hz    = [0.5 0 0 0];
+P.ref.stage_phi      = [pi/2 0 0 0];
+P.ref.stage_move_s   = [0 0.90 1.00 1.00];
+P.ref.stage_dwell_s  = [0 0.90 1.50 1.50];
+P.ref.stage_phase0   = [0 0.80 0 0];
+P.stage.friction_scale = [0.15 1 1 1];
+P.stage.k_scale        = [1 1 3.333 1];
+P.stage.noise_scale    = [1 1 20 1];
+P.stage.load_torque    = [0 0 0 0];
+P.ref.period  = 5.0;
+P.ref.v_peak  = max([P.ref.amp*pi, 1.875*P.ref.amp/0.90, ...
+                     1.875*P.ref.amp/1.00]);
+P.ref.v_scale = P.ref.v_peak;
+P.bank.ff_scale = [1.0 1.0 2.0 1.0];
 
 % ---- nominal controller gains ------------------------------------------
 wn = 2*pi*P.ctrl.fn_hz;
@@ -472,6 +500,12 @@ P.b2.Ki = P.ctrl.Ki*P.b2.rel(3);
 P.b2.model = struct('J', P.plant.J, 'b', P.plant.b, 'k', P.plant.k, ...
                     'fc', P.plant.fc, 'fs', P.plant.fs, ...
                     'vs', P.plant.vs, 'fvisc', P.plant.fvisc);
+% Closed-form RBF policy, fitted at commissioning time from a nominal-unit
+% excitation rollout.  No weights are committed; the fit is deterministic.
+P.b2.policy      = [];
+P.b2.policy_cfg  = struct('n_centers', 128, 'ridge', 1e-8, ...
+                          'data_s', 8.0, 'seed', 11);
+P.b2.stabilizer  = 1.00;   % fixed PD around the learned inverse-dynamics policy
 
 % ---- Branch 3: deterministic (white-box) feedforward --------------------
 % The 1 kHz core runs the nominal inverse-dynamics feedforward from the
@@ -509,31 +543,13 @@ P.observer.L2 = wob^2;
 P.observer.wn = wob;
 
 % ---- coarse-classifier class means (per domain) -------------------------
-% Frozen deployment table of the 10 Hz coarse classifier: class means in the
-% normalized feature space [rms(e)/amp, rms(u)/u_max, slow residual,
-% rms(xd)/v_scale].  run_efficiency_analysis.m quantifies how many
-% calibration runs are needed to recover such means.
-switch P.kind
-    case 'industrial'
-        P.ai.prototypes = [0.012 0.096 0.002 0.650; ...
-                           0.018 0.150 0.200 0.650; ...
-                           0.045 0.200 0.120 0.650];
-    case 'edge_vla'
-        P.ai.prototypes = [0.012 0.271 0.003 1.130; ...
-                           0.018 0.398 0.148 1.143; ...
-                           0.035 0.330 0.040 1.138];
-    case 'neuromodulation'
-        P.ai.prototypes = [0.009 0.139 0.002 1.020; ...
-                           0.029 0.234 0.220 1.024; ...
-                           0.060 0.250 0.060 1.020];
-    otherwise
-        error('load_domain_profile:unknownKind', ...
-            'No coarse-classifier calibration table for domain "%s".', P.kind);
-end
+% The 3x4 prototype table and the confidence threshold are commissioned by
+% calibrate_coarse_classifier.m from three short closed-loop probes.  No
+% prototype table is hard-coded here.
 
 % ---- slow-loop feature normalization -----------------------------------
 P.ai.outer_dt = 1/P.ai.outer_hz;
-P.ai.n_prototypes = size(P.ai.prototypes, 1);
+P.ai.n_prototypes = 3;
 P.ai.feature_scales = P.ai.feature_scales(:)';
 P.ai.feature_scales(4) = P.ref.v_scale;
 

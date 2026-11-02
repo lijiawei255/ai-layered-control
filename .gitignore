@@ -16,6 +16,12 @@ __pycache__/
 .venv/
 venv/
 ENV/
+# Python benchmark: generated shared library, build cache and output figure
+python_bench/build/
+python_bench/*.png
+python_bench/*.so
+python_bench/*.dll
+python_bench/*.dylib
 
 # --- MATLAB / Simulink temporary and build artefacts -----------------------
 slprj/
@@ -44,6 +50,8 @@ build/
 *.o
 *.obj
 *.dll
+*.so
+*.dylib
 *.lib
 *.exp
 *.pdb
@@ -51,6 +59,14 @@ build/
 *.stackdump
 *.dSYM/
 a.out
+
+# --- Cross-platform test / equivalence / scratch artefacts ----------------
+c99_layered_core/test_gatekeeper_standalone
+c99_layered_core/verify_core_equivalence
+c99_layered_core/*.bin
+c99_layered_core/*.csv
+matlab_simulink/*.bin
+matlab_simulink/*.csv
 
 # --- Local IDE / AI-agent / OS files ---------------------------------------
 .vscode/

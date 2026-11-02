@@ -2,604 +2,250 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-**A reference architecture for closed-loop AI control: a slow, coarse AI classifier decides *which*
-control regime a machine is in; a fast, zero-dependency deterministic core decides *how* to move the
-actuator. No end-to-end `u = pi(x)` model ever touches the 1 kHz path.**
+[![Release v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/lijiawei255/ai-layered-control/releases)
+[![ANSI C99 zero-heap core](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-00599C.svg)](c99_layered_core/)
+[![Python and MATLAB/Simulink benchmark](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-2ea44f.svg)](python_bench/)
+[![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**A reference architecture for closed-loop AI control: a slow, coarse AI classifier decides *which* control regime a machine is in; a fast, zero-dependency deterministic core decides *how* to move the actuator. In the layered path, no end-to-end `u = pi(x)` model ever touches the 1 kHz command path.**
 
 **TL;DR**
 
-* **A few dozen calibration runs, not a thousand.** The 10 Hz AI only has to map four normalised
-  macro-features onto one of three damping schedules: it reaches 100 % deployment quality with 40
-  calibration runs. The end-to-end alternative needs about 120 runs on the unit it was trained on - and
-  scores 0 % on the same task once that unit is deployed with +35 % drift, at any sample count.
-* **~100,000x less compute.** 2.41e4 MAC/s and 2.21e3 B, against 2.40e9 MAC/s and 5.60e6 B for a
-  1.2 M-parameter policy running at 1 kHz (99,502x / 2,536x). It fits a microcontroller that is already
-  on the board.
-* **+35 % unit-to-unit drift, zero retraining.** RMSE 0.0122 rad vs 0.0516 rad for the end-to-end
-  branch (4.22x). Across a full 0 -> +50 % drift sweep the AI stays frozen: 0.0111 -> 0.0151 rad.
-* **Explicit abstention on an unseen OOD fault.** Zero envelope excursions in the four-stage synthetic
-  benchmark of this repository, against 1,733 for the end-to-end branch; the layered controller latches
-  its abstention 2.0 ms after fault onset and holds the axis inside the envelope.
-* **4.2-4.9x less actuator travel.** Total variation TV(u) over 40 s: 342.0 N*m vs 1,442.9 N*m
-  (end-to-end) and 1,664.8 N*m (fixed PID). Same task, a fraction of the wear.
+* **A few dozen calibration runs, not a thousand.** The 10 Hz coarse classifier maps four dimensionless macro-features onto one of three damping schedules. It reaches **100 % deployment quality with N = 40** calibration samples. The paired continuous regression needs ~120–500 nominal-unit samples for the same in-distribution quality.
+* **+35 % unit-to-unit drift, zero retraining.** On the four-stage benchmark the layered branch tracks at **0.0057 rad RMSE in S2** versus **0.1585 rad** for the end-to-end branch. The continuous policy trained only on nominal data is at **0 %** deployable success on the +35 % drifted unit even at N = 2000; a drifted-data oracle recovers to **100 %** at N = 120.
+* **Explicit abstention on an unseen OOD fault.** **0** safety-envelope violation ticks for the layered branch in S4, versus **2,574** for the end-to-end branch; the OOD veto latches **2.0 ms** after fault onset. The same 2.0 ms is measured for the resonance-only and sensor-spike-only probes, while S1–S3 carry **0** OOD veto ticks under 20× broadband measurement noise.
+* **A stage-forced mode-necessity ablation.** Dynamic selection gives **0.00710** S1–S3 RMSE, versus **0.01201 / 0.00935 / 0.05501** for any fixed R1 / R2 / R3; the 40 s totals are **0.01721** versus **0.01798 / 0.01777 / 0.05069**. The deployed 10 Hz classifier lands at **0.00700** / **0.01630**, marginally better than the stage-forced bound.
+* **A real trained baseline.** Branch 2 is a closed-form RBF inverse-dynamics model fitted to a nominal-unit teacher rollout plus a fixed PD stabilizer. Branch 3's 3×4 prototypes and confidence threshold are commissioned by `calibrate_coarse_classifier.m`; no prototype table is hard-coded.
 
-> **Scope, before you read the numbers.** This is a *synthetic* benchmark: a second-order plant with
-> Stribeck friction, simulated at `dt = 1 ms` for 40 s under a fixed disturbance schedule, with a frozen
-> computed-torque policy standing in for a learned continuous controller. The compute and memory figures
-> are analytic (weights x rate), not profiled on hardware. Nothing here is a claim about a specific
-> machine. What is real: the C99 core (105 deterministic assertions, 0 failures), the four engineering
-> checks, and the fact that every number below is produced by the acceptance run in section 6 (the
-> console prints some of them to one decimal; the full-precision values live in the returned structs).
+> **Scope.** This is a methodological reference implementation on a synthetic nonlinear plant; see the single **Scope and disclaimer** statement at the end. All numbers below are produced by the acceptance run in §6.
 
 ---
 
-## 1. The architecture in one picture
+## 1. The architecture
 
 ```text
-+-------------------------------- slow outer loop: 10 Hz --------------------------------+
-|  4 normalised macro-features -> coarse 3-class classifier -> regime in {1, 2, 3}       |
-|  (rms error, rms effort, slow residual, rms velocity; all dimensionless)               |
-|  margin confidence d2/(d1+d2) in [0, 1]  -- collapses where the call is ambiguous      |
-|  frozen nominal observer -> residual r(t) = |y - y_hat| -- independent OOD evidence    |
-+----------------------------------------------------------------------------------------+
-              |  mailbox: {regime, confidence, frame age}   (may be late, missing, bad)
-              v
-+-------------------------------- fast inner loop: 1 kHz --------------------------------+
-|  0  input firewall   NaN/Inf/out-of-range frame -> hold actuator, latch audit bit      |
-|  1  safety envelope  |x| > 90 % of limit, or |x| + 60 ms*|xdot| > limit -> SAFE        |
-|  2  OOD residual     residual above threshold -> ABSTAIN (GATE_VETO_OOD_RESIDUAL)      |
-|  3  confidence       confidence < 0.45 or AI self-abstains -> ABSTAIN                  |
-|  4  heartbeat        stale frame -> GATE_HOLD_LATENCY, command and state frozen        |
-|  5  dwell            150 ms minimum between normal regime changes (anti-chatter)       |
-|  6  cooldown         500 ms of consecutive clean ticks before the AI is re-armed       |
-|  7  controller bank  4 x PID + deterministic feedforward u_ff, per-bank anti-windup    |
-|  8  clamps           bumpless transfer, |u| <= u_max, |du| <= slew_rate * dt           |
-|  9  audit            5 sticky fault bits: why the unit went safe, without the AI       |
-+----------------------------------------------------------------------------------------+
-              |
-              v
-      actuator     +     u_ff = white-box plant inverse from the commissioning model
++------------------------------ slow outer loop: 10 Hz ------------------------------+
+|  4 dimensionless macro-features -> coarse 3-class classifier -> regime in {1,2,3}  |
+|  (rms error, rms effort, max(slow residual, HF residual), rms velocity)             |
+|  margin x proximity confidence  -- collapses on ambiguity and on novelty            |
+|  independent nominal observer -> residual probe                                    |
++-------------------------------------------------------------------------------------+
+               |  mailbox: {regime, confidence, frame age}
+               v
++------------------------------ fast inner loop: 1 kHz ------------------------------+
+|  0  input firewall   NaN/Inf/out-of-range frame -> hold actuator, latch audit bit   |
+|  1  safety envelope  |x| > 90 % of limit, or |x| + 60 ms*|xdot| > limit -> SAFE      |
+|  2  OOD residual     spike channel OR narrowband HF channel -> ABSTAIN             |
+|  3  confidence       confidence below calibrated threshold or AI self-abstains      |
+|  4  heartbeat        stale frame -> GATE_HOLD_LATENCY, command and state frozen     |
+|  5  dwell            150 ms minimum between normal regime changes                   |
+|  6  cooldown         500 ms of consecutive clean ticks before the AI is re-armed    |
+|  7  controller bank  4 x PID + per-bank deterministic feedforward scale, anti-windup|
+|  8  clamps           bumpless transfer, |u| <= u_max, |du| <= slew_rate*dt           |
+|  9  audit            5 sticky fault bits: why the unit went safe, without the AI    |
++-------------------------------------------------------------------------------------+
+               |
+               v
+      actuator   +   u_ff = white-box plant inverse from the commissioning model
 ```
 
-Zero heap. No `math.h`. No recursion. No OS calls. One 84 B state struct, straight-line code, O(1)
-worst-case execution time. The AI is allowed to be slow, jittery and occasionally absent; the inner loop
-never waits on it.
+Zero heap. No `math.h`. No recursion. No OS calls. Straight-line code, O(1) worst-case execution time. `LayeredState_t` is 88 B; `LayeredConfig_t` is 132 B. The AI is allowed to be slow, jittery and occasionally absent; the inner loop never waits on it.
+
+The key v1.1.0 detail is the **orthogonal residual probe**:
+
+* **spike channel** — median-5 deviation of the position measurement, normalized by `res_fast_scale`;
+* **HF resonance channel** — a 2nd-order narrowband resonator at the profile's OOD mode (42 Hz industrial), 8 Hz bandwidth, 4 ms RMS energy, 2-tick confirmation;
+* **slow channel** — LP(innovation), used only as a classifier feature.
+
+The gate receives `max(res_fast, res_hf_gated)`. This is why 20× broadband measurement noise (S3) does not trip the OOD veto, while a 42 Hz structural resonance does.
 
 ## 2. Headline numbers
 
-Industrial reference preset, 40 s, 4 stages, 1 kHz inner loop, three branches on the identical plant,
-reference, noise realisation and fault schedule:
+Industrial reference preset, 40 s, 4 stages, 1 kHz inner loop, three branches on the identical plant, reference, noise realisation and fault schedule:
 
 | Metric | Branch 1: fixed PID | Branch 2: end-to-end AI | Branch 3: layered |
 | :--- | ---: | ---: | ---: |
-| RMSE S1 nominal [rad] | 0.0733 | 0.0087 | 0.0098 |
-| RMSE S2 +35 % drift [rad] | 0.1266 | 0.0516 | 0.0122 |
-| RMSE S3 edge compute limited [rad] | 0.1442 | 0.0933 | 0.0125 |
-| RMSE S4 unseen OOD fault [rad] | 0.1372 | 0.6152 | 0.0295 |
-| Phase-lag chattering index S3 [norm.] | 0.089 | 0.123 | 0.013 |
-| Actuator total variation TV(u), 40 s [N*m] | 1664.8 | 1442.9 | 342.0 |
-| Envelope excursions S1 / S2 / S3 / S4 [count] | 0 / 0 / 0 / 0 | 0 / 0 / 0 / **1733** | 0 / 0 / 0 / 0 |
-| OOD abstention response time | - | - | **2.0 ms** |
-| Calibration samples required | - | ~120 (nominal unit) | <= 50 |
-| Compute (MAC/s) | - | 2.40e9 | 2.41e4 |
-| Memory footprint | - | 5.60e6 B | 2.21e3 B |
+| RMSE S1 fast tracking [rad] | 0.0566 | 0.0397 | **0.0077** |
+| RMSE S2 +35 % load/Stribeck [rad] | 0.1790 | 0.1585 | **0.0057** |
+| RMSE S3 contact/HF noise/edge latency [rad] | 0.1921 | 0.1670 | **0.0074** |
+| RMSE S4 unseen OOD [rad] | 0.1693 | 0.8308 | **0.0303** |
+| Safety Violation Ticks S4 [ms] | 0 | 2574 | **0** |
+| OOD veto latency | - | - | **2.0 ms** |
+| Calibration Samples N (classifier / continuous) | - | ~500 | **≤ 40** |
+| Compute (MAC/s) | - | 2.40e9 | **2.41e4** |
+| Memory footprint | - | 5.60e6 B | **2.21e3 B** |
 
-All four engineering checks hold - the run ends with `All four engineering checks passed.`:
+`Safety Violation Ticks` are 1 kHz samples with `|x| > x_limit`; at `dt = 1 ms` the count equals milliseconds. `Control Effort TV(u) = Σ|u_k − u_{k−1}|` is the actuator-command total variation. `N` is the number of calibration samples used to fit the classifier or the continuous head.
 
-1. **S2 anti-overfitting:** 0.0516 vs 0.0122 rad (4.22x), AI frozen, +35 % uncalibrated drift.
-2. **S3 latency decoupling:** chattering 0.123 vs 0.013 (9.50x); RMSE 0.0933 vs 0.0125 rad under 10 Hz,
-   60-120 ms jitter and 15 % dropped frames.
-3. **S4 OOD abstention:** 1,733 vs **0** envelope excursions in the four-stage synthetic benchmark of
-   this repository, veto latched 2.0 ms after onset, safe-fallback regulator for the rest of the stage.
-4. **Data and compute:** the coarse classifier is already at 100 % deployment quality with `N <= 50`
-   (saturated at `N = 40`); the continuous policy needs about `N = 120` on the nominal unit (81.2 % at
-   `N = 40`, 100 % at `N = 120`) and stays at 0 % when the same unit is deployed with +35 % drift, even
-   at `N = 2000`; 99,502x compute and 2,536x memory reduction.
+**Control Effort TV(u), S1–S3:** layered **0.41e3 N·m** vs 1.24e3 (B1) and 1.33e3 (B2). In S4 the layered safe-fallback regulator spends **1.97e3 N·m** because it holds the axis inside the envelope while the OOD mode is active; the end-to-end branch has lower S4 TV but 2,574 violation ticks. Read TV together with the safety column, never alone.
 
-Sample-complexity curves (`N = 15 / 40 / 120 / 250 / 500 / 1000 / 2000`). Deployment quality = the
-damping actually applied stays within 10 % of the closed-loop optimum at that operating point, with the
-150 ms classifier dwell applied to the per-frame decisions first:
+## 3. Mode-necessity ablation
 
-| Learner / deployment condition | 15 | 40 | 120 | 250 | 500 | 1000 | 2000 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Layered coarse classifier, deployed at +35 % drift | 87.5 % | **100 %** | 100 % | 100 % | 100 % | 100 % | 100 % |
-| Continuous policy, nominal unit (0 % drift) | 28.1 % | 81.2 % | 100 % | 100 % | 100 % | 100 % | 100 % |
-| Continuous policy, deployed at +35 % drift | 3.1 % | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
+`run_all_benchmarks` runs three fixed-bank 40 s simulations and one stage-forced oracle (S1→R1, S2→R2, S3→R3, S4→safe fallback), plus the deployed 10 Hz classifier:
 
-The shape of that table is the argument in one glance: the coarse classifier saturates within a few
-tens of calibration runs, the continuous policy needs ~120 runs on the machinery it was trained on, and
-on a unit with +35 % drift it never clears the bar - extra nominal-unit data does not help, because the
-constant it is missing is physical, not statistical.
+| controller | S1 | S2 | S3 | S4 | S1–S3 | 40 s |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stage-forced oracle | 0.0083 | 0.0056 | 0.0071 | 0.0322 | **0.00710** | **0.01721** |
+| Fixed R1 | 0.0083 | 0.0077 | 0.0175 | 0.0293 | 0.01201 | 0.01798 |
+| Fixed R2 | 0.0095 | 0.0058 | 0.0117 | 0.0316 | 0.00935 | 0.01777 |
+| Fixed R3 | 0.0938 | 0.0150 | 0.0072 | 0.0346 | 0.05501 | 0.05069 |
+| Deployed 10 Hz classifier | 0.0077 | 0.0057 | 0.0074 | 0.0303 | 0.00700 | 0.01630 |
 
-Zero-retraining drift sweep (AI frozen, uncalibrated plant drift 0 / 17 / 33 / 50 %): the end-to-end
-branch rises 0.0101 -> 0.0783 rad (7.75x); the layered branch stays at 0.0111 -> 0.0151 rad (1.36x).
+The oracle is the ideal-classifier bound; the deployed classifier is within 2 % of its S1–S3 RMSE (0.00700 vs 0.00710). The stage-forced dynamic passes the `<0.8 ×` fixed-bank criterion (`0.00710 / 0.00935 = 0.759`) and the 40 s criterion.
 
-## 3. The three figures
+## 4. Paired sample complexity (Panel A)
 
-![Four-stage showdown: state tracking inside the safety envelope, actuator command, physics residual and confidence, regime and gate timeline](assets/benchmark_4stages_showdown.png)
+Both learners receive the **same N paired samples from the nominal unit** (`drift = 0`); the test deployment is the same unit at 0 % drift and a +35 % drifted unit. The oracle is the same 495-term continuous head retrained on +35 % drifted data.
 
-**Figure 1 - 40 s, four stages, three branches.** (a) state tracking against the hard envelope;
-(b) actuator command; (c) normalised fast residual and coarse-AI confidence for the layered branch;
-(d) active regime and gate-state timeline. Read (d) for the whole story: steady `1 -> 2 -> 3` regime
-changes, then at `t = 30 s` a clean switch into `REGIME_SAFE_FALLBACK (4)` with the gate latched at
-`2` (OOD residual) - an explained decision, not a silent clamp.
+| N | Layered @ +35 % | Continuous nominal-only @ 0 % | Continuous nominal-only @ +35 % | Oracle @ +35 % |
+| ---: | ---: | ---: | ---: | ---: |
+| 15 | **100.0 %** | 78.1 % | 3.1 % | 59.4 % |
+| 40 | **100.0 %** | 84.4 % | 0.0 % | 71.9 % |
+| 120 | **100.0 %** | 96.9 % | 3.1 % | **100.0 %** |
+| 500 | **100.0 %** | 100.0 % | 6.2 % | 100.0 % |
+| 2000 | **100.0 %** | 100.0 % | **0.0 %** | 100.0 % |
 
-![Sample complexity of coarse classification vs a continuous policy, zero-retraining drift robustness, and compute / memory footprint on a log scale](assets/efficiency_and_generalization.png)
+The shape is the argument: the coarse classifier saturates at N = 40 on a unit it never saw; the continuous regression trained only on nominal data never recovers on the drifted unit, even with 2,000 samples. The oracle recovers at N = 120, proving that the gap is **data coverage**, not model capacity.
 
-**Figure 2 - why the layering is cheap.** (a) deployment quality against the number of calibration runs:
-the coarse classifier is already at 100 % with 40 runs, the continuous policy needs about 120 runs on
-the unit it trained on, and it sits at 0 % once that unit is deployed with +35 % drift - at any sample
-count. (b) with the AI frozen, the layered branch stays flat across the drift sweep while the end-to-end
-branch rises monotonically. (c) compute, memory and inference rate on a log scale (99,502x / 2,536x).
+## 5. The three figures
+
+![Four-stage showdown: state tracking inside the safety envelope, actuator command, residual and confidence, regime and gate timeline](assets/benchmark_4stages_showdown.png)
+
+**Figure 1 — 40 s, four stages, three branches.** (a) state tracking against the hard envelope; (b) actuator command; (c) spike and HF residual channels with the AI confidence; (d) active regime and gate timeline. The S4 transition into `REGIME_SAFE_FALLBACK (4)` is a named decision, not a silent clamp.
+
+![Paired sample complexity, zero-retraining drift robustness, compute and memory footprint](assets/efficiency_and_generalization.png)
+
+**Figure 2 — paired data efficiency.** (a) layered classifier vs nominal-only continuous head vs +35 %-trained oracle; (b) full-loop drift sweep with the AI frozen; (c) compute, memory and inference rate.
 
 ![Cross-domain trajectories for industrial servo, edge VLA and closed-loop neuromodulation](assets/domain_profiles_comparison.png)
 
-**Figure 3 - the same architecture on three domains.** State and command traces for industrial
-servo/WAAM, the edge VLA preset (10 Hz policy over a 1 kHz joint loop) and closed-loop neuromodulation.
-Only the physical constants change; the architecture does not.
+**Figure 3 — the same architecture on three domains.** Only the physical constants, stage names and envelope units change; the C99 core and gate semantics do not.
 
-### Core systems insight: more nominal data cannot fix cross-unit drift
+## 6. Run and verify
 
-> **The sample count is not what fails.** On the unit it trained on, the continuous policy reaches 100 % deployable success with 120 calibration runs; move the same frozen policy to a unit carrying +35 % drift and it is at 0 % for every sample count from 40 to 2000. A 3-class coarse classifier reaches 100 % on that drifted unit with 40 runs - because it learned a qualitative partition and left the quantitative offset to feedback.
-
-The usual remedy for poor cross-unit generalisation is more of the same: more data on the nominal distribution, a bigger model, per-unit retraining. Figure 2(a) tests that remedy directly instead of assuming it. It holds the plant model, the feature pipeline and the scoring rule fixed, varies only the number of calibration runs, and then asks what each learner actually does when the machinery changes underneath it. The answer is that the two learners are not limited by the same quantity.
-
-What is measured there is deployment quality, not training loss. Both learners see the same four normalised macro-features, and both are scored the same way: the damping actually applied must stay within 10 % of the closed-loop optimum for that operating point, after the 150 ms classifier dwell. On the unit it trained on, the continuous policy is a competent learner - 28.1 % at N = 15, 81.2 % at N = 40, and 100 % from N = 120 on, where N counts calibration runs. The same frozen policy deployed on a unit carrying +35 % drift scores 3.1 % at N = 15 and exactly 0 % at every N from 40 to 2000. That is a hard floor, not a plateau: every decision falls outside the 10 % tolerance, and the curve does not creep upward with data. The layered curve, measured on the drifted unit, is already 87.5 % at N = 15 and 100 % from N = 40 on.
-
-The mechanism has a name, and it is not variance. The regressor is not learning how machines of this class behave; it is interpolating the inverse-dynamics manifold of the single machine in its training set. Every additional nominal sample lowers the empirical risk on that manifold and tightens the fit to it, which increases, rather than decreases, the effective error on a unit whose inertia (+35 %), break-away friction (2.4x) and Stribeck velocity (0.25x) sit outside it. What is missing is a physical constant, and no density of 0 %-drift samples carries information about a +35 % offset. The deployment point is off the support the learner fixed, so more data, a larger basis and stronger regularisation all pull on the wrong axis.
-
-The layered structure escapes at N = 40 because it splits the map into two parts that fail independently. The slow 10 Hz classifier learns only the qualitative partition of a four-dimensional dimensionless feature space into three regimes - 12 class-mean coordinates plus 4 feature scales, 16 floats in total. Because each feature is normalised by amplitude, actuator limit or velocity scale, a +35 % shift in the plant constants barely moves the operating point in that space, so the partition transfers. The quantitative offset is deliberately not learned at all: the 1 kHz deterministic bank's integrator, with tracking anti-windup, absorbs the unknown bias; the magnitude-then-slew clamps bound the transient; and three field scalars give the engineer the last 10 %. The rule of thumb follows from this: if the deployment condition can drift by tens of percent and you cannot collect data at the drifted condition, the binding question is not "how many samples" but "what is learned (a decision, not a command), how is its input normalised (so the decision survives scale changes), and what absorbs the remainder (a feedback loop you can bound)". The same mechanism shows up as the Stage 2 result in the four-stage benchmark - 0.0516 rad for the end-to-end branch against 0.0122 rad for the layered one, a 4.22x ratio - and is argued from the control side in [`docs/systems_engineering_manifesto_en.md`](docs/systems_engineering_manifesto_en.md) section 2.2.
-
-## 4. Five engineering bottlenecks of end-to-end continuous control - and the structural fix
-
-The failure of a monolithic `u = pi_theta(x)` policy in a real loop is not a model-capacity problem. It
-is five separate structural problems, and each one is dissolved by *where* the AI sits, not by making the
-AI bigger.
-
-The research lineage matters here. Most AI-plus-control work in the literature stays inside one
-continuous controller - tuning its parameters, or replacing it with an end-to-end network that regresses
-the physical inverse dynamics directly. This repository proposes the step *above* that layer: instead of
-fitting a continuous parameter manifold, it arbitrates between a small set of discrete structures and
-rejects the operating points it does not recognise.
-
-### 4.1 Boundary ill-conditioning: the regression target is discontinuous where it matters
-
-*Symptom.* Hunting and steady-state error at friction reversal, contact transition, backlash, actuator
-saturation.
-
-*Cause.* Inverse dynamics blow up on a non-smooth boundary. In this bench the break-away friction
-transition is 0.4 mrad/s wide on a 0.45 N*m jump, so the inverse gain there is set by physics you cannot
-average over - and any finite-capacity learner must smooth the jump. The smoothing is wrong the moment
-the boundary moves.
-
-*Fix.* The AI does not invert the plant. It selects one of 4 pre-verified controller banks; the
-plant-inverse term `u_ff` stays a white-box commissioning model; an integrator with tracking anti-windup
-absorbs the unknown bias. **Evidence:** S2 RMSE 0.0122 vs 0.0516 rad.
-
-### 4.2 Data hunger and unit-to-unit drift
-
-*Symptom.* Works on the pilot machine, fails on machine #2 by 30-40 %; fixing it needs a dataset and a
-GPU, per unit.
-
-*Cause.* A continuous policy encodes the *constants* of the plant it trained on; a classifier on
-normalised features encodes the *shape* of the operating point. Sample complexity differs by two orders
-of magnitude, and only the second transfers across units.
-
-*Fix.* Frozen AI plus three scalar field knobs (`gain_scale`, `damping_scale`, `safety_margin_scale`).
-**Evidence:** 100 % deployment quality from 40 calibration runs against ~120 runs for the continuous
-policy on its own unit, and 0 % for that same policy once the unit carries +35 % drift; 0.0111 -> 0.0151
-rad across the +50 % drift sweep with no retraining.
-
-### 4.3 Compute, power, and latency jitter inside the loop
-
-*Symptom.* The loop runs late, phase margin disappears, the axis chatters, the edge box throttles.
-
-*Cause.* A large model at 1 kHz is 2.4e9 MAC/s with data-dependent inference time; a 10 Hz policy puts
-60-120 ms of transport delay inside the feedback path. At a 3 Hz crossover that costs 65-130 deg of pure
-delay before zero-order-hold effects and dropped frames.
-
-*Fix.* The delay is moved out of the feedback path into a *decision* channel; the 1 kHz core is O(1)
-with a bounded worst case; a stale frame becomes a watchdog hold instead of a bad command.
-**Evidence:** chatter 0.013 vs 0.123 (9.50x), RMSE 0.0125 vs 0.0933 rad.
-
-### 4.4 Unsafe forced extrapolation under OOD
-
-*Symptom.* On an unseen fault the black box keeps producing confident commands, saturates, and pushes the
-axis outside its envelope.
-
-*Cause.* A learned function is defined off its training support; "confidence" is another learned output
-trained on the same data, not an evidence channel.
-
-*Fix.* An independent physics-residual hypothesis test against a frozen nominal model, with an explicit
-abstention state, sticky latches, hysteresis and a re-arm cooldown. **Evidence:** 1,733 vs 0 envelope
-excursions in the four-stage synthetic benchmark of this repository; veto 2.0 ms after onset; 0.0295 rad
-RMSE afterwards under a PD-only safe regulator.
-
-### 4.5 Zero field debuggability
-
-*Symptom.* A technician cannot tune what they cannot see; any change requires a new model version and a
-revalidation.
-
-*Cause.* The tuning surface is the learned parameters. There is no orthogonal knob, no incident record,
-no way to know *why* the unit went safe.
-
-*Fix.* Named gate states (every non-normal tick is a decision, never a silent clamp), a sticky 5-bit
-fault audit mask, 4 orthogonal banks, 3 physical knobs, and 105 deterministic assertions.
-**Evidence:** the C suite pins all of it - priority chain, dwell, cooldown, firewall, anti-windup, field
-knobs - with zero random inputs.
-
-For the control-theoretic version of this section (time-scale separation, delay-margin arithmetic,
-inverse ill-posedness, support and abstention, verifiability) see
-[`docs/systems_engineering_manifesto_en.md`](docs/systems_engineering_manifesto_en.md).
-
-## 5. Cross-domain isomorphic mapping
-
-The same three layers carry over unchanged; only the units, the physical constants and the meaning of
-the regime label change. All three presets ship in
-[`matlab_simulink/load_domain_profile.m`](matlab_simulink/load_domain_profile.m).
-
-| Dimension | Industrial servo / WAAM axis | Edge VLA (10 Hz policy over a 1 kHz arm) | Closed-loop neuromodulation (aDBS / SCS) |
-| :--- | :--- | :--- | :--- |
-| State / command | joint angle [rad] / torque [N*m] | joint angle [rad] / torque [N*m] | normalised biomarker / normalised stimulation envelope |
-| What the 10 Hz layer decides | thermal growth, wire-feed load, friction regime | compliance / contact regime for the joint | biomarker regime for the stimulation pattern |
-| What the 1 kHz core owns | torque loop, envelope, actuator limits | torque loop, envelope, actuator limits | stimulation envelope inside strict clinical bounds |
-| Drift to absorb without retraining | +35 % inertia, 2.4x break-away friction | +35 % link/payload inertia | +35 % electrode impedance, scar-tissue boundary |
-| OOD event to abstain on | 42 Hz parasitic structural resonance + sensor spikes | 38 Hz structural mode + sensor spikes | 33 Hz lead resonance + stimulation artefacts |
-
-Measured on all three presets with the same engine (synthetic dynamics presets, no hardware in the loop):
-
-| preset | S2 RMSE B2 | S2 RMSE B3 | S3 RMSE B2 | S3 RMSE B3 | S4 envelope excursions B2 | S4 envelope excursions B3 | TV(u) B2 | TV(u) B3 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `industrial` (rad) | 0.0516 | 0.0122 | 0.0933 | 0.0125 | 1733 | 0 | 1442.9 | 342.0 |
-| `edge_vla` (rad) | 0.0353 | 0.0086 | 0.2887 | 0.0102 | 1637 | 0 | 22484.5 | 18848.6 |
-| `neuromodulation` (norm.) | 0.0551 | 0.0269 | 0.0711 | 0.0238 | 182 | 0 | 11953.3 | 13824.0 |
-
-The pattern repeats across all three: under +35 % drift the layered branch tracks 4.2x, 4.1x and 2.0x
-better, under edge latency the gap widens, and only the end-to-end branch leaves the envelope. The
-actuator-travel column is deliberately left in - it shows that the layer that stays inside the envelope
-is *not* the one that works the actuator hardest (the neuromodulation preset is the case where the
-end-to-end branch happens to be smoother; its cost is the 182 excursions).
-
-Figure 3 above shows the three presets side by side. Per-domain thresholds, a porting checklist and the
-most common misuse per domain are in
-[`docs/domain_mapping_guide.md`](docs/domain_mapping_guide.md).
-
-## 6. Run it (Windows PowerShell / cmd.exe, copy-paste ready)
-
-**Prerequisites:** MATLAB with Simulink (the reference run used R2024b; no toolbox, no MEX compiler
-required), and optionally any C99 compiler (`gcc`, `clang`, MSVC, `arm-none-eabi-gcc`) for the standalone
-core test. Run both from the repository root.
-
-**6.1 The full acceptance run** - builds the model, simulates the 40 s four-stage bench, runs the
-efficiency study and the three domains, exports the three figures, and evaluates the four engineering
-checks. Everything is plain MATLAB on the CPU, and the script prints its own `=== TIMING ===` block. On
-the reference laptop (R2024b, idle) a cold `matlab -batch` takes about **27 s**, of which **~11.5 s is
-the one-off Simulink model build / first load**; in an already-warm MATLAB session the same work takes
-about **10 s**:
+### Full MATLAB acceptance run
 
 ```powershell
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-Success signals: the four `[1]`-`[4] ... PASS` lines under `=== ENGINEERING CHECKS ===`, the final line
-`All four engineering checks passed.`, three PNGs rewritten in `assets/` at 240 dpi (within the 200-300
-dpi budget), and exit code `0` (the script raises if any check fails). The run is deterministic: the
-four-stage benchmark uses `seed = 7`, the efficiency study `seed = 17`, and the C test uses no random
-number generator at all, so the printed numbers reproduce digit for digit. Individual experiments
-(efficiency only, one domain, model only) are listed in [`AGENTS.md`](AGENTS.md) section 4.4.
+Success criteria:
 
-**6.2 The standalone C99 core** - 105 deterministic assertions, no MATLAB involved:
+| Signal | Expected |
+| :--- | :--- |
+| checks `[1]`–`[5]` | all `PASS` |
+| final line | `All five engineering checks passed.` |
+| figures | `assets/benchmark_4stages_showdown.png`, `assets/efficiency_and_generalization.png`, `assets/domain_profiles_comparison.png` rewritten at 240 dpi |
+| model | `matlab_simulink/ai_layered_control_bench.slx` rebuilt (built-in blocks only) if Simulink is installed and the model is not open with unsaved edits |
+| exit code | `0` |
+
+If Simulink is not installed, the numeric benchmark and all five checks still run; the `.slx` step prints a skip line. A loaded model with unsaved edits is never closed or overwritten.
+
+### C99 core regression test
 
 ```powershell
-gcc -std=c99 -pedantic -Wall -Wextra -O2 c99_layered_core/test_gatekeeper_standalone.c c99_layered_core/layered_gatekeeper.c -o rta_test.exe
-.\rta_test.exe
+cd c99_layered_core
+gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe layered_gatekeeper.c test_gatekeeper_standalone.c
+.\test_gatekeeper_standalone.exe
+$LASTEXITCODE
 ```
 
-Success signals: every check line starts with `[PASS]`, the last line is
-`SUMMARY: n_pass=105, n_fail=0`, and the exit code is `0`. (`rta_test.exe` is gitignored, and the module
-compiles warning-free under `-pedantic -Wall -Wextra`.)
+Expected: `SUMMARY: n_pass=116, n_fail=0`, exit code 0, no compiler diagnostics.
 
-**6.3 The Simulink model** - `matlab_simulink/ai_layered_control_bench.slx` comes from
-`build_simulink_model.m` (built-in blocks only), and its parameters are inlined in the model, so it
-needs no workspace variables: after `clearvars` you can double-click Run, or run
-`sim('matlab_simulink/ai_layered_control_bench.slx')`. Treat it as a generated artefact and do not edit
-it by hand - change the builder and regenerate.
+### C99 ↔ MATLAB closed-loop equivalence
 
-That is the whole loop: one command proves the architecture's claims end to end, one command proves the
-deployable core in isolation. If either fails, the repository is broken - that is the contract.
-
-## 7. Using this repository from your AI assistant
-
-The repository is written to be read by agents first: plain-text C99 and MATLAB, no hidden weights, no
-datasets, a machine-readable ground-truth file, and two commands with exact pass strings. Paste this
-prompt into your AI coding assistant with `@AGENTS.md` attached:
-
-```text
-Read @AGENTS.md first. It is the ground truth for this repository: the four architectural
-invariants, the plain-text file map, the porting playbook, the acceptance commands and the
-reference numbers.
-
-Then help me port this architecture to my plant: <describe plant, units, control rate,
-actuator limits, safety envelope, how state is measured>.
-
-Rules for you:
-1. Start with the mailbox contract (LayeredInput_t field -> my signal, with units) and show
-   it to me before writing any control code.
-2. Keep the 1 kHz core exactly as it is: no heap, no math.h, O(1), NaN/Inf firewall,
-   priority chain, dwell, post-fault cooldown, per-controller anti-windup, bumpless transfer,
-   magnitude and slew clamps, sticky fault bits.
-3. The AI may only emit a regime (1..3, or 4 = abstain) and a confidence in [0,1], computed
-   from dimensionless macro-features. It must never emit u(t) or u_ff.
-4. Keep the physics-residual probe independent of the classifier, and able to force abstention.
-5. Field adaptation is the three FieldTuning_t scalars only. Never retrain or fine-tune.
-6. After each step, give me the signals to log and the pass/fail criterion. Do not claim
-   success without pasting the evidence (log lines, test output, exit code).
+```powershell
+matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 ```
 
-Adapt the prompt rather than the architecture: the four invariants in `AGENTS.md` are what make the
-drift, latency and OOD results hold, and any change that breaks one of them quietly returns you to
-end-to-end control.
+Expected: `PASS: 6000 closed-loop ticks; gate/regime/fault exact; max|du|=4.82e-07, max|du_target|=4.82e-07, max|dblend|=9.5e-08` (tolerances `1e-4`). No compiler => `SKIP`.
 
-## 8. Deep dives
+### 3-step C99 porting
 
-<details>
-<summary><strong>Second-by-second walkthrough of the four stages</strong> (why each branch fails or holds)</summary>
+1. Copy `c99_layered_core/layered_gatekeeper.c` and `.h` into the target; compile as ANSI C99 (`-std=c99`), with no heap, no `libm`, no recursion.
+2. Fill `LayeredConfig_t` with the target's units, limits and bank gains, then call `Layered_Init(&state, &config)` once at boot.
+3. In the 1 kHz (1 ms) ISR fill `LayeredInput_t` and call `Layered_Step(&state, &in, &out)`; write `out.u` to the actuator and persist/log `out.gate`, `out.regime` and the sticky fault bits.
 
-**Setup.** `dt = 1 ms`, 40 s, three branches on one plant and one disturbance schedule (single seed, so
-the comparison is paired). Industrial preset: `J = 0.010 kg*m^2`, viscous damping 0.060 N*m*s/rad,
-compliance 0.300 N*m/rad, `u_max = 2.0 N*m`, envelope `|x| = 1.0 rad`, position noise 0.0025 rad
-(1 sigma). The reference is a quintic point-to-point move (+/-0.5 rad, 1.5 s move, 1.5 s dwell) - the
-dwells are where stiction actually bites.
+### Python-only quickstart (no MATLAB)
 
-**S1, 0-10 s - nominal distribution.** All three branches track. The end-to-end branch is the best
-tracker (0.0087 rad) because it has memorised the exact inverse dynamics of *this* unit; the layered
-branch is close behind (0.0098 rad) with a well-tuned PID plus white-box feedforward; the conservative
-fixed PID is 7.5x the layered branch's error (0.0733 rad). Watch the commands instead: the end-to-end
-branch already spends
-660.3 N*m of total variation against 51.3 N*m for the layered branch, because it is continuously
-inverting a noisy measurement. Nominal performance is a *local* property; the cost is not.
-
-**S2, 10-20 s - the machine is swapped.** Inertia x1.35, Coulomb friction x2.0, break-away x2.4,
-Stribeck velocity x0.25, ramped over 1 s. The end-to-end branch's frozen inverse is now wrong by about
-0.63 N*m of break-away on an axis whose limit is 2.0 N*m, and it has no integral action to absorb the
-error - by construction, a policy trained for pure inverse dynamics carries `Ki = 0`. Result: 0.0516 rad
-versus 0.0122 rad. The layered branch's classifier sees the normalised feature vector drift, changes to
-`REGIME_HIGH_LOAD_DAMPED` (higher gains, much higher damping, heavy integral), and the integrator absorbs
-the rest. Nothing is retrained.
-
-**S3, 20-30 s - the edge chip, or the network, is slow.** From here the end-to-end branch is throttled to
-10 Hz with 60-120 ms of transport delay and 15 % dropped frames, while the layered branch keeps its inner
-loop at 1 kHz and only receives labels at that rate. At the 3 Hz design crossover, 60/80/120 ms of delay
-costs 65/86/130 deg of phase, plus about 54 deg from a 10 Hz zero-order hold, plus up to another 100 ms if
-a frame is dropped - against a 60-70 deg margin. The loop chatters: 0.123 vs 0.013 (9.50x), RMSE 0.0933
-vs 0.0125 rad. The layered branch is unaffected because the delay sits in the decision channel, and the
-150 ms dwell timer stops label noise from reaching the command at all.
-
-**S4, 30-40 s - an unseen fault arrives.** A 42 Hz parasitic mode (damping 0.03) excited by both command
-and motion, plus 0.20 rad sensor outliers at roughly 4 per second (an 80-sigma excursion against the noise
-floor). The end-to-end branch forces extrapolation: it saturates, then drives the axis past the 1.0 rad
-envelope 1,733 times in 10 s - RMSE 0.6152 rad, chatter 0.986. The layered branch's fast residual channel
-crosses its threshold 2.0 ms after onset, latches `GATE_VETO_OOD_RESIDUAL`, switches to the PD-only safe
-regulator with a bumpless transfer, stays inside the envelope, and finishes the stage at 0.0295 rad. It
-stays in fallback for a 500 ms cooldown after the fault subsides; the test suite pins the exact re-arm
-tick.
-
-**Total picture.** The monolithic branch wins 0.0087 to 0.0098 on the stage where its assumption holds,
-and loses by 4.22x, 7.5x and 1,733 envelope excursions on the three stages where it does not. That trade
-is the whole argument, and it is why the layered design is the default for machines that run unattended.
-
-</details>
-
-<details>
-<summary><strong>The four mechanisms, in engineering terms</strong> (time scales, delay margin, inversion, abstention)</summary>
-
-**Time-scale separation.** Inner 1 ms, outer 100 ms, plant drift that settles over about 1 s (content
-well below 1 Hz): two decades of separation. The outer loop sees a quasi-steady inner loop; the inner loop sees a piecewise-constant
-regime. That is what licenses "the AI may be slow, jittery and occasionally absent" as an architectural
-statement rather than an aspiration, and it is why the coarse layer only reads slow variables (feature
-time constants 0.25-0.50 s, i.e. 3-5 outer frames).
-
-**Delay margin.** For a loop with crossover `f_c`, a transport delay `T_d` costs `360 * f_c * T_d` of
-phase. At `f_c = 3 Hz` that is 108 deg per 100 ms - more than the entire margin. A 1 kHz inner loop with
-sub-millisecond delay costs under 1 deg. The layered design therefore keeps *all* delay out of the
-feedback path and pays for the AI's slowness in adaptation speed, on a time scale (seconds) where nothing
-matters. A stale heartbeat becomes a frozen command (`GATE_HOLD_LATENCY`) that leaves no trace in any
-integrator, blend or dwell counter.
-
-**Inversion is ill-posed on non-smooth boundaries.** `u = f^-1(..)` when `f` contains a jump (stiction,
-backlash, contact, dead-band) has unbounded gain at the jump; a finite-capacity learner must smooth it,
-and a smooth compensator in series with a relay-like nonlinearity produces a limit cycle rather than a
-fixed point. The robust cures are classical: integral action to absorb the unknown bias, a bank of
-controllers to change loop gain around the boundary, and hard limits to contain the limit cycle. The
-architecture schedules exactly those three with a slow, low-dimensional decision.
-
-**Abstention is a hypothesis test, not a mood.** A residual against a *frozen* nominal model has a null
-distribution you can characterise from commissioning noise, so the threshold has an arguable false-alarm
-rate and can be verified before deployment. Softmax confidence has none of those properties: it is a
-function of the same policy, trained on the same data, and it is usually high exactly where it is wrong.
-The architecture uses the residual as the primary OOD channel and keeps confidence as a secondary, sticky
-veto. Hysteresis (trip 1.0 / clear 0.80 for the residual; trip below 0.45 / clear at 0.55 for confidence)
-plus a 500 ms re-arm cooldown give the switching law dwell-time behaviour instead of chatter.
-
-The full argument - including what would falsify it, and when an end-to-end policy is the better
-engineering choice - is in
-[`docs/systems_engineering_manifesto_en.md`](docs/systems_engineering_manifesto_en.md).
-
-</details>
-
-## 9. Deterministic core: zero heap, no `malloc`, O(1) worst-case execution time
-
-Everything that can move the actuator lives in
-[`c99_layered_core/layered_gatekeeper.c`](c99_layered_core/layered_gatekeeper.c) behind the contract in
-[`c99_layered_core/layered_gatekeeper.h`](c99_layered_core/layered_gatekeeper.h), whose comments specify
-the full per-tick semantics.
-
-* **Zero dependencies.** The only include is `<stdint.h>`. No `math.h`, no libm, no `printf`, no OS calls.
-  `|x|`, clamping and the finite check are hand-written (a NaN fails both comparisons, an infinity fails
-  one), so no library call can be optimised in or out.
-* **Zero heap, zero recursion, no hidden state.** No allocation, no recursion, no file-static mutable
-  data. All persistence is the caller-owned `LayeredState_t` - **84 B** on the reference toolchain, with
-  `LayeredConfig_t` 116 B, `FieldTuning_t` 12 B, `LayeredInput_t` 36 B and `LayeredOutput_t` 28 B
-  (measured with `sizeof` on gcc 4.9.2, `-std=c99 -pedantic -Wall -Wextra`). Several axes can run side by
-  side; nothing is shared.
-* **O(1) WCET.** One step is a fixed straight-line sequence of branches and arithmetic: no
-  data-dependent loops, no dispatch, no memory walks. Worst case equals average case. It compiles clean
-  with `-pedantic -Wall -Wextra` and with `-Wdeclaration-after-statement`, so it drops into ISR code that
-  has to stay boring.
-* **Fails safe on bad input.** A NaN/Inf/out-of-range mailbox frame is rejected *before* any state is
-  touched: the actuator holds, `corrupted_frame_count` increments, a sticky bit latches, and no
-  integrator is poisoned.
-* **Bounded output, always.** Magnitude clamp then slew clamp, every tick; every bank controller's
-  integrator is back-calculated toward the *actually applied* command, so an inactive bank cannot hide
-  windup and a switch releases no energy; bumpless transfer bounds the step at
-  `blend_alpha * u_max + slew_rate * dt`.
-* **Pinned by tests, not by inspection.**
-  [`test_gatekeeper_standalone.c`](c99_layered_core/test_gatekeeper_standalone.c) composes 105
-  assertions over a 40 s mission schedule: priority chain, dwell, cooldown, NaN/Inf firewall,
-  anti-windup across a saturated bank switch, the three field knobs, feedforward handling, sticky
-  confidence latch, global actuator invariants, and the API / self-healing / null-pointer paths. It is
-  deterministic (no `rand()`, no `<math.h>`; a truncated-Taylor rotation matrix generates the reference
-  sine), so it prints `SUMMARY: n_pass=105, n_fail=0` everywhere.
-
-**Certification posture.** The core borrows defensive embedded-programming principles - zero dynamic
-allocation, bounded execution steps, input sanitisation, fault-bit logging - as a structure reference for
-later engineering work; the code in this repository is not certified functional-safety or medical-device
-firmware. The same principles are why the deterministic part is easy to test exhaustively: one
-straight-line C function, fixed state, a range-checked interface to the learned layer, and a runtime audit
-trail. That is a starting point for a safety case, not a substitute for a hazard analysis, hardware-in-the-
-loop testing, or the certification work of the target industry.
-
-## 10. Fault audit bit mask
-
-A sticky 5-bit mask in `LayeredState_t` records *why* the unit left normal operation. It is OR-ed with
-every new event and never cleared by the core, so it survives the incident and the platform can push it
-to non-volatile storage.
-
-| Bit | Macro | Latched when | Meaning in the field |
-| :--- | :--- | :--- | :--- |
-| 0 | `LAYERED_FAULT_BIT_LATENCY_TIMEOUT` | slow-loop heartbeat older than `outer_timeout_s` (0.30 s) | the AI process stalled, was preempted, or a frame was lost in transport |
-| 1 | `LAYERED_FAULT_BIT_OOD_RESIDUAL` | `\|y - y_hat\|` above threshold (sticky, clears with hysteresis) | the plant left the commissioned model - fault, wear, or a new operating mode |
-| 2 | `LAYERED_FAULT_BIT_LOW_CONFIDENCE` | confidence below 0.45, or the AI self-abstains (`regime == 4`) | the classifier does not vouch for this frame |
-| 3 | `LAYERED_FAULT_BIT_ENVELOPE_BREACH` | state beyond 90 % of the hard limit, or the 60 ms prediction does | the axis reached the edge of what the firmware allows |
-| 4 | `LAYERED_FAULT_BIT_NAN_CORRUPTION` | any NaN/Inf/out-of-range mailbox field | upstream software or IPC corruption - investigate the producer |
-
-Per-cause counters (`safety_veto_count`, `ood_veto_count`, `low_confidence_veto_count`,
-`latency_hold_count`, `corrupted_frame_count`, `step_count`) turn the bits into a timeline: how many
-episodes, how often, in which order. That is the black box a field engineer needs - and it needs nothing
-from the AI.
-
-## 11. Field tuning: three knobs, no retraining
-
-Moving the same firmware to a new machine, a new patient or a new payload is a calibration, not a
-machine-learning project:
-
-```c
-typedef struct {
-    float gain_scale;          /* scales all P/I gains;    1.0 = factory nominal */
-    float damping_scale;       /* scales all D gains;      1.0 = factory nominal */
-    float safety_margin_scale; /* scales the safety limit; 1.0 = factory nominal */
-} FieldTuning_t;               /* 12 B: the entire field-adaptation surface */
+```powershell
+python -m pip install -r python_bench/requirements.txt
+python python_bench/run_benchmark.py
 ```
 
-The AI stays frozen. The deterministic bank absorbs the uncalibrated drift; the integral action plus the
-drift tolerance shown in S2 is what buys the technician time to do the three-knob procedure properly. The
-C suite's stage 5 proves all three knobs actually move the command (gain up => steady-state `|u|` up;
-damping up => command moves along `+e_dot`; margin down => the envelope trips earlier), and stage 6
-proves the drift is absorbed without touching the classifier. Anything that cannot be fixed with these
-three numbers is a commissioning problem, and it should be fixed at commissioning - not papered over with
-a retrained model that nobody can re-verify.
+The entry tries to compile `c99_layered_core/layered_gatekeeper.c` with `ctypes` (Windows `.dll`, macOS `.dylib`, Linux `.so`); if no compiler is present it prints one line and falls back to the pure-Python/NumPy gatekeeper mirror. `--no-c` forces the mirror; `--selftest` replays 500 deterministic frames through both implementations and requires exact gate/regime and `|du| <= 1e-5`.
 
-## 12. Actuator wear: total variation TV(u)
+The **1 kHz C99 gatekeeper is frame-for-frame equivalent** between the MATLAB engine and the Python implementation (`--selftest` max `|du| = 1.55e-07 < 1e-6`). The standalone Python benchmark's 10 Hz outer probe uses adaptive noise floors and a confidence EMA; therefore its B3 S1–S4 RMSE is **0.0090 / 0.0053 / 0.0343 / 0.0873**, OOD veto **9.0 ms** (< 10 ms), and its safety-violation tick count is **0** in every stage. Those Python-run numbers intentionally differ from the MATLAB 40 s table; the gate semantics and C core do not.
 
-TV(u) is the sum of `|u(k) - u(k-1)|` over the run - a proxy for how hard the actuator, gearbox and
-mounts are being worked. Over the 40 s benchmark:
+### Simulink model as a standalone artifact
 
-| Branch | TV(u), 40 s [N*m] | Relative to layered |
-| :--- | ---: | ---: |
-| Branch 1: fixed PID | 1664.8 | 4.87x |
-| Branch 2: end-to-end AI | 1442.9 | 4.22x |
-| Branch 3: layered | **342.0** | 1.00x |
+```powershell
+matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('model runs standalone')"
+```
 
-Per stage, the layered branch stays between 51.3 and 148.3 N*m while the alternatives run 409-426 N*m
-(fixed PID) and 17.4-660.3 N*m (end-to-end). Two cautions before quoting these as "smoothness": (1) the
-units are domain-specific - compare branches within one benchmark, not across domains; (2) low TV is not
-automatically good: in S3 the end-to-end branch has the *lowest* TV (17.4 N*m) because its command is
-frozen between 10 Hz frames, which is a stale actuator, not a well-behaved one. Read TV together with
-tracking error and envelope excursions, never alone.
+The model is built from built-in blocks only, with every numeric parameter inlined. It is a visualization of the three branches; the quantitative benchmark lives in `sim_core_engine.m`.
 
-## 13. Repository contents and further reading
+## 7. The three domain presets
 
-The repository is plain text - C99, MATLAB, Markdown - plus one generated Simulink model and three
-generated figures. Nothing learned is shipped: the coarse classifier is a 16-float prototype table plus
-four feature scales.
+| Domain | S1 | S2 | S3 | S4 |
+| :--- | :--- | :--- | :--- | :--- |
+| **industrial WAAM** | Fast torch/axis tracking (light deposition load) | +35 % layer-heat equivalent load drift & wire-feed Stribeck friction | Arc/contact stiffness + arc-voltage HF noise + fieldbus latency | Unseen structural resonance & sensor spikes |
+| **edge VLA** | High-speed free-space motion (light payload) | +35 % payload drift & joint static friction | Contact stiffness step + vision/force HF noise + 10 Hz edge inference jitter | Unseen structural resonance & sensor spikes |
+| **neuromodulation** | Fast phasic biomarker tracking | +35 % electrode–tissue impedance drift & activation-threshold nonlinearity | High-coupling neural rebound + EMG/artifact HF noise + telemetry jitter | Unseen OOD pathological oscillation & lead micro-dislodgement spikes |
+
+The shared dimensionless fields are `friction_scale`, `k_scale`, `noise_scale` and per-bank `ff_scale`; the domain comments in `load_domain_profile.m` and `docs/domain_mapping_guide.md` use the domain's own physics. Neuromodulation never uses mechanical-arm wording.
+
++35 % drift in the industrial preset means: `J ×1.35, b ×1.25, k ×1.10, fc ×2.00, fs ×2.40, vs ×0.25, fvisc ×1.20`.
+
+## 8. Repository contents
 
 ```text
 ai-layered-control/
 ├── README.md / README_zh.md            this file / 中文版
-├── AGENTS.md                           machine-readable ground truth: invariants, playbook, commands
+├── AGENTS.md                           machine-readable invariants, playbook, commands
 ├── docs/
-│   ├── systems_engineering_manifesto_en.md   the systems-engineering argument (EN)
-│   ├── systems_engineering_manifesto_zh.md   same, 中文
-│   └── domain_mapping_guide.md               cross-domain mapping + porting checklist
-├── c99_layered_core/                   deployable core: C99, zero dependency, no heap
-│   ├── layered_gatekeeper.h            contract (read this first)
-│   ├── layered_gatekeeper.c            the 1 kHz implementation
-│   └── test_gatekeeper_standalone.c    105 deterministic assertions
-├── matlab_simulink/                    benchmark, presets, model builder
-│   ├── load_domain_profile.m           the three domain presets, in physical units
-│   ├── sim_core_engine.m               4-stage, 3-branch engine (+ MATLAB mirror of the C core)
-│   ├── run_efficiency_analysis.m       sample complexity, drift sweep, compute/memory
-│   ├── build_simulink_model.m          generates the .slx from built-in blocks
-│   ├── run_all_benchmarks.m            one-click acceptance run
-│   └── ai_layered_control_bench.slx    generated artefact (do not treat as source)
+│   ├── systems_engineering_manifesto_en.md / _zh.md
+│   └── domain_mapping_guide.md
+├── c99_layered_core/
+│   ├── layered_gatekeeper.h            88 B state / 132 B config contract
+│   ├── layered_gatekeeper.c            zero-dependency 1 kHz core
+│   ├── test_gatekeeper_standalone.c    116 deterministic checks
+│   └── verify_core_equivalence.c       closed-loop C replay harness (test-only)
+├── matlab_simulink/
+│   ├── load_domain_profile.m
+│   ├── sim_core_engine.m
+│   ├── calibrate_coarse_classifier.m
+│   ├── train_continuous_policy.m
+│   ├── run_efficiency_analysis.m
+│   ├── run_all_benchmarks.m
+│   ├── build_simulink_model.m
+│   ├── verify_core_equivalence.m
+│   └── ai_layered_control_bench.slx    generated artifact
+├── python_bench/
+│   ├── run_benchmark.py                ctypes C core or NumPy fallback
+│   └── requirements.txt
 └── assets/                             three generated 240 dpi figures
 ```
 
-| Document | Answers |
-| :--- | :--- |
-| [`docs/systems_engineering_manifesto_en.md`](docs/systems_engineering_manifesto_en.md) | why coarse classification + deterministic control beats single-point AI optimisation, when it does not, and what would falsify the claim |
-| [`AGENTS.md`](AGENTS.md) | the four non-negotiable invariants, the plain-text ground-truth file map, a four-step porting playbook, the acceptance commands |
-| [`docs/domain_mapping_guide.md`](docs/domain_mapping_guide.md) | the same mapping applied to industrial servo/WAAM, edge VLA and neuromodulation, with per-domain thresholds and misuse patterns |
-| [`c99_layered_core/layered_gatekeeper.h`](c99_layered_core/layered_gatekeeper.h) | the contract: 4 regimes, 5 gate states, 5 fault bits, the full per-tick semantics |
+Plain text: C99, MATLAB, Python, Markdown. No committed weights or datasets: the RBF policy is fitted deterministically at commissioning time from a synthetic nominal-unit rollout; the classifier prototypes are fitted from three stage probes; the C core is the deployable artifact.
 
-### Sister project: jev-tune
+## 9. Scope and disclaimer
 
-[`jev-tune`](https://github.com/lijiawei255/jev-tune) works one level lower, inside a single controller:
-continuous parameter-layer tuning with a C99 safety boundary as the backstop. This repository works one
-level higher, at the discrete structural layer - coarse semantic classification across operating
-conditions, convergence from very few calibration runs, compute decoupling between the slow and fast
-loops, and explicit rejection of operating points it does not recognise. The two are complementary:
-parameter-layer fitting and structural-layer arbitration, together forming one engineering-systems path
-from "tune the controller" to "decide which controller, and refuse the ones you cannot vouch for".
+This repository is a methodological reference implementation of a fast/slow-loop decoupled control architecture: a coarse semantic classifier, an independent physics-residual abstention probe, and a deterministic 1 kHz safety gate. The `neuromodulation` (aDBS/SCS) preset is a lumped-parameter synthetic nonlinear-dynamics and isomorphic biomarker-envelope model; it contains no patient records and is not a clinical physiological or pathological model of any specific disease. The C99 core follows defensive embedded principles (zero dynamic allocation, O(1) worst-case execution, NaN firewall, sticky fault audit), but it has not been certified and makes no claim of compliance with IEC 62304, ISO 14971, IEC 60601, or IEC 61508. Any clinical implant/wearable neuromodulation or high-risk industrial deployment must add independent hardware charge-balance protection, an external watchdog, and complete clinical/regulatory validation.
 
-## Citation
+## 10. Citation
 
-If this reference architecture or benchmark is useful in your work, the repository is citable. GitHub renders a **Cite this repository** button in the right-hand sidebar of the project page from [`CITATION.cff`](CITATION.cff), and that button exports APA or BibTeX for you. If you would rather paste the entry directly:
+If you use this reference architecture or benchmark in your work, please cite:
 
 ```bibtex
 @software{li2026ailayeredcontrol,
   author       = {Li, Jiawei},
-  title        = {{ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control}},
+  title        = {ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control},
   year         = {2026},
-  version      = {1.0.0},
+  version      = {1.1.0},
   url          = {https://github.com/lijiawei255/ai-layered-control},
-  note         = {ORCID: 0009-0002-8322-4474}
+  license      = {MIT}
 }
 ```
 
-## License
-
-MIT. See [LICENSE](LICENSE).
-
-## Scope and disclaimer
-
-This repository is a **reference implementation and conceptual benchmark** for academic exchange and
-architectural exploration. Every experiment in it runs on a **parameterised synthetic nonlinear plant**;
-it contains no clinical data from real patients and no production data from real machines, and nothing
-in it has been validated on hardware.
-
-Before any of this is used on a real industrial machine, robot or neuromodulation system, the full
-engineering process for that application has to be carried out: hazard analysis (FMEA / STPA, and the
-equivalent clinical risk analysis for medical use), hardware-in-the-loop testing, and the certification
-required by the relevant industrial-safety or medical-device regulations. The numbers in this README
-describe a simulation; they are not a safety claim about any device.
+**Sister project:** [jev-tune](https://github.com/lijiawei255/jev-tune) — continuous parameter-layer tuning inside a single controller, with a C99 safety-boundary fallback.

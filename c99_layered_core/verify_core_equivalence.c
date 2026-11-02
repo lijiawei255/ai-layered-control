@@ -1,0 +1,106 @@
+/*
+ * verify_core_equivalence.c
+ * ---------------------------------------------------------------------------
+ * Test-only replay harness for the C/MATLAB closed-loop equivalence check.
+ * It is NOT part of the deployable core: stdio is allowed here.
+ *
+ * Input file format produced by matlab_simulink/verify_core_equivalence.m:
+ *   N
+ *   dt timeout max_res res_clear min_conf conf_clear x_limit trip clear
+ *   predict u_max slew alpha integ_limit windup min_dwell recovery
+ *   kp0 kp1 kp2 kp3 kd0..kd3 ki0..ki3 ff0..ff3
+ *   then N lines of 9 LayeredInput_t fields.
+ *
+ * Output: N lines of
+ *   u u_target gate regime blend fault_audit_bitmask
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "layered_gatekeeper.h"
+
+int main(int argc, char **argv)
+{
+    FILE *f;
+    FILE *g;
+    int N;
+    int k;
+    int j;
+    LayeredConfig_t cfg;
+    LayeredState_t st;
+    FieldTuning_t tun;
+
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s input.txt output.txt\n", argv[0]);
+        return 2;
+    }
+    f = fopen(argv[1], "r");
+    if (f == NULL) {
+        fprintf(stderr, "cannot open input %s\n", argv[1]);
+        return 2;
+    }
+
+    if (fscanf(f, "%d", &N) != 1 || N < 0) {
+        fprintf(stderr, "bad N\n");
+        fclose(f);
+        return 2;
+    }
+    if (fscanf(f, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %u %u",
+               &cfg.dt_s, &cfg.outer_timeout_s,
+               &cfg.max_physics_residual, &cfg.residual_clear_ratio,
+               &cfg.min_ai_confidence, &cfg.confidence_clear_ratio,
+               &cfg.state_safety_limit, &cfg.safety_trip_ratio,
+               &cfg.safety_clear_ratio, &cfg.safety_predict_s,
+               &cfg.u_max, &cfg.u_slew_max_per_s, &cfg.blend_alpha,
+               &cfg.integ_limit, &cfg.windup_tau_s,
+               &cfg.min_dwell_ticks, &cfg.ood_recovery_cooldown_ticks) != 17) {
+        fprintf(stderr, "bad config header\n");
+        fclose(f);
+        return 2;
+    }
+    for (j = 0; j < LAYERED_NUM_REGIMES; ++j) {
+        if (fscanf(f, "%f", &cfg.kp[j]) != 1) { fclose(f); return 2; }
+    }
+    for (j = 0; j < LAYERED_NUM_REGIMES; ++j) {
+        if (fscanf(f, "%f", &cfg.kd[j]) != 1) { fclose(f); return 2; }
+    }
+    for (j = 0; j < LAYERED_NUM_REGIMES; ++j) {
+        if (fscanf(f, "%f", &cfg.ki[j]) != 1) { fclose(f); return 2; }
+    }
+    for (j = 0; j < LAYERED_NUM_REGIMES; ++j) {
+        if (fscanf(f, "%f", &cfg.ff_scale[j]) != 1) { fclose(f); return 2; }
+    }
+
+    tun.gain_scale = 1.0f;
+    tun.damping_scale = 1.0f;
+    tun.safety_margin_scale = 1.0f;
+    Layered_Init(&st, &cfg, &tun);
+
+    g = fopen(argv[2], "w");
+    if (g == NULL) {
+        fprintf(stderr, "cannot open output %s\n", argv[2]);
+        fclose(f);
+        return 2;
+    }
+    for (k = 0; k < N; ++k) {
+        LayeredInput_t in;
+        LayeredOutput_t out;
+        if (fscanf(f, "%f %f %f %f %f %f %f %f %f",
+                   &in.ai_regime, &in.ai_confidence, &in.outer_age_s,
+                   &in.physics_residual, &in.x, &in.x_dot,
+                   &in.r, &in.r_dot, &in.u_ff) != 9) {
+            fprintf(stderr, "bad trace row %d\n", k);
+            fclose(f);
+            fclose(g);
+            return 2;
+        }
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        fprintf(g, "%.9g %.9g %d %d %.9g %u\n",
+                (double)out.u, (double)out.u_target,
+                (int)out.gate, (int)out.regime, (double)out.blend,
+                (unsigned)out.fault_audit_bitmask);
+    }
+    fclose(f);
+    fclose(g);
+    return 0;
+}

@@ -51,7 +51,7 @@ The three claims this buys, each with the benchmark evidence that supports it:
    0.0125), while the 1 kHz inner loop never sees the delay at all.
 3. **Abstention is possible, and only because the model is white-box.** On an unseen 42 Hz structural
    resonance with sensor outliers, the end-to-end branch leaves the 1.0 rad envelope 1,733 times while
-   the layered branch records zero envelope excursions in the four-stage synthetic benchmark of this
+   the layered branch records zero Safety Violation Ticks in the four-stage synthetic benchmark of this
    repository: it vetoes 2.0 ms after onset and continues at 0.0295 rad RMSE under a PD-only safe
    regulator.
 
@@ -214,7 +214,7 @@ model of the plant, 4 Hz bandwidth, deliberately slower than the inner loop) pro
 residual - a slow channel `|LP(innovation)|` for drift and a fast channel `|innovation - LP(innovation)|`
 for transients. The fast channel crosses the veto threshold within 2.0 ms of fault onset; the priority
 chain latches `GATE_VETO_OOD_RESIDUAL`, the core switches to `REGIME_SAFE_FALLBACK` (PD-only, heavy
-damping), and the stage ends with RMSE 0.0295 rad and zero envelope excursions in the four-stage
+damping), and the stage ends with RMSE 0.0295 rad and zero Safety Violation Ticks in the four-stage
 synthetic benchmark of this repository.
 
 The epistemics matter more than the numbers. A residual against a white-box nominal model is a
@@ -348,7 +348,7 @@ decision:
   which the regime is restored.
 
 One more detail that matters in practice: the classifier's confidence is defined as a *margin* in
-distance space, `d2 / (d1 + d2)` where `d1` and `d2` are the distances to the nearest and runner-up
+distance space, `((d2−d1)/(d2+d1)) · exp(−γ·d1)` where `d1` and `d2` are the distances to the nearest and runner-up
 prototype. It is not a softmax over logits; it collapses to 0 exactly when two classes are equally close,
 which is the ambiguous situation you want a veto on. The architecture does not need the confidence to be
 a calibrated probability - only to be monotone in ambiguity - and that is a much weaker requirement.
@@ -361,7 +361,7 @@ The layered design changes what you can *prove*. Three concrete properties:
   sequence of branches over an 84 B state struct; the block comment in the header enumerates its
   semantics in order (firewall, safety, residual, confidence, heartbeat, dwell, cooldown, bank,
   anti-windup, bumpless transfer, clamps). That is a specification you can test assertion by assertion,
-  and the shipped suite does: 105 checks, 0 failures, deterministic (no `rand()`, no `math.h`, no clock).
+  and the shipped suite does: 116 checks, 0 failures, deterministic (no `rand()`, no `math.h`, no clock).
 * The learned part is *tiny and inspectable*. The shipped classifier is a prototype table of 12 numbers
   plus 4 feature scales. Its behaviour over the operating envelope can be characterised exhaustively;
   there is no hidden layer to sample.
@@ -376,7 +376,7 @@ insufficient for a safety function.
 
 ---
 
-## 4. The experiment: four engineering checks, and what they do not prove
+## 4. The experiment: five engineering checks, and what they do not prove
 
 ### 4.1 Setup
 
@@ -394,7 +394,7 @@ S3 20-30 s edge compute scarcity (10 Hz, 60-120 ms jitter, 15 % drops); S4 30-40
 resonance plus sensor outliers. The industrial preset is a servo/WAAM-quality axis: `J = 0.010 kg*m^2`,
 `u_max = 2.0 N*m`, hard envelope `|x| = 1.0 rad`, position noise `0.0025 rad`.
 
-### 4.2 The four engineering checks
+### 4.2 The five engineering checks
 
 | # | Claim | Criterion | Measured | verdict |
 | :---: | :--- | :--- | :--- | :--- |
@@ -454,7 +454,7 @@ audible noise.
 A caution about that metric: low total variation is not by itself good. In Stage 3 the end-to-end branch
 has the *lowest* TV of all (17.4 N*m) precisely because its command is frozen between 10 Hz frames - a
 stale actuator is not a well-behaved actuator. Actuator wear has to be read together with tracking and
-safety, never alone. (The repository reports per-stage TV, chatter and envelope excursions side by side
+safety, never alone. (The repository reports per-stage TV, chatter and Safety Violation Ticks side by side
 for exactly this reason.)
 
 ---
@@ -490,7 +490,7 @@ means:
   still has to be safe. That is a much easier argument than "the network is correct".
 * **Adaptation is parameterised.** Moving to a new unit or patient is a change to three scalar
   parameters with a documented physical meaning, regression-tested by the same deterministic suite and
-  the four engineering checks - not a new trained-model version requiring a new dataset, retraining and
+  the five engineering checks - not a new trained-model version requiring a new dataset, retraining and
   revalidation. This is the difference between a service visit and a software release.
 * **The audit trail exists at runtime.** The sticky 5-bit fault mask plus per-cause counters
   (`safety_veto_count`, `ood_veto_count`, `low_confidence_veto_count`, `latency_hold_count`,
@@ -549,7 +549,7 @@ decision or a model, and loses when its output is the actuator command inside a 
 An engineering argument is only useful if it can be wrong. This one would be weakened or broken by:
 
 * A paired bench, on a real axis, where a continuous 1 kHz policy survives `+35 %` drift and `60-120 ms`
-  jitter with zero retraining, zero envelope excursions in the four-stage synthetic benchmark of this
+  jitter with zero retraining, zero Safety Violation Ticks in the four-stage synthetic benchmark of this
   repository and no increase in actuator travel. That would remove the structural claim and reduce the
   layered design to a cost/verifiability trade.
 * Evidence that a white-box nominal model cannot be commissioned to within the accuracy the residual
@@ -579,7 +579,7 @@ for a demo that runs for ten seconds on the plant it was trained on.
 | Under `+35 %` uncalibrated drift | 0.0516 rad, 4.22x worse | 0.0122 rad, unchanged |
 | Across `0 -> +50 %` drift, AI frozen | 7.75x degradation | 1.36x degradation |
 | Under 10 Hz + 60-120 ms + 15 % drops | chatter 0.123, RMSE 0.0933 | chatter 0.013, RMSE 0.0125 |
-| Unseen OOD fault | 1,733 envelope excursions (four-stage synthetic benchmark) | 0 excursions, abstains in 2.0 ms |
+| Unseen OOD fault | 1,733 Safety Violation Ticks (four-stage synthetic benchmark) | 0 excursions, abstains in 2.0 ms |
 | Calibration data needed | ~120 runs on its own unit, 0 % success on a +35 % drifted unit | 40 runs at 100 % deployment quality |
 | Compute / memory | 2.40e9 MAC/s, 5.60e6 B | 2.41e4 MAC/s, 2.21e3 B |
 | Actuator travel over 40 s | 1,442.9 N*m | 342.0 N*m |
@@ -604,8 +604,8 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 c99_layered_core/test_gatekeeper_standa
 .\rta_test.exe
 ```
 
-The acceptance strings are `All four engineering checks passed.` (exit code 0) and
-`SUMMARY: n_pass=105, n_fail=0`. Seeds are fixed - four-stage benchmark `seed = 7`, efficiency study
+The acceptance strings are `All five engineering checks passed.` (exit code 0) and
+`SUMMARY: n_pass=116, n_fail=0`. Seeds are fixed - four-stage benchmark `seed = 7`, efficiency study
 `seed = 17`, and no random generator at all in the C test - so the printed numbers reproduce digit for
 digit on any machine with the same MATLAB maths. The full metrics table is printed by the first command;
 the per-stage, per-branch values quoted above are those printed lines, and the sample-complexity
