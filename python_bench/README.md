@@ -1,36 +1,61 @@
-# python_bench — zero-MATLAB entry point (v1.1.0)
+# Python entry point — v2.0.0
 
-## [REUSABLE CORE] vs [BENCHMARK HARNESS]
+The reusable implementation is the [C99 core](../c99_layered_core/layered_gatekeeper.h).
+[minimal_template.py](minimal_template.py) supplies a compact C binding, the slow/fast loop and
+two adaptation helpers. [run_benchmark.py](run_benchmark.py) runs the shared physical benchmark.
+Authoritative numerical results are in [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
-| Role | Files | Purpose |
-| :--- | :--- | :--- |
-| **[REUSABLE CORE]** | `../c99_layered_core/layered_gatekeeper.c/.h` + `minimal_template.py` | Copy into the target project. The template is a 10 Hz + 1 kHz copy-paste skeleton; it auto-loads the C99 core via `ctypes` (or builds it once) and falls back to a minimal Python gate when no compiler exists. |
-| **[BENCHMARK HARNESS]** | `run_benchmark.py` | Reproduces the 40 s paper/repo figures. **Do not copy the synthetic plant into production.** |
+## Run
 
-## Quick start
+From the repository root:
 
 ```powershell
-pip install -r python_bench/requirements.txt
-python python_bench/minimal_template.py      # 1 s reusable skeleton; prints [OK] ... 0 safety violations
-python python_bench/run_benchmark.py         # 40 s benchmark: C core via ctypes (builds on first run)
-python python_bench/run_benchmark.py --no-c  # force the pure-Python gatekeeper mirror
-python python_bench/run_benchmark.py --selftest  # C core vs Python mirror, 500 random frames
+python -m pip install -r python_bench/requirements.txt
+python python_bench/minimal_template.py
+python python_bench/run_benchmark.py
+python python_bench/run_benchmark.py --no-c
+python python_bench/run_benchmark.py --selftest
 ```
 
-## Minimal template: 3 slots
+The template requires a C99 compiler (`gcc` by default, or `CC`).
+It rebuilds the dynamic library when either `layered_gatekeeper.c` or `.h` changes.
+Compilation errors propagate directly. The benchmark's `--no-c` option selects its complete
+Python core mirror; `--selftest` compares the mirror with compiled C.
+Generated libraries and the Python preview figure remain ignored build artifacts.
 
-`minimal_template.py` is 98 lines and exposes only three replacements:
+## Adapt three slots
 
-1. `[USER-PLUGIN-SLOT 1]` — `read_plant_and_reference(t)`: real sensor `(q, dq)` and reference `(q_ref, dq_ref, ddq_ref)`;
-2. `[USER-PLUGIN-SLOT 2]` — `compute_nominal_residual(q, dq, u_prev)`: the target domain's minimal nominal-physics residual probe;
-3. `[USER-PLUGIN-SLOT 3]` — `slow_loop_10hz_step(...)`: 4-D dimensionless macro-features, margin × proximity confidence, S3 physical-residual mode guard, coarse `ai_regime ∈ {1,2,3,4}`.
+1. Replace the sensor, trajectory and actuator I/O with the device's measured state and command.
+2. Define the commissioned nominal predictor, independent residual probe and normalized features.
+3. Supply labeled commissioning windows and a safe device-trial callback.
 
-The main loop runs 1 kHz: every 100 ticks it refreshes the 10 Hz slow-loop decision; every tick it calls `Layered_Step` (or the fallback) and writes the safe command `u`.
+`Core(config, tuning=(1,1,1))` accepts the exact C configuration names.
+Its `step(regime, confidence, age, residual, x, x_dot, r, r_dot, u_ff)` returns
+`(u, gate, regime, blend, fault, corrupted, target)`.
+The configuration bank fields `kp`, `kd`, `ki` and `ff_scale` each contain four values.
 
-## 40 s benchmark
+`auto_calibrate(samples, labels)` expects four dimensionless features and labels 1–3.
+It returns three prototypes and three confidence parameters.
+Freeze these parameters, then call `auto_field_tune(evaluate, current)`.
+The trial callback returns `(measured_cost, valid)`; reject constraint violations.
+Invalid candidates cannot win, and an entirely invalid search returns the current knobs.
+The search adjusts gain and damping while retaining the commissioned safety-margin scale.
 
-The benchmark runs the industrial four-stage profile (S1 nominal, S2 +35 % drift, S3 edge latency + 20x noise + contact, S4 OOD 42 Hz sensor resonance + encoder spikes) at 1 kHz with three branches: fixed PID, a continuous ridge/RBF policy trained on nominal-unit data, and the layered 10 Hz classifier + 1 kHz gatekeeper bank.
+Frame age advances every tick from the source timestamp.
+On timeout the adapter sends R4 with zero confidence while retaining the real age.
+C's native HOLD retains an actuator command; the device fallback defines the desired physical behavior.
+Count safety violations from true/measured state, independently of gate activity.
 
-It prints per-stage RMSE, safety-violation ticks [ms], control effort TV(u) and the OOD veto latency, and writes `python_bench/benchmark_4stages.png` (2x2, 240 dpi).
+## Benchmark contract
 
-The deterministic core is the compiled `../c99_layered_core/layered_gatekeeper.c`; if no C compiler is found it falls back to a line-for-line Python mirror with identical gate decisions (`--selftest` proves gate/regime equality on 500 random frames, `max|du| <= 1e-5`). Build artefacts go to `python_bench/build/` and the output PNG is gitignored; both are regenerated.
+The three branches are white-box feedforward plus PID, conditioned RBF continuous action,
+and a coarse supervisor plus deterministic gatekeeper. Both learned continuous actions and C control
+run at 1 kHz; only context/supervisor updates run at 10 Hz.
+The physical fixture combines Karnopp friction, unit drift, moving unilateral contact,
+white measurement noise and a passive variable-frequency flexible mode.
+The benchmark regenerates its training samples and classifier archive deterministically.
+It reports the four-stage metrics, mode ablations, frozen-AI tuning and action-sample efficiency.
+The deployment path reads measured features; stage labels are confined to plant generation and scoring.
+
+Porting order, multi-axis ownership and timeout behavior are specified in
+[AGENTS.md](../AGENTS.md). Scope is stated at the end of the root README.

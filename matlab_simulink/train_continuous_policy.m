@@ -1,70 +1,36 @@
-function policy = train_continuous_policy(X, y, opts)
-%TRAIN_CONTINUOUS_POLICY  Closed-form RBF policy (no toolbox, no gradient loop).
-%
-%   POLICY = TRAIN_CONTINUOUS_POLICY(X, Y, OPTS)
-%     X : N x d raw features
-%     Y : N x 1 teacher command
-%     OPTS fields: .n_centers (48), .ridge (1e-6), .seed (11)
-%
-%   The RBF centres are selected by deterministic farthest-point sampling and
-%   the output weights are solved by ridge regression.  This is a genuine
-%   one-hidden-layer RBF network fitted to data; the deployed policy is
-%   POLICY_WEIGHTS = POLICY.WEIGHTS, not a hand-written inverse-dynamics
-%   formula.  No weights are stored in the repository; the fit is repeated
-%   deterministically at commissioning time.
-
-if nargin < 3 || isempty(opts)
-    opts = struct();
+function policy = train_continuous_policy(P, nSamples, nCenters, unit)
+%TRAIN_CONTINUOUS_POLICY Conditional 1 kHz action head with 10 Hz context.
+if nargin<1, P=load_domain_profile(); end
+if nargin<2, nSamples=16000; end
+if nargin<3, nCenters=512; end
+if nargin<4, unit=0; end
+state=uint32(933); values=zeros(9*nSamples,1);
+for j=1:numel(values)
+    state=uint32(bitand(uint64(1664525)*uint64(state)+uint64(1013904223),uint64(4294967295)));
+    values(j)=(double(state)+.5)/4294967296;
 end
-if ~isfield(opts, 'n_centers') || isempty(opts.n_centers)
-    opts.n_centers = 48;
+X=reshape(values,9,nSamples)'*2-1;
+X(:,6:9)=(X(:,6:9)+1)/2; X(:,9)=X(:,9)*1.4;
+h=min(max((X(:,9)-.65)/.35,0),1);
+kp=60*(1-h)+8*h; kd=1.2*(1-h)+.8*h; p=P.nominal;
+ff=p.J*(1+unit)*6*X(:,5)+p.b*2*X(:,4)+p.k*.5*X(:,3)+p.fc*sign(X(:,4));
+Y=kp.*(.1*X(:,1))+kd.*X(:,2)+ff;
+if unit~=0
+    Y=Y+(1.2*(1+4.5*unit)-p.fc)*sign(2*X(:,4)-X(:,2));
 end
-if ~isfield(opts, 'ridge') || isempty(opts.ridge)
-    opts.ridge = 1e-6;
+mu=mean(X,1); sd=max(std(X,1,1),.05); Z=(X-mu)./sd;
+nCenters=min(nCenters,nSamples); indices=ones(nCenters,1);
+dist=sum((Z-Z(1,:)).^2,2);
+for j=2:nCenters
+    [~,indices(j)]=max(dist);
+    dist=min(dist,sum((Z-Z(indices(j),:)).^2,2));
 end
-if ~isfield(opts, 'seed') || isempty(opts.seed)
-    opts.seed = 11;
-end
-
-X = double(X); y = double(y(:));
-[N, d] = size(X);
-mu = mean(X, 1);
-sig = std(X, 0, 1);
-sig(sig < 1e-9) = 1;
-Z = (X - mu)./sig;
-
-k = min(opts.n_centers, N);
-centers = zeros(k, d);
-% deterministic farthest-point sampling; start from the sample closest to the
-% origin so the result does not depend on row order.
-[~, first] = min(sum(Z.^2, 2));
-centers(1,:) = Z(first,:);
-dist2 = sum((Z - centers(1,:)).^2, 2);
-for j = 2:k
-    [~, idx] = max(dist2);
-    centers(j,:) = Z(idx,:);
-    dist2 = min(dist2, sum((Z - centers(j,:)).^2, 2));
-end
-% width from the median nearest-centre distance
-D = zeros(N,k);
-for j = 1:k
-    D(:,j) = sum((Z - centers(j,:)).^2, 2);
-end
-width = median(sqrt(min(D,[],2)));
-width = max(width, 1e-3);
-
-Phi = exp(-0.5*D/(width^2));
-lambda = opts.ridge*max(N, 1);
-w = (Phi'*Phi + lambda*eye(k)) \ (Phi'*y);
-
-policy = struct();
-policy.mu = mu;
-policy.sig = sig;
-policy.centers = centers;
-policy.width = width;
-policy.weights = w;
-policy.n_centers = k;
-policy.n_samples = N;
-policy.ridge = opts.ridge;
-policy.train_rmse = sqrt(mean((Phi*w - y).^2));
+centers=Z(indices,:); d=zeros(nCenters);
+for j=1:nCenters, d(:,j)=sum((centers-centers(j,:)).^2,2); end
+d(1:nCenters+1:end)=Inf;
+width=2*sqrt(median(min(d,[],2)));
+radial=exp(-max(sum(Z.^2,2)+sum(centers.^2,2)'-2*Z*centers',0)/(2*width^2));
+phi=[ones(nSamples,1),Z,radial];
+w=(phi'*phi+1e-7*nSamples*eye(size(phi,2)))\(phi'*Y);
+policy=struct('mu',mu,'sd',sd,'centers',centers,'width',width,'w',w);
 end

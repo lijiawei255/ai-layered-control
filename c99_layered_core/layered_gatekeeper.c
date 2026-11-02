@@ -9,8 +9,8 @@
  *   - the only include is the module header (which pulls in <stdint.h>);
  *   - no <math.h> / libm: |.|, clamping and the whole decision logic are hand
  *     written, no exp()/sqrt()/trig is ever needed;
- *   - no allocation, no I/O, no recursion, no loops over memory: one step is a
- *     fixed straight-line path, so the worst-case execution time is O(1);
+ *   - no allocation, no I/O, no recursion: fixed-size checks and controller
+ *     arithmetic keep the worst-case execution time O(1);
  *   - no file-static mutable state: every byte of persistence lives in
  *     LayeredState_t, so several instances can run side by side.
  *
@@ -28,9 +28,8 @@
 
 #include "layered_gatekeeper.h"
 
-/* Anything with a larger magnitude is treated as a non-finite (overflowed)
- * measurement.  FLT_MAX is ~3.4028e38, so every finite value passes.  This is
- * the "<math.h>-free isfinite()" used by the input firewall. */
+/* Magnitudes above 3e38 are rejected along with NaN/Inf. The comparison-only
+ * firewall leaves headroom below the float32 representable maximum. */
 #define LAYERED_FINITE_LIMIT 3.0e38f
 
 /* Build-time guard: the straight-line bank code below is written out for
@@ -49,6 +48,9 @@ static float lg_absf(float v)
 
 static float lg_clampf(float v, float lo, float hi)
 {
+    if (v != v) {
+        v = 0.0f;
+    }
     if (v < lo) {
         return lo;
     }
@@ -62,6 +64,29 @@ static float lg_clampf(float v, float lo, float hi)
 static int lg_is_finite(float v)
 {
     return (v >= -LAYERED_FINITE_LIMIT) && (v <= LAYERED_FINITE_LIMIT);
+}
+
+static int lg_settings_are_corrupt(const LayeredConfig_t *c, const FieldTuning_t *t)
+{
+    int i;
+    if (!lg_is_finite(c->dt_s) || !lg_is_finite(c->outer_timeout_s) ||
+        !lg_is_finite(c->max_physics_residual) || !lg_is_finite(c->residual_clear_ratio) ||
+        !lg_is_finite(c->min_ai_confidence) || !lg_is_finite(c->confidence_clear_ratio) ||
+        !lg_is_finite(c->state_safety_limit) || !lg_is_finite(c->safety_trip_ratio) ||
+        !lg_is_finite(c->safety_clear_ratio) || !lg_is_finite(c->safety_predict_s) ||
+        !lg_is_finite(c->u_max) || !lg_is_finite(c->u_slew_max_per_s) ||
+        !lg_is_finite(c->blend_alpha) || !lg_is_finite(c->integ_limit) ||
+        !lg_is_finite(c->windup_tau_s) || !lg_is_finite(t->gain_scale) ||
+        !lg_is_finite(t->damping_scale) || !lg_is_finite(t->safety_margin_scale)) {
+        return 1;
+    }
+    for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
+        if (!lg_is_finite(c->kp[i]) || !lg_is_finite(c->kd[i]) ||
+            !lg_is_finite(c->ki[i]) || !lg_is_finite(c->ff_scale[i])) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ========================================================================= */
@@ -270,12 +295,12 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
 
     /* ---------------- 0. INPUT FIREWALL -------------------------------- */
     /* Nothing below this block runs for a corrupt frame: no integrator, no
-     * latch, no blend, no dwell counter is touched.  The actuator simply
-     * stays where it is (fail-safe hold) and the sticky NAN_CORRUPTION bit
+     * latch, no blend, no dwell counter is touched. The applied command
+     * remains unchanged and the sticky NAN_CORRUPTION bit
      * records that this IPC frame must be investigated.  The recovery
      * cooldown is re-armed because a corrupt frame is not a clean sample; it
      * must never count towards "consecutive clean ticks". */
-    if (lg_frame_is_corrupt(input)) {
+    if (lg_frame_is_corrupt(input) || lg_settings_are_corrupt(config, tuning)) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_NAN_CORRUPTION;
         state->corrupted_frame_count++;
         state->recovery_ticks = config->ood_recovery_cooldown_ticks;
@@ -468,6 +493,9 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             state->u_target += config->blend_alpha * (u_active - state->u_target);
             state->blend = lg_clampf(state->blend + config->blend_alpha, 0.0f, 1.0f);
         }
+        if (state->u_target != state->u_target) {
+            state->u_target = 0.0f;
+        }
 
         /* Hard actuator limits: magnitude first, then slew rate. */
         u_cmd = lg_clampf(state->u_target, -u_max, u_max);
@@ -494,9 +522,9 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         out.u_target = state->u_target;
         out.blend = state->blend;
     } else {
-        /* GATE_HOLD_LATENCY: the actuator stands still.  Command, target,
-         * blend progress, dwell counter and every integrator are frozen so
-         * that the stale AI layer leaves no trace in the controller state. */
+        /* GATE_HOLD_LATENCY holds command, target, blend and integrators.
+         * Dwell bookkeeping still advances; the watchdog re-arms recovery.
+         * A held actuator command does not imply a held physical position. */
         out.u = state->u_applied;
         out.u_target = state->u_target;
         out.blend = state->blend;

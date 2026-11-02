@@ -1,1188 +1,374 @@
-function out = sim_core_engine(profile, opts)
-%SIM_CORE_ENGINE  Four-stage closed-loop benchmark engine for the layered
-%   AI control reference architecture.
-%
-%   OUT = SIM_CORE_ENGINE()            % industrial profile, full 40 s run
-%   OUT = SIM_CORE_ENGINE('edge_vla')
-%   OUT = SIM_CORE_ENGINE(P)           % pass a struct from LOAD_DOMAIN_PROFILE
-%   OUT = SIM_CORE_ENGINE(P, OPTS)
-%
-%   Three branches are simulated side by side on the SAME plant, the SAME
-%   reference trajectory and the SAME fault schedule so the comparison is
-%   apples to apples:
-%
-%     Branch 1 - Fixed Baseline        conservative 1 kHz PID, no adaptation.
-%     Branch 2 - End-to-End AI         high-frequency continuous policy that
-%                                      learned the inverse dynamics of the
-%                                      NOMINAL unit; inference is throttled to
-%                                      10 Hz with jitter/drops in Stage 3-4.
-%     Branch 3 - Layered (proposed)    10 Hz coarse regime classifier +
-%                                      physics residual probe + 1 kHz C99
-%                                      gatekeeper / controller bank.
-%
-%   Stage timeline (default 40 s, dt = 1 ms):
-%     Stage 1  0-10 s  nominal distribution
-%     Stage 2 10-20 s  cross-unit +35% drift and non-smooth Stribeck boundary
-%     Stage 3 20-30 s  edge compute scarcity: 10 Hz, 60-120 ms jitter, drops
-%     Stage 4 30-40 s  unseen OOD structural resonance + sensor outliers
-%
-%   OPTS fields (all optional):
-%     .t_end          simulation horizon in seconds   (default P.stage.T)
-%     .branches       1xN branches to run             (default [1 2 3])
-%     .seed           RNG seed for noise/faults       (default 7)
-%     .drift_scale    override drift magnitude, e.g. 0.35 for +35 %
-%     .drift_t_start  override drift onset time
-%     .edge_on        enable Stage 3 edge constraints (default true)
-%     .ood_on         enable Stage 4 OOD fault        (default true)
-%     .verbose        print a short stage summary     (default false)
-%
-%   The gatekeeper implemented in LOCAL_CORE_STEP is a line-by-line MATLAB mirror of
-%   c99_layered_core/layered_gatekeeper.c (same decision order, dwell timer,
-%   post-fault cooldown, per-controller anti-windup, NaN firewall and fault
-%   bitmask) so the figure-producing benchmark and the deployable C core can
-%   be reviewed against each other line by line.
-%
-%   See also LOAD_DOMAIN_PROFILE, RUN_EFFICIENCY_ANALYSIS, RUN_ALL_BENCHMARKS.
-
-% ------------------------------------------------------------------------
-% 0. Input handling
-% ------------------------------------------------------------------------
-if nargin < 1 || isempty(profile)
-    profile = 'industrial';
+function [out, diagnostics] = sim_core_engine(P, opts)
+%SIM_CORE_ENGINE Three controllers on a shared four-stage physical fixture.
+if nargin < 1, P = load_domain_profile(); end
+if ischar(P) || isstring(P), P = load_domain_profile(char(P)); end
+if nargin < 2, opts = struct(); end
+defaults = struct('branches',[1 2 3],'mode','dynamic','fixed_regime',[], ...
+    'seed',7,'drift',.35,'scenario',[],'duration',40,'substeps',2, ...
+    'ood',true,'jitter',true,'spikes',true,'bias',true,'wallphase',.4, ...
+    'noise_scale',1,'fault_f',[12 24],'zeta',.012,'wallk',300,'wallx',.43, ...
+    'tuning',[1 1 1],'ood_gate',true,'conf_gate',true,'ffsafe',0, ...
+    'auto_calibrate',true,'log_core',false,'amplitude',[],'probe_spikes',true);
+keys = fieldnames(defaults);
+for j=1:numel(keys)
+    if ~isfield(opts,keys{j}), opts.(keys{j})=defaults.(keys{j}); end
 end
-if nargin < 2 || isempty(opts)
-    opts = struct();
+if isempty(P.classifier) && opts.auto_calibrate
+    P.classifier = calibrate_coarse_classifier(P);
 end
-if ischar(profile) || (isstring(profile) && isscalar(profile))
-    P = load_domain_profile(char(profile));
-else
-    P = profile;
+if any(opts.branches==2) && isempty(P.policy)
+    P.policy = train_continuous_policy(P);
 end
-opts = local_defaults(opts, P);
-
-% Coarse-classifier prototypes are commissioned from short closed-loop
-% probes, never hard-coded.  calibrate_coarse_classifier() runs its probes
-% with auto_calibrate=false, so this call cannot recurse.
-if isfield(P.ai,'auto_calibrate') && P.ai.auto_calibrate && ...
-        (isempty(P.ai.prototypes) || size(P.ai.prototypes,1) ~= 3)
-    P = calibrate_coarse_classifier(P);
+c = make_context(P,opts);
+out = struct('context',c,'profile',P,'t',c.t,'r',c.r,'stage',c.stage, ...
+    'ref',struct('r',c.r,'rd',c.rd,'rdd',c.rdd),'b1',[],'b2',[],'b3',[]);
+for b=opts.branches
+    mode = opts.mode;
+    if b==1, mode='b1'; elseif b==2, mode='b2'; end
+    out.(sprintf('b%d',b)) = run_branch(P,c,opts,mode);
 end
-
-% Fixed seed for every stochastic term (sensor noise and the outlier schedule),
-% so the benchmark is bit-reproducible on a given MATLAB release.
-rng(opts.seed, 'twister');
-
-dt = P.dt;
-N  = round(opts.t_end/dt);
-t  = (0:N-1)'*dt;
-
-% Reference trajectory (analytic derivatives) and stage index.
-stage = local_stage_index(t, P.stage.edges);
-[r, rd, rdd] = local_ref(P, t, stage);
-
-% ------------------------------------------------------------------------
-% 1. Disturbance schedule (identical for all three branches)
-% ------------------------------------------------------------------------
-plant = local_plant_arrays(P, opts, t, stage);
-
-% Sensor noise and outliers: same realisation for every branch.  Outliers
-% belong to the Stage-4 OOD fault only.  The sensor-noise scale is
-% stage-dependent: S3 deliberately carries a strong broadband measurement
-% noise floor (the HF residual probe must not mistake it for OOD).
-rng(opts.seed + 11, 'twister');
-sigma_t = P.sensor.sigma * P.stage.noise_scale(stage);
-noise = sigma_t .* randn(N,1);
-spike = zeros(N,1);
-if opts.ood_on && opts.ood_spikes
-    i_onset = min(N, max(1, round(P.ood.t_start/dt) + 1));
-    first   = min(N, i_onset + round(P.ood.spike_first_s/dt));
-    if first >= 1 && first <= N
-        spike(first) = P.ood.spike_amp;                       % deterministic
-    end
-    mask = false(N,1);
-    mask(i_onset:end) = true;
-    rnd  = rand(N,1);
-    idx  = find(rnd < P.ood.spike_prob & mask);
-    if ~isempty(idx)
-        sgn = 2*(rand(numel(idx),1) > 0.5) - 1;
-        spike(idx) = spike(idx) + P.ood.spike_amp*sgn;
+out.config = P.cfg;
+if ~isempty(P.classifier)
+    out.config.min_ai_confidence=P.classifier.trip;
+    out.config.confidence_clear_ratio=P.classifier.clear;
+end
+M=struct('rmse',nan(3,4),'tv',nan(3,4),'violations',nan(3,4), ...
+    'peak_contact',nan(3,4),'maxabs',nan(3,4));
+for b=opts.branches
+    z=out.(sprintf('b%d',b)).log;
+    for s=unique(c.stage)'
+        q=c.stage==s;
+        M.rmse(b,s+1)=sqrt(mean((z(q,1)-c.r(q)).^2));
+        M.tv(b,s+1)=sum(abs(diff(z(q,2))));
+        M.violations(b,s+1)=sum(abs(z(q,1))>1);
+        M.peak_contact(b,s+1)=max(z(q,5));
+        M.maxabs(b,s+1)=max(abs(z(q,1)));
     end
 end
-
-% Edge-compute frame schedule: identical for Branch 2 inference and for the
-% Branch 3 coarse classifier.
-sched = local_frame_schedule(P, opts, dt, N);
-
-% OOD parasitic mode parameters.
-ood = struct('t_start', P.ood.t_start, 'wr', 2*pi*P.ood.res_hz, ...
-             'zr', P.ood.res_zeta, 'cu', P.ood.res_cu, ...
-             'cx', P.ood.res_cx, 'kq', P.ood.res_kq, ...
-             'ky', P.ood.res_ky, 'kick', P.ood.res_kick, ...
-             'on', opts.ood_on && opts.ood_resonance);
-
-% Branch 3 core configuration (mirror of the C99 config struct).
-cfg = local_core_config(P);
-
-% ------------------------------------------------------------------------
-% 2. Run the requested branches
-% ------------------------------------------------------------------------
-out = struct();
-out.opts     = opts;
-out.profile  = P;
-out.t        = t;
-out.stage    = stage;
-out.ref      = struct('r', r, 'rd', rd, 'rddot', rdd);
-out.schedule = sched;
-out.b1 = [];
-out.b2 = [];
-out.b3 = [];
-if any(opts.branches == 1)
-    out.b1 = local_run_fixed(P, t, r, rd, noise, spike, plant, ood, r(1));
+out.metrics=M;
+if nargout>1, diagnostics=physical_probes(P); end
 end
-if any(opts.branches == 2)
-    if isempty(P.b2.policy) || ~isfield(P.b2.policy, 'weights')
-        P.b2.policy = local_train_b2(P, opts);
+
+function c = make_context(P,o)
+dt=P.dt; n=round(o.duration/dt); t=(0:n-1)'*dt;
+if isempty(o.scenario), stage=min(floor(t/10),3); else, stage=repmat(o.scenario,n,1); end
+r=zeros(n,1); rd=r; rdd=r;
+for s=0:3
+    mask=stage==s; tr=t(mask);
+    if isempty(o.scenario), tr=tr-10*s; amp=.5; else, amp=.46; end
+    if ~isempty(o.amplitude), amp=o.amplitude; end
+    [r(mask),rd(mask),rdd(mask)]=reference(s,tr,amp);
+end
+drift=(stage>=1)*o.drift; p=zeros(n,5);
+p(:,1)=P.nominal.J*(1+drift); p(:,2)=P.nominal.b*(1+.3*drift);
+p(:,3)=P.nominal.k; p(:,4)=P.nominal.fc; p(:,5)=P.nominal.fs;
+p(stage==1,4)=1.2*(1+4.5*o.drift);
+p(stage==1,5)=2.5*(1+4.3*o.drift);
+ran=reshape(lcg(o.seed+11,6*n),n,6)';
+white=(ran(1,:)+ran(2,:)+ran(3,:)-1.5)'*2;
+sigma=repmat(.0015,n,1); sigma(stage==2)=.015;
+noise=white.*sigma*o.noise_scale;
+onset=30.037; wallstart=20; freqstart=30;
+if ~isempty(o.scenario), onset=.037; wallstart=0; freqstart=0; end
+fault=(stage==3)&o.ood&(t>=onset);
+sfault=double(fault)*.025*o.bias;
+spike=zeros(n,1); hit=fault&(ran(4,:)'<.004);
+sg=ones(n,1); sg(ran(5,:)'<=.5)=-1;
+spike(hit)=.18*sg(hit);
+first=find(fault,1); if ~isempty(first), spike(first)=.18; end
+if ~o.spikes, spike(:)=0; end
+ct=max(t-wallstart,0); approach=.24*exp(-ct/.25);
+wall=o.wallx+.025*sin(2*pi*.73*t+o.wallphase)+approach;
+wv=.025*2*pi*.73*cos(2*pi*.73*t+o.wallphase)-approach/.25;
+wc=double(stage==2)*o.wallk;
+emit=(0:100:n-1)'; nf=numel(emit); rn=reshape(lcg(o.seed+37,2*nf),nf,2)';
+delays=repmat(.02,nf,1); edge=(stage(emit+1)>=2)&o.jitter;
+delays(edge)=.06+.06*rn(1,edge)';
+drops=edge&(rn(2,:)'<.08); arrivals=cell(n,1);
+for i=1:nf
+    k=emit(i)+round(delays(i)/dt)+1;
+    if k<=n && ~drops(i), arrivals{k}=[arrivals{k},i]; end
+end
+freq=o.fault_f(1)+diff(o.fault_f)*min(max((t-freqstart)/10,0),1);
+c=struct('t',t,'stage',stage,'r',r,'rd',rd,'rdd',rdd,'p',p, ...
+    'noise',noise,'sfault',sfault,'spike',spike,'wall',wall,'wv',wv, ...
+    'wc',wc,'arrivals',{arrivals},'stamp',emit*dt,'fault',fault, ...
+    'freq',freq,'zeta',o.zeta,'substeps',o.substeps);
+end
+
+function a=lcg(seed,n)
+a=zeros(n,1); state=uint32(seed);
+for k=1:n
+    state=uint32(bitand(uint64(1664525)*uint64(state)+uint64(1013904223),uint64(4294967295)));
+    a(k)=(double(state)+.5)/4294967296;
+end
+end
+
+function [r,v,a]=reference(stage,t,amp)
+if stage==0
+    w=pi; r=amp*cos(w*t); v=-amp*w*sin(w*t); a=-amp*w*w*cos(w*t); return;
+end
+if stage==1, move=.9; dwell=.9; phase=.8; else, move=1.; dwell=1.5; phase=0.; end
+u=mod(t+phase,2*(move+dwell)); r=zeros(size(t)); v=r; a=r;
+r(u<dwell)=amp; r(u>=dwell+move & u<2*dwell+move)=-amp;
+for side=1:2
+    if side==1, q=u>=dwell & u<dwell+move; tau=(u(q)-dwell)/move; sg=-1;
+    else, q=u>=2*dwell+move; tau=(u(q)-2*dwell-move)/move; sg=1; end
+    pp=tau.*tau.*tau.*(10+tau.*(-15+6*tau));
+    vv=tau.*tau.*(30-60*tau+30*tau.*tau);
+    aa=tau.*(60-180*tau+120*tau.*tau);
+    r(q)=-sg*amp+sg*2*amp*pp; v(q)=sg*2*amp*vv/move; a(q)=sg*2*amp*aa/(move*move);
+end
+end
+
+function [x,v,stuck]=advance(x,v,u,p,dt,force)
+drive=u-p(2)*v-p(3)*x-force; stuck=0;
+if abs(v)<.003 && abs(drive)<=p(5), v=0.; stuck=1; return; end
+direction=v; if abs(v)<=1e-10, direction=drive; end
+f=p(4); if direction<0, f=-f; end
+vn=v+dt*(drive-f)/p(1);
+if v*vn<0 && abs(drive)<=p(5), vn=0.; end
+x=x+dt*vn; v=vn;
+end
+
+function f=friction(v,p)
+f=0.; if abs(v)>1e-10, f=sign(v)*p(4); end
+end
+
+function pr=probe_init(x)
+pr=struct('xh',x,'vh',0.,'lp',0.,'buf',[],'yf',x,'vf',0., ...
+    'me',0.,'mu',0.,'hf',0.,'sp',0.,'rough',.0017^2,'noisef',x, ...
+    'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
+    'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[]);
+end
+
+function [pr,ym,yd,res]=probe_step(pr,y,u,r,p,dt,spike_gate)
+pr.buf=[pr.buf,y]; if numel(pr.buf)>5, pr.buf=pr.buf(2:end); end
+sorted=sort(pr.buf); med=sorted(floor(numel(sorted)/2)+1);
+pr.sp=abs(y-med)/.12; ym=y; if pr.sp>1, ym=med; end
+[xp,vp]=advance(pr.xh,pr.vh,u,p,dt,0.);
+innov=ym-xp;
+pr.lp=pr.lp+dt/.10*(innov-pr.lp);
+pr.slowenergy=pr.slowenergy+dt/.35*(pr.lp*pr.lp-pr.slowenergy);
+aa=dt/(dt+1/(2*pi*25));
+pr.y1=pr.y1+aa*(med-pr.y1); pr.y2=pr.y2+aa*(pr.y1-pr.y2);
+actual=(pr.y2-2*pr.yold+pr.yolder)/(dt*dt); pr.yolder=pr.yold; pr.yold=pr.y2;
+predicted=(u-p(2)*pr.vf-p(3)*ym-friction(pr.vf,p))/p(1);
+pr.apbuf=[pr.apbuf,predicted]; if numel(pr.apbuf)>3, pr.apbuf=pr.apbuf(2:end); end
+pr.a1=pr.a1+aa*(pr.apbuf(1)-pr.a1); pr.a2=pr.a2+aa*(pr.a1-pr.a2);
+ar=actual-pr.a2; pr.alp=pr.alp+dt/(dt+1/(2*pi*5))*(ar-pr.alp);
+pr.ae=pr.ae+dt/.008*((ar-pr.alp)^2-pr.ae); pr.hf=sqrt(max(pr.ae,0))/500;
+pr.xh=xp+dt*40*innov; pr.vh=vp+dt*400*innov;
+vd=(ym-pr.yf)/.002; pr.yf=pr.yf+dt/.002*(ym-pr.yf); pr.vf=pr.vf+dt/.002*(vd-pr.vf);
+pr.noisef=pr.noisef+dt/.003*(ym-pr.noisef);
+pr.rough=pr.rough+dt/.15*((ym-pr.noisef)^2-pr.rough);
+pr.me=pr.me+dt/.25*((r-ym)^2-pr.me); pr.mu=pr.mu+dt/.25*(u*u-pr.mu);
+sp=pr.sp; if ~spike_gate, sp=0; end
+pr.veto=max([sp,pr.hf,pr.veto*(1-dt)]);
+yd=pr.vf; res=pr.veto;
+end
+
+function [reg,conf]=classify(feat,clf)
+d=sqrt(sum((clf.prototypes-feat).^2,2)); [ds,order]=sort(d);
+reg=order(1); conf=(ds(2)-ds(1))/(ds(2)+ds(1)+1e-9)*exp(-clf.gamma*ds(1));
+conf=min(max(conf,0),1);
+end
+
+function B=run_branch(P,c,o,mode)
+n=numel(c.t); dt=P.dt; nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
+x=c.r(1); v=0.; xm=x; vm=0.; wasflex=false; u0=0.; integ=0.; pr=probe_init(x);
+ctx=zeros(1,4); frames=zeros(ceil(n/100),4); last_stamp=0.; cfg=P.cfg; cfg.ff_scale(4)=o.ffsafe;
+if ~isempty(P.classifier)
+    cfg.min_ai_confidence=P.classifier.trip; cfg.confidence_clear_ratio=P.classifier.clear;
+end
+ckeys=fieldnames(cfg); for j=1:numel(ckeys), cfg.(ckeys{j})=single(cfg.(ckeys{j})); end
+tune=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
+logs=zeros(n,14); macro=zeros(ceil(n/100),5);
+age=zeros(n,1);
+CI=zeros(n,9*double(o.log_core)); CO=zeros(n,6*double(o.log_core));
+for k=1:n
+    r=c.r(k); rd=c.rd(k); rdd=c.rdd(k);
+    [pr,ym,yd,res]=probe_step(pr,x+c.noise(k)+c.sfault(k)+c.spike(k),u0,r,nom,dt,o.probe_spikes);
+    if mod(k-1,100)==0
+        mi=floor((k-1)/100)+1;
+        q=sqrt(max([pr.me,pr.mu,pr.slowenergy,pr.rough],0));
+        frames(mi,:)=q./(q+P.feature_scales).*[1,1,.5,1.4];
+        macro(mi,:)=[c.t(k),frames(mi,:)];
     end
-    out.profile = P;
-    out.b2 = local_run_e2e(P, t, r, rd, rdd, noise, spike, plant, ood, ...
-                           sched, opts, r(1), P.b2.policy);
-end
-if any(opts.branches == 3)
-    out.b3 = local_run_layered(P, t, r, rd, rdd, noise, spike, plant, ood, ...
-                               sched, opts, cfg, r(1));
-end
-
-% ------------------------------------------------------------------------
-% 3. Engineering metrics
-% ------------------------------------------------------------------------
-out.metrics = local_metrics(P, out, opts);
-out.metrics.checks = local_checks(P, out);
-
-if opts.verbose
-    local_print_summary(P, out);
-end
-end
-
-% =========================================================================
-%  OPTIONS / CONFIG
-% =========================================================================
-function opts = local_defaults(opts, P)
-if ~isfield(opts, 't_end') || isempty(opts.t_end)
-    opts.t_end = P.stage.T;
-end
-if ~isfield(opts, 'branches') || isempty(opts.branches)
-    opts.branches = [1 2 3];
-end
-if ~isfield(opts, 'seed') || isempty(opts.seed)
-    opts.seed = 7;
-end
-if ~isfield(opts, 'drift_scale')
-    opts.drift_scale = [];
-end
-if ~isfield(opts, 'drift_t_start') || isempty(opts.drift_t_start)
-    opts.drift_t_start = P.drift.t_start;
-end
-if ~isfield(opts, 'edge_on') || isempty(opts.edge_on)
-    opts.edge_on = true;
-end
-if ~isfield(opts, 'ood_on') || isempty(opts.ood_on)
-    opts.ood_on = true;
-end
-if ~isfield(opts, 'ood_spikes') || isempty(opts.ood_spikes)
-    opts.ood_spikes = true;
-end
-if ~isfield(opts, 'ood_resonance') || isempty(opts.ood_resonance)
-    opts.ood_resonance = true;
-end
-if ~isfield(opts, 'log_core') || isempty(opts.log_core)
-    opts.log_core = false;
-end
-if ~isfield(opts, 'stage_regime') || isempty(opts.stage_regime)
-    opts.stage_regime = [];       % commissioning aid: force a bank per stage
-end
-if ~isfield(opts, 'verbose') || isempty(opts.verbose)
-    opts.verbose = false;
-end
-if ~isfield(opts, 'fixed_regime') || isempty(opts.fixed_regime)
-    opts.fixed_regime = NaN;      % tuning aid: force a constant regime
-end
-% Trim the benchmark horizon if a caller asked for a shorter run.
-opts.t_end = min(opts.t_end, P.stage.T);
-end
-
-function cfg = local_core_config(P)
-%LOCAL_CORE_CONFIG  Mirror of c99_layered_core LayeredConfig_t + gains.
-cfg = struct();
-cfg.dt            = P.dt;
-cfg.timeout_s     = P.ai.outer_timeout_s;
-cfg.max_residual  = P.ai.max_residual;
-cfg.res_clear     = P.ai.residual_clear_ratio;
-cfg.min_confidence= P.ai.min_confidence;
-cfg.conf_clear    = P.ai.confidence_clear;
-cfg.x_limit       = P.safety.x_limit;
-cfg.trip_ratio    = P.safety.trip_ratio;
-cfg.clear_ratio   = P.safety.clear_ratio;
-cfg.predict_s     = P.safety.predict_s;
-cfg.u_max         = P.act.u_max;
-cfg.slew_max      = P.act.slew_max;
-cfg.blend_alpha   = P.gate.blend_alpha;
-cfg.integ_limit   = P.gate.integ_limit;
-cfg.windup_tau_s  = P.gate.windup_tau_s;
-cfg.min_dwell     = max(1, round(P.gate.min_dwell_s/P.dt));
-cfg.recovery      = max(0, round(P.gate.ood_recovery_cooldown_s/P.dt));
-cfg.kp            = P.bank.Kp(:);
-cfg.kd            = P.bank.Kd(:);
-cfg.ki            = P.bank.Ki(:);
-cfg.ff_scale      = P.bank.ff_scale(:);
-cfg.gain_scale    = 1.0;
-cfg.damping_scale = 1.0;
-cfg.safety_margin_scale = 1.0;
-end
-
-% =========================================================================
-%  SIGNALS
-% =========================================================================
-function [r, rd, rdd] = local_ref(P, t, stage)
-% Stage-aware reference.  Every stage starts and ends at r = +A, rd = 0, so
-% the pieces join continuously:
-%   S1 harmonic 0.5 Hz, 5 full periods in 10 s
-%   S2 trapezoid 0.90/0.90 with phase0 = 0.8 s (starts and ends in +A dwell)
-%   S3/S4 trapezoid 1.0/1.5, exactly two periods in 10 s
-r = zeros(size(t)); rd = r; rdd = r;
-for s = 1:numel(P.stage.edges)-1
-    idx = (stage == s);
-    if ~any(idx)
-        continue;
-    end
-    ts = t(idx) - P.stage.edges(s);
-    A  = P.ref.stage_amp(s);
-    if strcmpi(P.ref.stage_mode{s}, 'harmonic')
-        w  = 2*pi*P.ref.stage_f1_hz(s);
-        ph = P.ref.stage_phi(s);
-        r(idx)   = A*sin(w*ts + ph);
-        rd(idx)  = A*w*cos(w*ts + ph);
-        rdd(idx) = -A*w^2*sin(w*ts + ph);
-    else
-        [rs, rds, rdds] = local_trapezoid(ts, A, ...
-            P.ref.stage_dwell_s(s), P.ref.stage_move_s(s), ...
-            P.ref.stage_phase0(s));
-        r(idx) = rs; rd(idx) = rds; rdd(idx) = rdds;
-    end
-end
-end
-
-function [p, v, a] = local_quintic(tau)
-% 5th-order polynomial: zero velocity and acceleration at both ends.
-p = 10*tau.^3 - 15*tau.^4 + 6*tau.^5;
-v = 30*tau.^2 - 60*tau.^3 + 30*tau.^4;
-a = 60*tau - 180*tau.^2 + 120*tau.^3;
-end
-
-function [r, rd, rdd] = local_trapezoid(ts, A, dw, mv, phase0)
-% Quintic point-to-point moves separated by dwells, with an optional phase
-% offset so the piece can start/end in a +A dwell (used for S2).
-per = 2*(dw + mv);
-s = mod(ts + phase0, per);
-r = zeros(size(ts)); rd = r; rdd = r;
-m1 = s < dw;
-r(m1) = A;
-m2 = ~m1 & (s < dw + mv);
-tau = (s(m2) - dw)/mv;
-[p, v, a] = local_quintic(tau);
-r(m2)   = A - 2*A*p;
-rd(m2)  = -2*A*v/mv;
-rdd(m2) = -2*A*a/mv^2;
-m3 = ~m1 & ~m2 & (s < 2*dw + mv);
-r(m3) = -A;
-m4 = ~(m1 | m2 | m3);
-tau = (s(m4) - (2*dw + mv))/mv;
-[p, v, a] = local_quintic(tau);
-r(m4)   = -A + 2*A*p;
-rd(m4)  = 2*A*v/mv;
-rdd(m4) = 2*A*a/mv^2;
-end
-
-function stage = local_stage_index(t, edges)
-stage = zeros(size(t));
-for s = 1:numel(edges)-1
-    stage(t >= edges(s) & t < edges(s+1)) = s;
-end
-stage(t >= edges(end)) = numel(edges) - 1;
-end
-
-function F = local_friction(v, fc, fs, vs, fvisc)
-% Non-smooth Stribeck friction, evaluated with a very sharp smooth sign so
-% the model stays continuous but behaves like a real stiction boundary.
-veps = max(vs*0.02, 1e-9);
-sg   = tanh(v/veps);
-F    = fvisc*v + fc*sg + (fs - fc)*exp(-abs(v)/vs)*sg;
-end
-
-function plant = local_plant_arrays(P, opts, t, stage)
-% Local uncalibrated drift: the machine/patient is swapped at t_start and the
-% parameters settle to the drifted values over ramp_s seconds.  The per-stage
-% friction/k scales are applied first (S1 light load, S3 contact/rebound).
-sc = zeros(size(t));
-if P.drift.ramp_s <= 0
-    sc(t >= opts.drift_t_start) = 1;
-else
-    f = (t - opts.drift_t_start)/P.drift.ramp_s;
-    f = min(max(f, 0), 1);
-    sc = 0.5 - 0.5*cos(pi*f);      % smooth cosine redeployment ramp
-end
-if isempty(opts.drift_scale)
-    amp = 1.0;
-else
-    amp = opts.drift_scale/max(P.drift.J - 1, 1e-6);
-end
-dr = @(factor) 1 + (factor - 1)*amp.*sc;
-fric_s = P.stage.friction_scale(stage)';
-k_s    = P.stage.k_scale(stage)';
-plant.J    = P.plant.J*dr(P.drift.J);
-plant.b    = P.plant.b*dr(P.drift.b);
-plant.k    = P.plant.k*dr(P.drift.k).*k_s;
-plant.fc   = P.plant.fc*dr(P.drift.fc).*fric_s;
-plant.fs   = P.plant.fs*dr(P.drift.fs).*fric_s;
-plant.vs   = P.plant.vs*max(1 + (P.drift.vs - 1)*amp*sc, 0.05);
-plant.fvisc= P.plant.fvisc*dr(P.drift.fvisc).*fric_s;
-plant.load = P.stage.load_torque(stage)';
-end
-
-function sched = local_frame_schedule(P, opts, dt, N)
-% 10 Hz slow-loop / edge-inference frame schedule.
-n_frame = floor(opts.t_end/P.ai.outer_dt) + 1;
-t_emit  = (0:n_frame-1)'*P.ai.outer_dt;
-rng(opts.seed + 37, 'twister');
-lat  = 0.020*ones(n_frame,1);
-drop = false(n_frame,1);
-if opts.edge_on
-    after = t_emit >= P.edge.t_start;
-    n_after = nnz(after);
-    if n_after > 0
-        lat(after)  = P.edge.base_latency_s + ...
-                      P.edge.jitter_s*rand(n_after,1);
-        drop(after) = rand(n_after,1) < P.edge.drop_prob;
-    end
-end
-emit_idx = min(N, max(1, round(t_emit/dt) + 1));
-arr_idx  = min(N, max(1, round((t_emit + lat)/dt) + 1));
-arr_idx(drop) = 0;
-
-% index look-up tables: sample -> frame id (0 = none)
-emit_map = zeros(N,1);
-arr_map  = zeros(N,1);
-for m = 1:n_frame
-    if emit_idx(m) >= 1 && emit_idx(m) <= N
-        if emit_map(emit_idx(m)) == 0
-            emit_map(emit_idx(m)) = m;
+    for mi=c.arrivals{k}
+        if c.stamp(mi)>=last_stamp
+            last_stamp=c.stamp(mi); ctx=frames(mi,:);
+            if ~isempty(P.classifier), [ai,conf]=classify(ctx,P.classifier); end
         end
     end
-    if arr_idx(m) >= 1 && arr_idx(m) <= N
-        if arr_map(arr_idx(m)) == 0
-            arr_map(arr_idx(m)) = m;
+    age(k)=c.t(k)-last_stamp;
+    e=r-ym; ed=rd-yd;
+    uff=nom(1)*rdd+nom(2)*rd+nom(3)*r+friction(rd,nom);
+    gate=0; reg=0;
+    if strcmp(mode,'b2')
+        feat=[e/.1,ed,r/.5,rd/2,rdd/6,ctx];
+        z=(feat-P.policy.mu)./P.policy.sd;
+        phi=exp(-sum((P.policy.centers-z).^2,2)/(2*P.policy.width^2));
+        raw=P.policy.w(1)+z*P.policy.w(2:10)+phi'*P.policy.w(11:end); calls=calls+1;
+        u=clamp(clamp(raw,-20,20),u0-2,u0+2);
+    elseif strcmp(mode,'b1')
+        kp=P.baseline(1); kd=P.baseline(2); ki=P.baseline(3);
+        raw=kp*e+kd*ed+ki*integ+uff;
+        u=clamp(clamp(raw,-20,20),u0-2,u0+2);
+        if ki~=0, integ=clamp(integ+dt*e+(u-raw)*dt/(ki*.1),-.5,.5); end
+    else
+        if ~isempty(o.fixed_regime), ai=o.fixed_regime; conf=1.; end
+        if strcmp(mode,'rules')
+            if ctx(4)>.65, ai=3; elseif ctx(3)>.25 || ctx(2)>.55, ai=2; else, ai=1; end
+            conf=1.;
         end
+        ci=conf; if ~o.conf_gate, ci=1.; end
+        mai=ai; if age(k)>P.cfg.outer_timeout_s, mai=4; ci=0.; end
+        residual=res; if ~o.ood_gate, residual=0.; end
+        input=single([mai,ci,age(k),residual,ym,yd,r,rd,uff]);
+        [core,result]=core_step(core,cfg,tune,input);
+        u=result(1); gate=result(3); reg=result(4);
+        if o.log_core, CI(k,:)=double(input); CO(k,:)=double(result); end
     end
-end
-sched = struct('t_emit', t_emit, 'latency', lat, 'dropped', drop, ...
-               'emit_idx', emit_idx, 'arr_idx', arr_idx, ...
-               'emit_map', emit_map, 'arr_map', arr_map, ...
-               'n_frame', n_frame);
-end
-
-% =========================================================================
-%  BRANCH 1 -- conservative fixed PID (no adaptation, no fault detection)
-% =========================================================================
-function B = local_run_fixed(P, t, r, rd, noise, spike, plant, ood, x0)
-N  = numel(t); dt = P.dt;
-x = x0; xd = 0; q = 0; qd = 0;
-u_app = 0; y_prev = 0; yf = x0; ydf = 0; integ = 0;
-
-Kp = P.b1.Kp; Kd = P.b1.Kd; Ki = P.b1.Ki;
-u_max = P.act.u_max; dslew = P.act.slew_max*dt;
-tau_d = P.sensor.deriv_tau_s;
-wind  = P.gate.windup_tau_s; ilim = P.gate.integ_limit;
-
-X = zeros(N,1); XD = zeros(N,1); U = zeros(N,1); Y = zeros(N,1);
-for k = 1:N
-    y = x + noise(k) + spike(k) + ood.ky*q;
-
-    % filtered derivative ("dirty derivative"): unity DC gain, no 1/dt noise
-    % amplification.
-    ydf = (y - yf)/tau_d;
-    yf  = yf + (dt/tau_d)*(y - yf);
-
-    e  = r(k)  - y;
-    ed = rd(k) - ydf;
-    u_raw = Kp*e + Kd*ed + Ki*integ;
-
-    % tracking anti-windup
-    if Ki > 0
-        integ = integ + dt*e + (u_app - u_raw)*dt/(Ki*wind);
-        integ = min(max(integ, -ilim), ilim);
-    end
-
-    u = min(max(u_raw, -u_max), u_max);
-    du = min(max(u - u_app, -dslew), dslew);
-    u = u_app + du;
-
-    [d_ood, q, qd] = local_ood_step(ood, t(k), q, qd, u, x, dt);
-    F = local_friction(xd, plant.fc(k), plant.fs(k), plant.vs(k), plant.fvisc(k));
-    acc = (u - plant.b(k)*xd - plant.k(k)*x - F + d_ood - plant.load(k))/plant.J(k);
-    xd = xd + dt*acc;
-    x  = x  + dt*xd;
-
-    X(k) = x; XD(k) = xd; U(k) = u; Y(k) = y;
-    u_app = u;
-end
-B = struct('name', 'Fixed baseline', 'x', X, 'xd', XD, 'u', U, 'y', Y, ...
-           'gate', nan(N,1), 'regime', nan(N,1), 'res_fast', nan(N,1), ...
-           'res_slow', nan(N,1), 'ai_conf', nan(N,1), 'faults', uint32(0));
-end
-
-% =========================================================================
-%  BRANCH 2 -- end-to-end continuous AI policy (overfitted inverse dynamics)
-% =========================================================================
-function B = local_run_e2e(P, t, r, rd, rdd, noise, spike, plant, ood, ...
-                           sched, opts, x0, policy)
-N  = numel(t); dt = P.dt;
-x = x0; xd = 0; q = 0; qd = 0;
-u_app = 0; y_prev = 0; yf = x0; ydf = 0;
-
-u_max = P.act.u_max; dslew = P.act.slew_max*dt;
-tau_d = P.sensor.deriv_tau_s;
-stab  = P.b2.stabilizer;
-Kp = P.b2.Kp; Kd = P.b2.Kd;
-
-X = zeros(N,1); XD = zeros(N,1); U = zeros(N,1); Y = zeros(N,1);
-u_hold = 0;
-frame_u = nan(sched.n_frame,1);
-edge_on = opts.edge_on;
-t_edge  = P.edge.t_start;
-
-for k = 1:N
-    tk = t(k);
-    y = x + noise(k) + spike(k) + ood.ky*q;
-    ydf = (y - yf)/tau_d;
-    yf  = yf + (dt/tau_d)*(y - yf);
-
-    e  = r(k)  - y;
-    ed = rd(k) - ydf;
-
-    if (~edge_on) || (tk < t_edge)
-        % 1 kHz deployment of the trained continuous policy.
-        u_pol = local_policy_eval(policy, e, ed, r(k), rd(k), rdd(k));
-        u_cmd = u_pol + stab*(Kp*e + Kd*ed);
-        u_hold = u_cmd;
-    else
-        % edge deployment: inference at 10 Hz, transport delay, frame drops.
-        m_emit = sched.emit_map(k);
-        if m_emit > 0 && sched.t_emit(m_emit) >= t_edge && sched.arr_idx(m_emit) > 0
-            u_pol = local_policy_eval(policy, e, ed, r(k), rd(k), rdd(k));
-            frame_u(m_emit) = u_pol + stab*(Kp*e + Kd*ed);
-        end
-        m_arr = sched.arr_map(k);
-        if m_arr > 0 && ~isnan(frame_u(m_arr))
-            u_hold = frame_u(m_arr);
-        end
-        u_cmd = u_hold;
-    end
-
-    u = min(max(u_cmd, -u_max), u_max);
-    du = min(max(u - u_app, -dslew), dslew);
-    u = u_app + du;
-
-    [d_ood, q, qd] = local_ood_step(ood, tk, q, qd, u, x, dt);
-    F = local_friction(xd, plant.fc(k), plant.fs(k), plant.vs(k), plant.fvisc(k));
-    acc = (u - plant.b(k)*xd - plant.k(k)*x - F + d_ood - plant.load(k))/plant.J(k);
-    xd = xd + dt*acc;
-    x  = x  + dt*xd;
-
-    X(k) = x; XD(k) = xd; U(k) = u; Y(k) = y;
-    u_app = u;
-end
-B = struct('name', 'End-to-end AI', 'x', X, 'xd', XD, 'u', U, 'y', Y, ...
-           'gate', nan(N,1), 'regime', nan(N,1), 'res_fast', nan(N,1), ...
-           'res_slow', nan(N,1), 'ai_conf', nan(N,1), 'faults', uint32(0));
-end
-
-% =========================================================================
-%  BRANCH 2 training: closed-form RBF fitted to a nominal teacher rollout
-% =========================================================================
-function policy = local_train_b2(P, opts)
-cfg = P.b2.policy_cfg;
-dt = P.dt;
-N = max(64, round(cfg.data_s/dt));
-t = (0:N-1)'*dt;
-w1 = 2*pi*0.35; w2 = 2*pi*0.85;
-A1 = 0.30; A2 = 0.12;
-r   = A1*sin(w1*t) + A2*sin(w2*t + 0.5);
-rd  = A1*w1*cos(w1*t) + A2*w2*cos(w2*t + 0.5);
-rdd = -A1*w1^2*sin(w1*t) - A2*w2^2*sin(w2*t + 0.5);
-
-m  = P.b2.model;
-Kp = P.b2.Kp;
-Kd = P.b2.Kd;
-x = r(1); xd = 0;
-X = zeros(N,5); Y = zeros(N,1);
-for k = 1:N
-    e  = r(k) - x;
-    ed = rd(k) - xd;
-    u_ff = m.J*rdd(k) + m.b*rd(k) + m.k*r(k) + ...
-           local_friction(rd(k), m.fc, m.fs, m.vs, m.fvisc);
-    u = u_ff + Kp*e + Kd*ed;
-    X(k,:) = [e, ed, r(k), rd(k), rdd(k)];
-    Y(k) = u_ff;
-    F = local_friction(xd, P.plant.fc, P.plant.fs, P.plant.vs, P.plant.fvisc);
-    acc = (u - P.plant.b*xd - P.plant.k*x - F)/P.plant.J;
-    xd = xd + dt*acc;
-    x  = x  + dt*xd;
-end
-keep = t >= 0.2;
-policy = train_continuous_policy(X(keep,:), Y(keep), ...
-    struct('n_centers', cfg.n_centers, 'ridge', cfg.ridge, 'seed', cfg.seed));
-policy.teacher = 'nominal computed-torque + PD';
-policy.data_s = cfg.data_s;
-end
-
-function u = local_policy_eval(policy, e, ed, r, rd, rdd)
-z = ([e ed r rd rdd] - policy.mu)./policy.sig;
-d2 = sum((z - policy.centers).^2, 2);
-phi = exp(-0.5*d2/(policy.width^2));
-u = phi'*policy.weights;
-end
-
-% =========================================================================
-%  BRANCH 3 -- proposed layered architecture
-% =========================================================================
-function B = local_run_layered(P, t, r, rd, rdd, noise, spike, plant, ood, ...
-                               sched, opts, cfg, x0)
-N  = numel(t); dt = P.dt;
-x = x0; xd = 0; q = 0; qd = 0;
-u_app = 0; y_prev = 0;
-yf = x0; ydf = 0;
-stg = local_stage_index(t, P.stage.edges);
-
-% nominal observer (frozen nominal model, deployment-time)
-m = P.b2.model;
-L1 = P.observer.L1; L2 = P.observer.L2;
-xhat = x0; xdhat = 0;
-
-% residual probe: three orthogonal channels
-%   slow   : LP(innovation) for the classifier's drift feature
-%   fast   : median-5 deviation for sensor spikes (broadband, single sample)
-%   hf     : narrowband energy around the known parasitic mode for resonance
-tau_lp = P.ai.lp_tau_s;
-lp = 0;
-res_fast = 0; res_slow = 0; res_hf = 0;
-guard = false;
-
-% median-5 buffer for the spike channel
-ybuf = nan(5,1); yptr = 1;
-% 2nd-order narrowband resonator at the profile's OOD resonance frequency
-w0 = 2*pi*P.ood.res_hz;
-bw = P.ood.res_hf_bw_hz;
-rr = exp(-pi*bw*dt);
-a1 = 2*rr*cos(w0*dt);
-a2 = -rr^2;
-b0 = 1 - rr;
-bp1 = 0; bp2 = 0;
-ms_hf = 0;
-hf_run = 0;
-tau_hf = P.ood.res_hf_window_s;
-
-% slow-loop feature EMAs (warm started from the nominal operating point)
-tau_w  = P.ai.window_tau_s;
-tau_v  = P.ai.window_tau_v_s;
-ms_e  = (0.02*P.ref.amp)^2;
-ms_u  = (0.10*P.act.u_max)^2;
-ms_v  = (0.35*P.ref.v_scale)^2;
-fsc   = P.ai.feature_scales;
-proto = P.ai.prototypes;
-gamma = P.ai.confidence_gamma;
-
-% slow-loop mailbox
-ai_regime = 1; ai_conf = 0.95; last_arrival = 0;
-frame_regime = nan(sched.n_frame,1);
-frame_conf   = nan(sched.n_frame,1);
-frame_feat   = nan(sched.n_frame,4);
-
-core = local_core_init(P, cfg);
-
-X = zeros(N,1); XD = zeros(N,1); U = zeros(N,1); Y = zeros(N,1);
-GA = zeros(N,1); RG = zeros(N,1); RF = zeros(N,1); RS = zeros(N,1);
-RH = zeros(N,1); CF = zeros(N,1); AG = zeros(N,1);
-RC = zeros(N,1); DW = zeros(N,1);
-if opts.log_core
-    CI = zeros(N,9); CO = zeros(N,6);
-else
-    CI = []; CO = [];
-end
-
-for k = 1:N
-    tk = t(k);
-    y = x + noise(k) + spike(k) + ood.ky*q;
-
-    % ---- orthogonal residual probe -------------------------------------
-    inov = y - xhat;
-    lp = lp + (dt/tau_lp)*(inov - lp);
-    res_slow = abs(lp)/P.ai.res_slow_scale;
-
-    % Spike channel: median-5 deviation of the raw measurement.  A single
-    % sensor outlier is removed by the median; broadband measurement noise
-    % (S3) does not produce a large deviation.
-    ybuf(yptr) = y;
-    yptr = mod(yptr, 5) + 1;
-    ymed = median(ybuf(~isnan(ybuf)));
-    res_fast = abs(y - ymed)/P.ai.res_fast_scale;
-
-    % Resonance channel: narrowband energy at the profile's OOD mode.
-    % A 2nd-order resonator rejects the broadband S3 noise floor, while the
-    % 42 Hz structural mode passes; two consecutive above-threshold ticks are
-    % required before it is passed to the gate.
-    yb = a1*bp1 + a2*bp2 + b0*inov;
-    bp2 = bp1; bp1 = yb;
-    ms_hf = ms_hf + (dt/tau_hf)*(yb^2 - ms_hf);
-    res_hf = sqrt(ms_hf)/P.ai.res_hf_scale;
-    if res_hf > cfg.max_residual
-        hf_run = hf_run + 1;
-    else
-        hf_run = 0;
-    end
-    if hf_run >= 2
-        res_hf_gated = res_hf;
-    else
-        res_hf_gated = 0;
-    end
-    residual = max(res_fast, res_hf_gated);
-
-    % ---- nominal observer ---------------------------------------------
-    xhat  = xhat  + dt*(xdhat + L1*inov);
-    xdhat = xdhat + dt*((u_app - m.b*xdhat - m.k*xhat - ...
-                         local_friction(xdhat, m.fc, m.fs, m.vs, m.fvisc))/m.J ...
-                        + L2*inov);
-
-    % Sensor-fault hardening only for the broadband spike channel; the
-    % narrowband resonance channel is an abstention signal, not a reason to
-    % replace the measurement with the slow observer.
-    guard = res_fast > 0.5*cfg.max_residual;
-    if guard
-        y_pos = xhat;
-        y_tmp = xhat;
-        ydf   = xdhat;
-        yf    = xhat;
-    else
-        ydf   = (y - yf)/P.sensor.deriv_tau_s;      % dirty derivative
-        yf    = yf + (dt/P.sensor.deriv_tau_s)*(y - yf);
-        y_pos = y;
-        y_tmp = y;
-    end
-    y_prev = y_tmp;
-
-    % ---- macro features for the coarse classifier ----------------------
-    e3 = r(k) - y_pos;
-    ms_e = ms_e + (dt/tau_w)*(e3^2 - ms_e);
-    ms_u = ms_u + (dt/tau_w)*(u_app^2 - ms_u);
-    ms_v = ms_v + (dt/tau_v)*(ydf^2 - ms_v);
-
-    % ---- slow-loop frames: emit (classify) / arrive (mailbox) -----------
-    m_emit = sched.emit_map(k);
-    if m_emit > 0
-        feat = [sqrt(ms_e)/fsc(1), sqrt(ms_u)/fsc(2), ...
-                max(res_slow,res_hf)/fsc(3), sqrt(ms_v)/fsc(4)];
-        [reg, conf] = local_classify(feat, proto, gamma);
-        frame_regime(m_emit) = reg;
-        frame_conf(m_emit)   = conf;
-        frame_feat(m_emit,:) = feat;
-    end
-    m_arr = sched.arr_map(k);
-    if m_arr > 0 && ~isnan(frame_regime(m_arr))
-        ai_regime  = frame_regime(m_arr);
-        ai_conf    = min(max(frame_conf(m_arr), 0), 1);
-        last_arrival = tk;
-    end
-    if ~isnan(opts.fixed_regime)
-        ai_regime = opts.fixed_regime;
-        ai_conf   = 1.0;
-    end
-    if ~isempty(opts.stage_regime)
-        ai_regime = opts.stage_regime(stg(k));
-        ai_conf   = 1.0;
-    end
-    % The HF resonance/noise probe is an independent physics sensor for the
-    % contact/high-frequency regime.  When it is elevated but the spike
-    % channel is quiet, select the compliant bank 3.  This is deliberately
-    % orthogonal to the 10 Hz classifier: the classifier still supplies the
-    % nominal/heavy-load partition, while the residual probe catches the
-    % high-frequency condition the macro-features can miss.
-    if isnan(opts.fixed_regime) && isempty(opts.stage_regime) && ...
-            res_hf > 0.42 && res_fast < 0.5
-        ai_regime = 3;
-        ai_conf = max(ai_conf, 0.5);
-    elseif isnan(opts.fixed_regime) && isempty(opts.stage_regime) && ...
-            ai_regime == 3 && res_hf < 0.42 && stg(k) <= 2
-        % A class-3 call without HF support is a low-frequency load call,
-        % not a contact/rebound call: use the damped heavy-load bank.
-        ai_regime = 2;
-        ai_conf = max(ai_conf, 0.3);
-    end
-    age = tk - last_arrival;       % watchdog starts at system start, not at
-                                   % the first valid classifier frame
-
-    % ---- 1 kHz deterministic core --------------------------------------
-    % White-box feedforward from the commissioning model: the plant-inverse
-    % term is NEVER produced by the AI, it is part of the deterministic core.
-    if P.b3.ff_weight ~= 0
-        u_ff = P.b3.ff_weight*(m.J*rdd(k) + m.b*rd(k) + m.k*r(k) + ...
-               local_friction(rd(k), m.fc, m.fs, m.vs, m.fvisc));
-    else
-        u_ff = 0;
-    end
-    in = struct('ai_regime', ai_regime, 'confidence', ai_conf, ...
-                'age', age, 'residual', residual, ...
-                'x', y_pos, 'xd', ydf, 'r', r(k), 'rd', rd(k), ...
-                'u_ff', u_ff);
-    if opts.log_core
-        CI(k,:) = [in.ai_regime, in.confidence, in.age, in.residual, ...
-                   in.x, in.xd, in.r, in.rd, in.u_ff];
-    end
-    [core, u, gate, regime] = local_core_step(core, cfg, in);
-    if opts.log_core
-        CO(k,:) = [u, core.u_target, gate, regime, core.blend, ...
-                   double(core.fault_bits)];
-    end
-
-    % ---- plant ---------------------------------------------------------
-    [d_ood, q, qd] = local_ood_step(ood, tk, q, qd, u, x, dt);
-    F = local_friction(xd, plant.fc(k), plant.fs(k), plant.vs(k), plant.fvisc(k));
-    acc = (u - plant.b(k)*xd - plant.k(k)*x - F + d_ood - plant.load(k))/plant.J(k);
-    xd = xd + dt*acc;
-    x  = x  + dt*xd;
-
-    X(k) = x; XD(k) = xd; U(k) = u; Y(k) = y;
-    GA(k) = gate; RG(k) = regime; RF(k) = res_fast; RS(k) = res_slow;
-    RH(k) = res_hf; CF(k) = ai_conf; AG(k) = age;
-    RC(k) = core.recovery_ticks; DW(k) = core.dwell_ticks;
-    u_app = u;
-end
-
-B = struct('name', 'Layered AI', 'x', X, 'xd', XD, 'u', U, 'y', Y, ...
-           'gate', GA, 'regime', RG, 'res_fast', RF, 'res_slow', RS, ...
-           'res_hf', RH, 'ai_conf', CF, 'faults', core.fault_bits, ...
-           'core_counters', core.counters, ...
-           'age', AG, 'recovery_ticks', RC, 'dwell_ticks', DW, ...
-           'frame_regime', frame_regime, 'frame_conf', frame_conf, ...
-           'frame_feat', frame_feat, 'core_in', CI, 'core_out', CO);
-end
-
-% =========================================================================
-%  1 kHz CORE -- MATLAB mirror of layered_gatekeeper.c
-% =========================================================================
-function core = local_core_init(P, cfg)
-core = struct();
-core.u_applied = 0;
-core.u_target  = 0;
-core.integ     = zeros(4,1);
-core.blend     = 0;
-core.control_started = false;
-core.regime    = 1;              % REGIME_NOMINAL
-core.gate      = 0;              % GATE_NORMAL
-core.ood_latched    = false;
-core.safety_latched = false;
-core.conf_latched   = false;
-core.dwell_ticks    = 0;
-core.recovery_ticks = 0;
-core.fault_bits     = uint32(0);
-core.counters = struct('safety', 0, 'ood', 0, 'conf', 0, 'latency', 0, ...
-                       'corrupted', 0, 'steps', 0);
-end
-
-function [core, u, gate, regime] = local_core_step(core, cfg, in)
-% Straight port of Layered_Step() from c99_layered_core/layered_gatekeeper.c.
-% The decision order, the coalesced cooldown, the first-clean-step snap and
-% the exact dwell counter are kept in lockstep with the C core; the
-% verify_core_equivalence script replays a closed-loop trace through both.
-
-FAULT_LATENCY = uint32(1);   % 1u<<0
-FAULT_OOD     = uint32(2);   % 1u<<1
-FAULT_CONF    = uint32(4);   % 1u<<2
-FAULT_ENVELOPE= uint32(8);   % 1u<<3
-FAULT_NAN     = uint32(16);  % 1u<<4
-
-u = core.u_applied; gate = core.gate; regime = core.regime;
-core.counters.steps = core.counters.steps + 1;
-
-% ---- 0. INPUT FIREWALL (before touching any controller state) -----------
-vals = [in.ai_regime, in.confidence, in.age, in.residual, in.x, in.xd, ...
-        in.r, in.rd, in.u_ff];
-bad = any(~isfinite(vals)) || in.ai_regime < 1 || in.ai_regime > 4 || ...
-      in.confidence < 0 || in.confidence > 1 || in.age < 0 || in.residual < 0;
-if bad
-    core.fault_bits = bitor(core.fault_bits, FAULT_NAN);
-    core.counters.corrupted = core.counters.corrupted + 1;
-    core.recovery_ticks = cfg.recovery;   % corrupt frame is not clean
-    core.gate = 1;                        % GATE_HOLD_LATENCY: fail-safe hold
-    gate = 1;
-    return;                               % integrators NOT updated
-end
-
-snap = ~core.control_started;
-conf_before = core.conf_latched;
-old_regime = core.regime;
-
-u_max = abs(cfg.u_max);
-integ_limit = abs(cfg.integ_limit);
-dt = abs(cfg.dt);
-du_max = abs(cfg.slew_max)*dt;
-
-% ---- 1. hard safety envelope -------------------------------------------
-limit_eff = abs(cfg.x_limit*cfg.safety_margin_scale);
-x_abs = abs(in.x);
-xdot_abs = abs(in.xd);
-pred = x_abs + abs(cfg.predict_s)*xdot_abs;
-if core.safety_latched
-    clear_level = cfg.clear_ratio*limit_eff;
-    % Sticky until BOTH the measurement and the prediction recede.
-    if x_abs < clear_level && pred < clear_level
-        core.safety_latched = false;
-    end
-elseif x_abs > cfg.trip_ratio*limit_eff || pred > limit_eff
-    core.safety_latched = true;
-    core.counters.safety = core.counters.safety + 1;
-    core.fault_bits = bitor(core.fault_bits, FAULT_ENVELOPE);
-end
-
-% ---- 2. physics-residual (OOD) veto ------------------------------------
-residual_abs = abs(in.residual);
-if core.ood_latched
-    if residual_abs < cfg.res_clear*cfg.max_residual
-        core.ood_latched = false;
-    end
-elseif residual_abs > cfg.max_residual
-    core.ood_latched = true;
-    core.counters.ood = core.counters.ood + 1;
-    core.fault_bits = bitor(core.fault_bits, FAULT_OOD);
-end
-
-% ---- 3. confidence / explicit abstention --------------------------------
-abstain = (in.ai_regime >= 3.5);   % same threshold mapping as the C core
-if in.confidence < cfg.min_confidence || abstain
-    core.conf_latched = true;
-    core.fault_bits = bitor(core.fault_bits, FAULT_CONF);
-elseif in.confidence >= cfg.conf_clear && ~abstain
-    core.conf_latched = false;
-end
-conf_veto = core.conf_latched;
-if conf_veto && ~conf_before
-    core.counters.conf = core.counters.conf + 1;
-end
-
-% ---- 4. heartbeat watchdog ---------------------------------------------
-stale = in.age > cfg.timeout_s;
-if stale
-    core.fault_bits = bitor(core.fault_bits, FAULT_LATENCY);
-    core.recovery_ticks = cfg.recovery;   % stale frame is not clean
-    if (in.age - cfg.timeout_s) <= dt
-        core.counters.latency = core.counters.latency + 1;
-    end
-end
-
-% ---- 5. decision priority ----------------------------------------------
-veto_active = core.safety_latched || core.ood_latched || conf_veto;
-if core.safety_latched
-    gate = 4;
-elseif core.ood_latched
-    gate = 2;
-elseif conf_veto
-    gate = 3;
-elseif stale
-    gate = 1;
-else
-    gate = 0;
-end
-if veto_active
-    core.recovery_ticks = cfg.recovery;
-end
-
-% ---- 6. cooldown + anti-chatter dwell ----------------------------------
-if gate == 0
-    if core.recovery_ticks > 0
-        core.recovery_ticks = core.recovery_ticks - 1;
-        target = 4;                       % REGIME_SAFE_FALLBACK
-    else
-        cand = local_mailbox_regime(in.ai_regime);
-        if cand == core.regime
-            target = core.regime;
-        elseif (core.dwell_ticks + 1) >= cfg.min_dwell
-            target = cand;
+    sx=x; sxm=xm; p=c.p(k,:); peak=0.; stuck=0;
+    if c.fault(k) && ~wasflex, xm=x; vm=v; wasflex=true; end
+    for j=1:c.substeps
+        h=dt/c.substeps; delta=x-c.wall(k); contact=0.;
+        if delta>0 && c.wc(k)>0, contact=max(0,c.wc(k)*delta+.8*(v-c.wv(k))); end
+        peak=max(peak,contact/.25);
+        if c.fault(k)
+            [x,v,xm,vm,stuck]=flex_advance(x,v,xm,vm,u,p,h,c.freq(k),c.zeta,contact);
         else
-            target = core.regime;         % anti-chatter: keep current
+            [x,v,stuck]=advance(x,v,u,p,h,contact);
         end
     end
-elseif gate == 1
-    target = core.regime;                 % hold: keep the last bank
-else
-    target = 4;
+    logs(k,:)=[sx,u,gate,reg,peak,stuck,res,conf,pr.hf,ai,ym,sxm,yd,integ]; u0=u;
+end
+B=struct('log',logs,'macro',macro,'calls',calls,'core_in',CI,'core_out',CO, ...
+    'age',age, ...
+    'x',logs(:,1),'u',logs(:,2),'gate',logs(:,3),'regime',logs(:,4), ...
+    'residual',logs(:,7),'confidence',logs(:,8),'contact_force',logs(:,5));
 end
 
-% ---- 7. controller bank + bumpless transfer + clamps -------------------
-do_control = (gate ~= 1);
-if do_control
-    e  = in.r  - in.x;
-    ed = in.rd - in.xd;
-    kp = cfg.kp*cfg.gain_scale;
-    kd = cfg.kd*cfg.damping_scale;
-    ki = cfg.ki*cfg.gain_scale;
-    u_pid = kp*e + kd*ed + ki.*core.integ + cfg.ff_scale*in.u_ff;
-    u_active = u_pid(target);
-    alpha = cfg.blend_alpha;
-    if snap
-        core.u_target = u_active;
-        core.blend = 1.0;
+function [x,v,xm,vm,stuck]=flex_advance(x,v,xm,vm,u,p,dt,freq,zeta,contact)
+jm=p(1)*.2; jl=p(1)*.8; reduced=jm*jl/(jm+jl); w=2*pi*freq;
+kc=reduced*w*w; dc=2*zeta*w*reduced; spring=kc*(xm-x)+dc*(vm-v);
+vm=vm+dt*(u-.1*vm-spring)/jm; xm=xm+dt*vm;
+pl=p; pl(1)=jl; [x,v,stuck]=advance(x,v,spring,pl,dt,contact);
+end
+
+function D=physical_probes(P)
+nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
+sequence=lcg(18,1000); D.lcg_last=sequence(end);
+D.sensor_hz=[12 18 37 83 137]; D.sensor_detect_ms=nan(1,5);
+for j=1:5
+    pr=probe_init(0);
+    for k=1:200, pr=probe_step(pr,0,0,0,nom,P.dt,false); end
+    for k=0:999
+        y=.2*sin(2*pi*D.sensor_hz(j)*k*P.dt);
+        [pr,~,~,res]=probe_step(pr,y,0,0,nom,P.dt,false);
+        if res>1, D.sensor_detect_ms(j)=1000*k*P.dt; break; end
+    end
+end
+D.free_hz=[12 18 24]; D.free_energy_ratio=zeros(1,3); D.free_peak_ratio=zeros(1,3);
+p=nom; p(1)=p(1)*1.35; p(2)=p(2)*(1+.3*.35); h=P.dt/2;
+jm=.2*p(1); jl=.8*p(1); reduced=jm*jl/(jm+jl);
+for j=1:3
+    freq=D.free_hz(j); kc=reduced*(2*pi*freq)^2;
+    x=0; v=0; xm=.05; vm=0; initial=.5*kc*xm^2; peak=initial;
+    for k=1:6000
+        [x,v,xm,vm]=flex_advance(x,v,xm,vm,0,p,h,freq,.012,0);
+        energy=.5*(jm*vm^2+jl*v^2+kc*(xm-x)^2+p(3)*x^2);
+        peak=max(peak,energy);
+    end
+    D.free_energy_ratio(j)=energy/initial; D.free_peak_ratio(j)=peak/initial;
+end
+end
+
+function st=core_init()
+st=struct('u_applied',single(0),'u_target',single(0),'integ',zeros(4,1,'single'), ...
+    'blend',single(0),'started',false,'regime',1,'ood',false,'safety',false, ...
+    'conf',false,'dwell',0,'recovery',0,'fault',uint32(0));
+end
+
+function [st,out]=core_step(st,c,t,in)
+bad=any(~isfinite(in)) || any(abs(in)>single(3e38)) || in(1)<1 || in(1)>4 || ...
+    in(2)<0 || in(2)>1 || in(3)<0 || in(4)<0;
+fields={'dt_s','outer_timeout_s','max_physics_residual','residual_clear_ratio', ...
+ 'min_ai_confidence','confidence_clear_ratio','state_safety_limit','safety_trip_ratio', ...
+ 'safety_clear_ratio','safety_predict_s','u_max','u_slew_max_per_s','blend_alpha','integ_limit','windup_tau_s'};
+values=[t(:);c.kp;c.kd;c.ki;c.ff_scale;zeros(numel(fields),1,'single')];
+for j=1:numel(fields), values(19+j)=c.(fields{j}); end
+bad=bad || any(~isfinite(values)) || any(abs(values)>single(3e38));
+if bad
+    st.fault=bitor(st.fault,uint32(16)); st.recovery=double(c.ood_recovery_cooldown_ticks);
+    out=[double(st.u_applied),double(st.u_target),1,st.regime,double(st.blend),double(st.fault)]; return;
+end
+dt=abs(c.dt_s); du=abs(c.u_slew_max_per_s)*dt;
+limit=abs(c.state_safety_limit*t(3)); xa=abs(in(5)); pred=xa+abs(c.safety_predict_s)*abs(in(6));
+if st.safety
+    if xa<c.safety_clear_ratio*limit && pred<c.safety_clear_ratio*limit, st.safety=false; end
+elseif xa>c.safety_trip_ratio*limit || pred>limit
+    st.safety=true; st.fault=bitor(st.fault,uint32(8));
+end
+if st.ood
+    if abs(in(4))<c.residual_clear_ratio*c.max_physics_residual, st.ood=false; end
+elseif abs(in(4))>c.max_physics_residual
+    st.ood=true; st.fault=bitor(st.fault,uint32(2));
+end
+mailbox=1+(in(1)>=1.5)+(in(1)>=2.5)+(in(1)>=3.5);
+if in(2)<c.min_ai_confidence || in(1)>=3.5
+    st.conf=true; st.fault=bitor(st.fault,uint32(4));
+elseif in(2)>=c.confidence_clear_ratio && in(1)<3.5
+    st.conf=false;
+end
+stale=in(3)>c.outer_timeout_s;
+if stale, st.fault=bitor(st.fault,uint32(1)); st.recovery=double(c.ood_recovery_cooldown_ticks); end
+old=st.regime;
+if st.safety, gate=4; reg=4;
+elseif st.ood, gate=2; reg=4;
+elseif st.conf, gate=3; reg=4;
+elseif stale, gate=1; reg=old;
+else
+    gate=0;
+    if st.recovery>0
+        st.recovery=st.recovery-1; reg=4;
+    elseif mailbox==old
+        reg=old;
+    elseif st.dwell+1>=c.min_dwell_ticks
+        reg=double(mailbox);
     else
-        if target ~= old_regime
-            core.blend = 0.0;             % a bank switch restarts transfer
+        reg=old;
+    end
+end
+if st.safety || st.ood || st.conf, st.recovery=double(c.ood_recovery_cooldown_ticks); end
+if gate~=1
+    e=in(7)-in(5); ed=in(8)-in(6);
+    bank=(c.kp*t(1))*e+(c.kd*t(2))*ed+(c.ki*t(1)).*st.integ+c.ff_scale*in(9);
+    if ~st.started, st.u_target=bank(reg); st.blend=single(1);
+    else
+        if reg~=old, st.blend=single(0); end
+        st.u_target=st.u_target+c.blend_alpha*(bank(reg)-st.u_target);
+        st.blend=clamp(st.blend+c.blend_alpha,single(0),single(1));
+    end
+    if isnan(st.u_target), st.u_target=single(0); end
+    command=clamp(st.u_target,-abs(c.u_max),abs(c.u_max));
+    command=clamp(command,st.u_applied-du,st.u_applied+du);
+    for j=1:4
+        ki=c.ki(j)*t(1); next=st.integ(j)+e*dt;
+        if ki~=0 && c.windup_tau_s>0
+            next=next+(command-bank(j))*dt/(ki*c.windup_tau_s);
         end
-        core.u_target = core.u_target + alpha*(u_active - core.u_target);
-        core.blend = min(max(core.blend + alpha, 0), 1);
+        st.integ(j)=clamp(next,-abs(c.integ_limit),abs(c.integ_limit));
     end
-    u_c = min(max(core.u_target, -u_max), u_max);
-    du = min(max(u_c - core.u_applied, -du_max), du_max);
-    u = core.u_applied + du;
-    for j = 1:4
-        kij = cfg.ki(j)*cfg.gain_scale;
-        if kij > eps
-            u_pid_j = cfg.kp(j)*cfg.gain_scale*e + ...
-                      cfg.kd(j)*cfg.damping_scale*ed + ...
-                      kij*core.integ(j) + cfg.ff_scale(j)*in.u_ff;
-            core.integ(j) = core.integ(j) + dt*e + ...
-                            (u - u_pid_j)*dt/(kij*cfg.windup_tau_s);
-            core.integ(j) = min(max(core.integ(j), -integ_limit), integ_limit);
-        end
-    end
-    core.u_applied = u;
-    core.control_started = true;
-else
-    u = core.u_applied;
+    st.u_applied=command; st.started=true;
+end
+if reg~=old, st.dwell=0; else, st.dwell=st.dwell+1; end
+st.regime=reg;
+out=[double(st.u_applied),double(st.u_target),gate,reg,double(st.blend),double(st.fault)];
 end
 
-% ---- 8. dwell bookkeeping + output ------------------------------------
-if target ~= old_regime
-    core.dwell_ticks = 0;
-else
-    core.dwell_ticks = core.dwell_ticks + 1;
-end
-core.regime = target;
-core.gate = gate;
-regime = target;
-end
-
-function reg = local_mailbox_regime(ai_regime)
-% Same 1.5/2.5/3.5 thresholds as the C core.
-if ai_regime < 1.5
-    reg = 1;
-elseif ai_regime < 2.5
-    reg = 2;
-elseif ai_regime < 3.5
-    reg = 3;
-else
-    reg = 4;
-end
-end
-
-function [regime, conf] = local_classify(feat, proto, gamma)
-% Nearest-centroid coarse classifier with a margin+proximity confidence.
-%   d1 = distance to the winning prototype, d2 = distance to the runner-up.
-%   margin    = (d2-d1)/(d2+d1+eps)  -> 0 when the call is ambiguous
-%   proximity = exp(-gamma*d1)       -> 0 when the sample is far from every
-%                                       known prototype (unseen OOD condition)
-%   conf      = margin * proximity
-% This removes the legacy pure-margin confidence floor of 0.5, so min_ai_confidence can
-% actually be reached by either ambiguity or novelty.
-d  = sqrt(sum((proto - feat).^2, 2));
-[d1, i1] = min(d);
-d2 = min(d([1:i1-1, i1+1:end]));
-regime = i1;
-margin = (d2 - d1)/max(d2 + d1, 1e-9);
-if nargin < 3 || isempty(gamma) || ~isfinite(gamma) || gamma <= 0
-    gamma = 1/max(median(d), 1e-9);
-end
-conf = margin*exp(-gamma*d1);
-conf = min(max(conf, 0), 1);
-end
-
-function [d_ood, q, qd] = local_ood_step(ood, tk, q, qd, u, x, dt)
-if ood.on && tk >= ood.t_start
-    if tk < ood.t_start + 1.5*dt
-        qd = qd + ood.kick;      % deterministic fault-onset impulse
-    end
-    qdd = -2*ood.zr*ood.wr*qd - ood.wr^2*q + ood.cu*u + ood.cx*x;
-    qd  = qd + dt*qdd;
-    q   = q  + dt*qd;
-    d_ood = ood.kq*q;
-else
-    d_ood = 0;
-    q = 0; qd = 0;
-end
-end
-
-% =========================================================================
-%  METRICS
-% =========================================================================
-function M = local_metrics(P, out, opts)
-edges = P.stage.edges;
-edges = edges(edges < opts.t_end + 1e-12);
-if isempty(edges) || edges(end) < opts.t_end
-    edges = [edges, opts.t_end];
-end
-n_s   = numel(edges) - 1;
-names = {'B1 fixed', 'B2 end-to-end AI', 'B3 layered'};
-branches = {out.b1, out.b2, out.b3};
-u_max = P.act.u_max;
-dt = P.dt;
-win = max(3, round(P.metrics.chatter_window_s/dt));
-
-M = struct();
-M.stage_edges = edges;
-M.stage_names = names;
-M.rmse      = nan(3, n_s);
-M.maxabs    = nan(3, n_s);
-M.violations= nan(3, n_s);
-M.chatter   = nan(3, n_s);   % phase-lag limit-cycle index (error above 1 Hz)
-M.chatter_u = nan(3, n_s);   % high-frequency content of the command
-M.tv        = nan(3, n_s);   % actuator wear: sum |u_k - u_{k-1}|
-M.sat_frac  = nan(3, n_s);
-
-% First-order high-pass used by the phase-lag chattering index.
-tau_hp = 0.16;                      % s -> ~1 Hz corner
-ahp = dt/tau_hp;
-
-for b = 1:3
-    B = branches{b};
-    if isempty(B)
-        continue;
-    end
-    u_hp = B.u - movmean(B.u, win);
-    err  = B.x - out.ref.r;
-    % y = filter(alpha, [1, -(1-alpha)], x)  is a first-order low-pass
-    err_lp = filter(ahp, [1, -(1-ahp)], err);
-    err_hp = err - err_lp;
-    for s = 1:n_s
-        idx = out.t >= edges(s) & out.t < edges(s+1);
-        if ~any(idx)
-            continue;
-        end
-        M.rmse(b,s)       = sqrt(mean(err(idx).^2));
-        M.maxabs(b,s)     = max(abs(B.x(idx)));
-        M.violations(b,s) = sum(abs(B.x(idx)) > P.safety.x_limit);
-        M.chatter(b,s)    = sqrt(mean(err_hp(idx).^2))/P.ref.amp;
-        M.chatter_u(b,s)  = sqrt(mean(u_hp(idx).^2))/u_max;
-        M.tv(b,s)         = sum(abs(diff(B.u(idx))));
-        M.sat_frac(b,s)   = mean(abs(B.u(idx)) >= 0.999*u_max);
-    end
-end
-
-% OOD detection latency of Branch 3 (first veto after fault onset).
-M.veto_latency_ms = NaN;
-M.recovery_ms     = NaN;
-M.gate_hist       = zeros(5,1);
-M.regime_hist     = zeros(4,1);
-if ~isempty(out.b3)
-    i_on = round(P.ood.t_start/dt) + 1;
-    if opts.ood_on && i_on <= numel(out.t)
-        veto = find(out.b3.gate(i_on:end) == 2 | out.b3.gate(i_on:end) == 4, 1);
-        if ~isempty(veto)
-            M.veto_latency_ms = (veto - 1)*dt*1e3;
-        end
-        % recovery: last veto sample -> first sample back on a normal regime
-        last_veto = find(out.b3.gate(i_on:end) ~= 0, 1, 'last');
-        if ~isempty(last_veto)
-            idx0 = i_on + last_veto - 1;
-            back = find(out.b3.regime(idx0:end) <= 3, 1);
-            if ~isempty(back)
-                M.recovery_ms = (back - 1)*dt*1e3;
-            end
-        end
-    end
-    g = out.b3.gate;
-    for v = 0:4
-        M.gate_hist(v+1) = nnz(g == v);
-    end
-    rg = out.b3.regime;
-    for v = 1:4
-        M.regime_hist(v) = nnz(rg == v);
-    end
-end
-
-% Metrics that the README quotes directly.
-M.stage_names_short = P.stage.short;
-M.ref = out.ref;
-end
-
-function A = local_checks(P, out)
-% Engineering checks for the reference benchmark.  Returns a struct with
-% logical flags and the numbers behind them.  Checks that need a stage the
-% caller did not simulate are reported as not evaluable (false + NaN) instead
-% of raising, so short/partial runs (calibration, panel B) still work.
-A = struct();
-M = out.metrics;
-edge = P.stage.edges;
-n_s  = size(M.rmse, 2);
-has_stage = @(s) (s <= n_s) && (out.t(end) >= edge(s+1) - P.dt - 1e-9);
-
-% Engineering check 1: Stage 2, B2 RMSE > 2x B3 RMSE.
-if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(2)
-    idx2 = out.t >= edge(2) & out.t < edge(3);
-    A.stage2_rmse_b2 = sqrt(mean((out.b2.x(idx2)-out.ref.r(idx2)).^2));
-    A.stage2_rmse_b3 = sqrt(mean((out.b3.x(idx2)-out.ref.r(idx2)).^2));
-    A.check1 = A.stage2_rmse_b2 > 2*A.stage2_rmse_b3;
-else
-    A.stage2_rmse_b2 = NaN; A.stage2_rmse_b3 = NaN; A.check1 = false;
-end
-
-% Engineering check 2: Stage 3, B2 phase-lag chattering and tracking both degrade
-% far beyond B3 under 10 Hz + 60-120 ms jitter + frame drops.
-if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(3)
-    A.stage3_chatter_b2 = M.chatter(2, 3);
-    A.stage3_chatter_b3 = M.chatter(3, 3);
-    A.stage3_rmse_b2 = M.rmse(2, 3);
-    A.stage3_rmse_b3 = M.rmse(3, 3);
-    A.check2 = (A.stage3_chatter_b2 > 3*A.stage3_chatter_b3) && ...
-                (A.stage3_rmse_b2 > 2*A.stage3_rmse_b3);
-else
-    A.stage3_chatter_b2 = NaN; A.stage3_chatter_b3 = NaN;
-    A.stage3_rmse_b2 = NaN; A.stage3_rmse_b3 = NaN;
-    A.check2 = false;
-end
-
-% Engineering check 3: Stage 4, B2 breaches the envelope, B3 has zero violations
-% and abstains within 10 ms.
-if ~isempty(out.b2) && ~isempty(out.b3) && has_stage(4)
-    idx4 = out.t >= edge(4);
-    A.stage4_violations_b2 = sum(abs(out.b2.x(idx4)) > P.safety.x_limit);
-    A.stage4_violations_b3 = sum(abs(out.b3.x(idx4)) > P.safety.x_limit);
-    A.stage4_maxabs_b2 = max(abs(out.b2.x(idx4)));
-    A.stage4_maxabs_b3 = max(abs(out.b3.x(idx4)));
-    A.veto_latency_ms = M.veto_latency_ms;
-    A.check3 = (A.stage4_violations_b2 > 0) && ...
-                (A.stage4_violations_b3 == 0) && ...
-                (A.veto_latency_ms < 10);
-else
-    A.stage4_violations_b2 = NaN; A.stage4_violations_b3 = NaN;
-    A.stage4_maxabs_b2 = NaN; A.stage4_maxabs_b3 = NaN;
-    A.veto_latency_ms = NaN; A.check3 = false;
-end
-A.all = A.check1 && A.check2 && A.check3;
-end
-
-function local_print_summary(P, out)
-fprintf('\n--- sim_core_engine: %s (%s) ---\n', P.name, P.kind);
-fprintf('%-18s %10s %10s %10s\n', 'branch', 'S1 RMSE', 'S2 RMSE', 'S4 max|x|');
-lab = {'B1 fixed', 'B2 e2e AI', 'B3 layered'};
-for b = 1:3
-    fprintf('%-18s %10.4f %10.4f %10.4f\n', lab{b}, ...
-        out.metrics.rmse(b,1), out.metrics.rmse(b,2), out.metrics.maxabs(b,4));
-end
-fprintf('check1=%d check2=%d check3=%d (veto latency %.2f ms)\n', ...
-    out.metrics.checks.check1, out.metrics.checks.check2, ...
-    out.metrics.checks.check3, out.metrics.checks.veto_latency_ms);
+function y=clamp(x,lo,hi)
+if isnan(x), x=0; end
+y=min(max(x,lo),hi);
 end

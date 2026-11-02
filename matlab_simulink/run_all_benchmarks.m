@@ -1,341 +1,155 @@
-%RUN_ALL_BENCHMARKS  One-click entry point for the whole reference benchmark.
-%
-%   Run it from anywhere:
-%       matlab -batch "run('matlab_simulink/run_all_benchmarks.m')"
-%
-%   What it does, in order:
-%     1. builds matlab_simulink/ai_layered_control_bench.slx (built-in blocks
-%        only) and smoke-tests it for 0.1 s, if Simulink is installed and the
-%        model is not open with unsaved edits;
-%     2. runs the 40 s four-stage benchmark of the industrial reference
-%        profile and verifies checks 1-3;
-%     3. runs the paired, nominal-only data / drift / compute study and
-%        verifies check 4;
-%     4. runs the three domain presets;
-%     5. runs the stage-forced mode-necessity ablation (check 5) and the
-%        OOD probe cross-checks;
-%     6. exports the three publication figures into assets/ at 240 dpi and
-%        prints a Markdown metrics table to stdout.
-%
-%   Everything is plain MATLAB + Simulink: no toolbox, no GPU, no MEX.
-
-here  = fileparts(mfilename('fullpath'));
-root  = fullfile(here, '..');
-addpath(here);
-assets = fullfile(root, 'assets');
-if ~exist(assets, 'dir')
-    mkdir(assets);
+%RUN_ALL_BENCHMARKS V2 physical benchmark, adaptation and engineering checks.
+started=tic; here=fileparts(mfilename('fullpath')); addpath(here);
+assets_dir=fullfile(here,'..','assets');
+if ~exist('generate_figures','var'), generate_figures=true; end
+P=load_domain_profile(); P.classifier=calibrate_coarse_classifier(P);
+P.policy=train_continuous_policy(P);
+fprintf('[1/5] Shared four-stage fixture and continuous 1 kHz actions\n');
+[main,D]=sim_core_engine(P); M=main.metrics;
+D.regime_fraction=zeros(4,4); D.gate_ticks=zeros(4,5);
+for s=0:3
+    selected=main.stage==s;
+    for r=1:4, D.regime_fraction(s+1,r)=mean(main.b3.regime(selected)==r); end
+    for g=0:4, D.gate_ticks(s+1,g+1)=sum(main.b3.gate(selected)==g); end
 end
-t_start = tic;
-fprintf('=== ai-layered-control reference benchmark (v1.1.0) ===\n');
-
-% ------------------------------------------------------------------------
-% 1. Simulink model (optional) + smoke test
-% ------------------------------------------------------------------------
-mdl_path = fullfile(here, 'ai_layered_control_bench.slx');
-[mdl, mdl_status] = build_simulink_model(mdl_path);
-t_model = toc(t_start);
-switch mdl_status
-    case 'built'
-        load_system(mdl);
-        set_param(mdl, 'StopTime', '0.1');
-        sim(mdl);
-        close_system(mdl, 0);
-        fprintf('[1/5] Simulink model built and smoke-tested: matlab_simulink/%s.slx\n', mdl);
-    case 'skipped_dirty'
-        fprintf('[1/5] Simulink model is open with unsaved edits: skipped rebuild; numeric benchmark continues.\n');
-    otherwise
-        fprintf('[1/5] Simulink not installed: skipped .slx build; numeric benchmark continues.\n');
+fresh=[true; diff(main.b3.age)<-.0005] & main.stage<3 & main.b3.age<=P.cfg.outer_timeout_s;
+D.fresh_low_confidence_frames=sum(fresh & main.b3.confidence<P.classifier.trip);
+D.normal_timeout_ticks=sum(main.stage<3 & main.b3.age>P.cfg.outer_timeout_s);
+D.fresh_gate3_ticks=sum(main.stage<3 & main.b3.age<=P.cfg.outer_timeout_s & main.b3.gate==3);
+D.confidence_thresholds=[P.classifier.trip P.classifier.clear];
+fprintf('[2/5] Fixed controller banks and model-agnostic supervision\n');
+A=struct();
+for bank=1:4
+    z=sim_core_engine(P,struct('branches',3,'fixed_regime',bank));
+    A.(sprintf('R%d',bank))=z.metrics;
 end
-
-% ------------------------------------------------------------------------
-% 2. Four-stage benchmark (industrial reference profile)
-% ------------------------------------------------------------------------
-P    = load_domain_profile('industrial');
-P    = calibrate_coarse_classifier(P);
-out  = sim_core_engine(P, struct('verbose', false));
-P    = out.profile;                  % calibrated P + trained B2 policy
-A    = out.metrics.checks;
-fig1 = fullfile(assets, 'benchmark_4stages_showdown.png');
-local_plot_stages(out, P, fig1);
-fprintf('[2/5] 40 s four-stage benchmark: figure -> assets/benchmark_4stages_showdown.png\n');
-t_bench = toc(t_start) - t_model;
-
-% ------------------------------------------------------------------------
-% 3. Paired nominal-only data / drift / compute study
-% ------------------------------------------------------------------------
-E  = run_efficiency_analysis(P, struct('assets_dir', assets, 'make_figure', true));
-A4 = E.check4;
-fprintf('[3/5] efficiency study: figure -> assets/efficiency_and_generalization.png\n');
-t_eff = toc(t_start) - t_model - t_bench;
-
-% ------------------------------------------------------------------------
-% 4. Stage-forced mode-necessity ablation + OOD probes (check 5 / check 3)
-% ------------------------------------------------------------------------
-fixed = cell(1,3);
-for r = 1:3
-    fixed{r} = sim_core_engine(P, struct('branches', 3, 'fixed_regime', r, ...
-                                         'verbose', false));
+z=sim_core_engine(P,struct('branches',3,'mode','rules')); A.rules=z.metrics;
+A.dynamic=M;
+fprintf('[3/5] Action sample budgets and frozen-AI field tuning\n');
+E=run_efficiency_analysis(P,struct('make_figure',generate_figures,'assets_dir',assets_dir));
+fprintf('[4/5] Independent seeds and physical sensitivity\n');
+seeds=[107 211 307 401 503]; phases=[.3 1.3 2.3 3.3 4.3];
+H=repmat(struct('seed',0,'wallphase',0,'metrics',M,'fresh_gate3_ticks',0, ...
+    'timeout_ticks',0,'fresh_low_confidence_frames',0),1,5);
+for j=1:5
+    z=sim_core_engine(P,struct('seed',seeds(j),'wallphase',phases(j)));
+    normal=z.stage<3; fresh_age=z.b3.age<=P.cfg.outer_timeout_s;
+    received=[true; diff(z.b3.age)<-.0005] & normal & fresh_age;
+    H(j)=struct('seed',seeds(j),'wallphase',phases(j),'metrics',z.metrics, ...
+        'fresh_gate3_ticks',sum(normal & fresh_age & z.b3.gate==3), ...
+        'timeout_ticks',sum(normal & ~fresh_age), ...
+        'fresh_low_confidence_frames',sum(received & z.b3.confidence<P.classifier.trip));
 end
-oracle = sim_core_engine(P, struct('branches', 3, 'stage_regime', [1 2 3 4], ...
-                                   'verbose', false));
-actual = out;
-s123 = @(M) sqrt(mean(M(1:3).^2));
-s40  = @(M) sqrt(mean(M.^2));
-fixed_s123 = [s123(fixed{1}.metrics.rmse(3,:)), ...
-              s123(fixed{2}.metrics.rmse(3,:)), ...
-              s123(fixed{3}.metrics.rmse(3,:))];
-fixed_40   = [s40(fixed{1}.metrics.rmse(3,:)), ...
-              s40(fixed{2}.metrics.rmse(3,:)), ...
-              s40(fixed{3}.metrics.rmse(3,:))];
-oracle_s123 = s123(oracle.metrics.rmse(3,:));
-oracle_40   = s40(oracle.metrics.rmse(3,:));
-actual_s123 = s123(actual.metrics.rmse(3,:));
-actual_40   = s40(actual.metrics.rmse(3,:));
-A5 = struct();
-A5.fixed_s123 = fixed_s123;
-A5.fixed_40 = fixed_40;
-A5.oracle_s123 = oracle_s123;
-A5.oracle_40 = oracle_40;
-A5.actual_s123 = actual_s123;
-A5.actual_40 = actual_40;
-A5.check5 = (oracle_s123 < 0.8*min(fixed_s123)) && ...
-            (oracle_40 < min(fixed_40));
-
-% OOD probes: resonance-only, spike-only, and S1-S3 false-veto count.
-Pr = P; Pr.ood.t_start = 1.0; Pr.ood.spike_amp = 0; Pr.ood.spike_prob = 0;
-out_r = sim_core_engine(Pr, struct('t_end', 6, 'branches', 3, ...
-    'ood_spikes', false, 'ood_resonance', true, 'edge_on', false, 'verbose', false));
-Ps = P; Ps.ood.t_start = 1.0; Ps.ood.res_kq = 0; Ps.ood.res_ky = 0; Ps.ood.res_kick = 0;
-out_s = sim_core_engine(Ps, struct('t_end', 6, 'branches', 3, ...
-    'ood_spikes', true, 'ood_resonance', false, 'edge_on', false, 'verbose', false));
-resonance_ms = out_r.metrics.veto_latency_ms;
-spike_ms     = out_s.metrics.veto_latency_ms;
-s123_ood     = sum(out.b3.gate(out.t < 30) == 2);
-A.check3_probe = (resonance_ms < 10) && (spike_ms < 10) && (s123_ood == 0);
-A.check3 = A.check3 && A.check3_probe;
-
-fprintf('[4/5] mode-necessity ablation + OOD probes complete.\n');
-t_ablate = toc(t_start) - t_model - t_bench - t_eff;
-
-% ------------------------------------------------------------------------
-% 5. The three domain presets
-% ------------------------------------------------------------------------
-profiles = {'industrial', 'edge_vla', 'neuromodulation'};
-outs = cell(1, numel(profiles));
-for i = 1:numel(profiles)
-    Pi = load_domain_profile(profiles{i});
-    Pi = calibrate_coarse_classifier(Pi);
-    outs{i} = sim_core_engine(Pi, struct('verbose', false));
+cases={'no_jitter','no_spike','no_ood_veto','fallback_ff','band_18_36','band_24_48','one_substep','four_substeps'};
+settings={struct('jitter',false),struct('branches',3,'spikes',false), ...
+    struct('branches',3,'ood_gate',false),struct('branches',3,'ffsafe',1), ...
+    struct('fault_f',[18 36]),struct('fault_f',[24 48]),struct('substeps',1),struct('substeps',4)};
+V=struct();
+for j=1:numel(cases)
+    z=sim_core_engine(P,settings{j}); V.(cases{j})=z.metrics;
 end
-fig3 = fullfile(assets, 'domain_profiles_comparison.png');
-local_plot_domains(outs, fig3);
-fprintf('[5/5] cross-domain comparison: figure -> assets/domain_profiles_comparison.png\n');
-t_dom = toc(t_start) - t_model - t_bench - t_eff - t_ablate;
-
-% ------------------------------------------------------------------------
-% Engineering checks + Markdown metrics table
-% ------------------------------------------------------------------------
-M = out.metrics;
-fprintf('\n=== ENGINEERING CHECKS ===\n');
-fprintf('[1] S2 drift robustness (B2 RMSE vs B3):      %s  (%.4f vs %.4f, ratio %.2f)\n', ...
-    local_ok(A.check1), A.stage2_rmse_b2, A.stage2_rmse_b3, ...
-    A.stage2_rmse_b2/max(A.stage2_rmse_b3, eps));
-fprintf('[2] S3 latency decoupling (chatter / RMSE):   %s  (%.3f vs %.3f, ratio %.2f; RMSE %.4f vs %.4f)\n', ...
-    local_ok(A.check2), A.stage3_chatter_b2, A.stage3_chatter_b3, ...
-    A.stage3_chatter_b2/max(A.stage3_chatter_b3, eps), ...
-    A.stage3_rmse_b2, A.stage3_rmse_b3);
-fprintf('[3] S4 OOD abstention and envelope safety:    %s  (B2 breaches %d, B3 breaches %d, veto %.1f ms; spike %.1f ms / resonance %.1f ms; S1-S3 OOD ticks %d)\n', ...
-    local_ok(A.check3), A.stage4_violations_b2, A.stage4_violations_b3, ...
-    A.veto_latency_ms, spike_ms, resonance_ms, s123_ood);
-fprintf('[4] Paired data and compute efficiency:      %s  (layered %.1f%% at N=40, continuous nominal-only %.1f%% at N=40 / %.1f%% at N=120, +35%% drift %.1f%% at N=2000, oracle %.1f%% at N=120, compute %.0fx)\n', ...
-    local_ok(A4.pass), A4.layered_at_40, A4.cont_nominal_at_40, ...
-    A4.cont_nominal_at_120, A4.cont_deployed_at_2000, ...
-    A4.oracle_at_120, A4.compute_ratio);
-fprintf('[5] Mode necessity (stage-forced oracle):     %s  (S1-S3 %.5f vs fixed %.5f/%.5f/%.5f; 40 s %.5f vs %.5f/%.5f/%.5f; deployed classifier S1-S3 %.5f, 40 s %.5f)\n', ...
-    local_ok(A5.check5), A5.oracle_s123, fixed_s123(1), fixed_s123(2), fixed_s123(3), ...
-    A5.oracle_40, fixed_40(1), fixed_40(2), fixed_40(3), ...
-    A5.actual_s123, A5.actual_40);
-
-fprintf('\n=== MODE-NECESSITY ABLATION (40 s, S1/S2/S3/S4 RMSE) ===\n');
-fprintf('| controller | S1 | S2 | S3 | S4 | S1-S3 | 40 s | TV(u) |\n');
-fprintf('| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n');
-ab_names = {'Stage-forced oracle', 'Fixed R1', 'Fixed R2', 'Fixed R3'};
-ab_outs  = {oracle, fixed{1}, fixed{2}, fixed{3}};
-for i = 1:4
-    Mi = ab_outs{i}.metrics;
-    fprintf('| %s | %.4f | %.4f | %.4f | %.4f | %.5f | %.5f | %.1f |\n', ...
-        ab_names{i}, Mi.rmse(3,1), Mi.rmse(3,2), Mi.rmse(3,3), Mi.rmse(3,4), ...
-        s123(Mi.rmse(3,:)), s40(Mi.rmse(3,:)), sum(Mi.tv(3,:)));
+Q=P; Q.cfg.state_safety_limit=100; Q.cfg.outer_timeout_s=100;
+z=sim_core_engine(Q,struct('branches',3,'spikes',false,'probe_spikes',false,'conf_gate',false));
+V.broadband_only=z.metrics;
+first=find(z.b3.gate==2 & z.context.fault,1); onset=find(z.context.fault,1);
+D.broadband_only_detect_ms=1000*(z.t(first)-z.t(onset));
+fprintf('[5/5] C99 input replay, acceptance and generated artifacts\n');
+replay=verify_core_equivalence(P);
+for b=1:3
+    u=main.(sprintf('b%d',b)).u;
+    assert(all(isfinite(u)) && max(abs(u))<=20.00001,'Actuator magnitude failed.');
+    assert(max(abs(diff([0;u])))<=2.00001,'Actuator slew failed.');
 end
-fprintf('| deployed 10 Hz classifier | %.4f | %.4f | %.4f | %.4f | %.5f | %.5f | %.1f |\n', ...
-    M.rmse(3,1), M.rmse(3,2), M.rmse(3,3), M.rmse(3,4), actual_s123, actual_40, sum(M.tv(3,:)));
-
-fprintf('\n=== QUANTITATIVE METRICS (industrial reference profile) ===\n');
-fprintf('| metric | Branch 1: fixed PID | Branch 2: end-to-end AI | Branch 3: layered |\n');
-fprintf('| :--- | ---: | ---: | ---: |\n');
-stages = P.stages.short;
-for s = 1:4
-    fprintf('| RMSE %s [%s] | %.4f | %.4f | %.4f |\n', stages{s}, P.units.state, ...
-        M.rmse(1,s), M.rmse(2,s), M.rmse(3,s));
+assert(main.b2.calls==40000 && all(M.rmse(:,1)<.01),'Nominal accuracy or action rate failed.');
+assert(D.lcg_last==.16194512567017227,'LCG sequence differs.');
+fprintf('[1] Equal 1 kHz action rate, nominal tracking and actuator bounds: PASS\n');
+assert(M.rmse(2,2)>M.rmse(1,2) && M.rmse(3,2)<.03,'S2 transfer result failed.');
+assert(M.peak_contact(1,3)>20 && M.peak_contact(3,3)<20 && M.tv(3,3)<M.tv(1,3),'Contact tradeoff failed.');
+fprintf('[2] S2 load/friction and S3 contact/noise tradeoff: PASS\n');
+assert(all(M.violations(3,:)==0) && all(M.violations(1:2,4)>0),'Composite fault result failed.');
+for j=1:numel(H), assert(all(H(j).metrics.violations(3,:)==0),'Holdout B3 safety failed.'); end
+assert(all(isfinite(D.sensor_detect_ms)) && all(D.sensor_detect_ms<=1000),'Broadband sensor probe failed.');
+assert(all(D.free_energy_ratio<.01) && all(D.free_peak_ratio<1.01),'Free structural response failed.');
+assert(all(V.broadband_only.violations(3,:)==0) && ~isempty(first),'Independent broadband veto failed.');
+fprintf('[3] Composite OOD and five holdout B3 safety runs: PASS\n');
+assert(E.retrained(end)<E.frozen(end),'Retrained action-head recovery failed.');
+for j=1:numel(E.tuning)
+    assert(E.tuning(j).after_rmse<.6*E.tuning(j).before_rmse,'Tuning gain below 40%%.');
+    assert(all(E.tuning(j).mission.violations(3,:)==0) && E.tuning(j).mission.peak_contact(3,3)<20,'Tuned mission safety failed.');
 end
-for s = 1:4
-    fprintf('| chatter %s [norm.] | %.3f | %.3f | %.3f |\n', stages{s}, ...
-        M.chatter(1,s), M.chatter(2,s), M.chatter(3,s));
+fprintf('[4] Frozen-AI tuning and action-label sample budget: PASS\n');
+assert(A.R2.rmse(3,2)<A.R1.rmse(3,2) && A.R2.rmse(3,2)<A.R3.rmse(3,2),'Load-bank necessity failed.');
+assert(A.R3.peak_contact(3,3)<A.R1.peak_contact(3,3) && A.R3.peak_contact(3,3)<A.R2.peak_contact(3,3),'Compliance-bank necessity failed.');
+assert(all(A.rules.violations(3,:)==0) && A.rules.peak_contact(3,3)<20,'Rules supervisor safety failed.');
+fprintf('[5] Controller-bank necessity and supervisor interchangeability: PASS\n');
+if generate_figures
+    draw_showdown(main,assets_dir); draw_mappings(main,assets_dir);
+    [model,status]=build_simulink_model();
+    assert(strcmp(status,'built'),'Simulink is required to regenerate the model.');
+    sim(model,'StopTime','0.1'); close_system(model,0);
 end
-for s = 1:4
-    fprintf('| Control Effort TV(u) %s [%s] | %.1f | %.1f | %.1f |\n', stages{s}, P.units.input, ...
-        M.tv(1,s), M.tv(2,s), M.tv(3,s));
-end
-for s = 1:4
-    fprintf('| Safety Violation Ticks %s [ms] | %d | %d | %d |\n', stages{s}, ...
-        M.violations(1,s), M.violations(2,s), M.violations(3,s));
-end
-fprintf('| total Control Effort TV(u) over 40 s [%s] | %.1f | %.1f | %.1f |\n', ...
-    P.units.input, sum(M.tv(1,:)), sum(M.tv(2,:)), sum(M.tv(3,:)));
-fprintf('| OOD veto latency | - | - | %.1f ms |\n', M.veto_latency_ms);
-fprintf('| Calibration Samples N (classifier / continuous) | - | ~500 | <= 40 |\n');
-fprintf('| compute load (MAC/s) | - | %.2e | %.2e |\n', ...
-    E.panelC.monolithic.macs_per_s, E.panelC.layered.macs_per_s);
-fprintf('| memory footprint (B) | - | %.2e | %.2e |\n', ...
-    E.panelC.monolithic.mem_bytes, E.panelC.layered.mem_bytes);
-fprintf('| compute / memory reduction | - | - | %.0fx / %.0fx |\n', ...
-    E.panelC.compute_ratio, E.panelC.memory_ratio);
-fprintf('> +35%% drift = J x1.35, b x1.25, k x1.10, fc x2.00, fs x2.40, vs x0.25, fvisc x1.20 (industrial).\n');
-
-fprintf('\n=== CROSS-DOMAIN SYNTHETIC PRESET METRICS ===\n');
-fprintf('| preset | S2 RMSE B2 | S2 RMSE B3 | S3 RMSE B2 | S3 RMSE B3 | S4 breaches B2 | S4 breaches B3 | Control Effort TV(u) B2 | Control Effort TV(u) B3 |\n');
-fprintf('| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n');
-for i = 1:numel(profiles)
-    Mi = outs{i}.metrics;
-    fprintf('| `%s` (%s) | %.4f | %.4f | %.4f | %.4f | %d | %d | %.1f | %.1f |\n', ...
-        outs{i}.profile.kind, outs{i}.profile.units.state, ...
-        Mi.rmse(2,2), Mi.rmse(3,2), Mi.rmse(2,3), Mi.rmse(3,3), ...
-        Mi.violations(2,4), Mi.violations(3,4), ...
-        sum(Mi.tv(2,:)), sum(Mi.tv(3,:)));
-end
-
-fprintf('\nfigures written to: %s\n', assets);
-fprintf('\n=== TIMING (wall clock, this MATLAB process) ===\n');
-fprintf('  model build + smoke test      : %6.2f s\n', t_model);
-fprintf('  four-stage benchmark + figure : %6.2f s\n', t_bench);
-fprintf('  efficiency study + figure     : %6.2f s\n', t_eff);
-fprintf('  ablation / probes             : %6.2f s\n', t_ablate);
-fprintf('  three domain presets + figure : %6.2f s\n', t_dom);
-fprintf('  total wall-clock time         : %6.2f s\n', toc(t_start));
-if ~(A.check1 && A.check2 && A.check3 && A4.pass && A5.check5)
-    error('run_all_benchmarks:check', ...
-          'At least one engineering check failed - see the table above.');
-end
-fprintf('All five engineering checks passed.\n');
-
-% =========================================================================
-%  Figure 1 - four-stage showdown
-% =========================================================================
-function local_plot_stages(out, P, path)
-t = out.t;
-col1 = [0.55 0.55 0.55];
-col2 = [0.85 0.33 0.10];
-col3 = [0.00 0.45 0.74];
-fig = figure('Visible', 'off', 'Color', 'w', 'Position', [80 80 1100 700]);
-
-subplot(2,2,1);
-plot(t, out.ref.r, 'k--', 'LineWidth', 1.0); hold on;
-plot(t, out.b1.x, 'Color', col1, 'LineWidth', 1.0);
-plot(t, out.b2.x, 'Color', col2, 'LineWidth', 1.0);
-plot(t, out.b3.x, 'Color', col3, 'LineWidth', 1.2);
-yline(P.safety.x_limit, 'r-', 'LineWidth', 1.2);
-yline(-P.safety.x_limit, 'r-', 'LineWidth', 1.2);
-grid on; box on; xlim([0 t(end)]);
-xlabel('time [s]'); ylabel(sprintf('state [%s]', P.units.state));
-title('(a) State tracking and hard safety envelope');
-legend({'reference', 'Branch 1 fixed PID', 'Branch 2 end-to-end AI', ...
-        'Branch 3 layered'}, 'Location', 'southwest');
-
-subplot(2,2,2);
-plot(t, out.b1.u, 'Color', col1, 'LineWidth', 0.8); hold on;
-plot(t, out.b2.u, 'Color', col2, 'LineWidth', 0.8);
-plot(t, out.b3.u, 'Color', col3, 'LineWidth', 1.0);
-grid on; box on; xlim([0 t(end)]);
-xlabel('time [s]'); ylabel(sprintf('command [%s]', P.units.input));
-title('(b) Actuator command');
-legend({'Branch 1', 'Branch 2', 'Branch 3'}, 'Location', 'southwest');
-
-subplot(2,2,3);
-yyaxis left;
-plot(t, out.b3.res_fast, 'Color', [0.49 0.18 0.56], 'LineWidth', 0.9); hold on;
-plot(t, out.b3.res_hf, 'Color', [0.00 0.45 0.74], 'LineWidth', 0.9);
-yline(P.ai.max_residual, 'r--', 'LineWidth', 1.0);
-ylabel('normalized residual'); ylim([0 2.5]);
-yyaxis right;
-plot(t, out.b3.ai_conf, 'Color', [0.47 0.67 0.19], 'LineWidth', 1.0); hold on;
-yline(P.ai.min_confidence, 'k:', 'LineWidth', 1.0);
-ylabel('classifier confidence'); ylim([0 1]);
-grid on; box on; xlim([0 t(end)]);
-xlabel('time [s]');
-title('(c) Spike / HF residual channels and AI confidence');
-legend({'spike channel', 'HF resonance channel', 'OOD threshold', 'confidence'}, ...
-       'Location', 'northeast');
-
-subplot(2,2,4);
-stairs(t, out.b3.regime, 'Color', col3, 'LineWidth', 1.2); hold on;
-stairs(t, out.b3.gate, 'Color', col2, 'LineWidth', 0.9);
-grid on; box on; xlim([0 t(end)]);
-ylim([-0.2 4.5]);
-xlabel('time [s]'); ylabel('index');
-title('(d) Active regime and gate state timeline');
-legend({'regime (1 nominal, 2 load, 3 boundary, 4 fallback)', ...
-        'gate (0 normal, 1 hold, 2 OOD, 3 confidence, 4 envelope)'}, ...
-        'Location', 'southwest');
-
-if ~exist(fileparts(path), 'dir')
-    mkdir(fileparts(path));
-end
-exportgraphics(fig, path, 'Resolution', 240);
-close(fig);
-end
-
-% =========================================================================
-%  Figure 3 - cross-domain trajectories
-% =========================================================================
-function local_plot_domains(outs, path)
-col2 = [0.85 0.33 0.10];
-col3 = [0.00 0.45 0.74];
-fig = figure('Visible', 'off', 'Color', 'w', 'Position', [80 80 1100 640]);
-titles = {'Industrial servo / WAAM', 'Edge VLA (10 Hz over 1 kHz)', ...
-          'Closed-loop neuromodulation'};
-for i = 1:numel(outs)
-    o = outs{i}; P = o.profile;
-    t = o.t;
-    subplot(2, numel(outs), i);
-    plot(t, o.ref.r, 'k--', 'LineWidth', 1.0); hold on;
-    plot(t, o.b2.x, 'Color', col2, 'LineWidth', 0.9);
-    plot(t, o.b3.x, 'Color', col3, 'LineWidth', 1.1);
-    yline(P.safety.x_limit, 'r-', 'LineWidth', 1.0);
-    yline(-P.safety.x_limit, 'r-', 'LineWidth', 1.0);
-    grid on; box on; xlim([0 t(end)]);
-    xlabel('time [s]'); ylabel(sprintf('state [%s]', P.units.state));
-    title(sprintf('%s: state', titles{i}));
-    if i == 1
-        legend({'reference', 'Branch 2 end-to-end AI', 'Branch 3 layered'}, ...
-               'Location', 'southwest');
+fprintf('\n| Stage | Branch | RMSE [rad] | TV [N m] | Violation ticks | Peak contact [N] |\n');
+fprintf('|---|---|---:|---:|---:|---:|\n');
+for s=1:4
+    for b=1:3
+        fprintf('| S%d | B%d | %.6f | %.2f | %d | %.2f |\n',s,b,M.rmse(b,s),M.tv(b,s),M.violations(b,s),M.peak_contact(b,s));
     end
+end
+fprintf('\n| Supervisor | S1 RMSE | S2 RMSE | S3 RMSE | S4 RMSE | S3 TV | S3 peak N |\n');
+fprintf('|---|---:|---:|---:|---:|---:|---:|\n');
+for key={'R1','R2','R3','R4','dynamic','rules'}
+    a=A.(key{1}); fprintf('| %s | %.6f | %.6f | %.6f | %.6f | %.2f | %.2f |\n',key{1},a.rmse(3,:),a.tv(3,3),a.peak_contact(3,3));
+end
+fprintf('\n| Drift | Factory RMSE | Tuned RMSE | B1 RMSE | Gain / damping / margin |\n');
+fprintf('|---|---:|---:|---:|---|\n');
+for j=1:2
+    a=E.tuning(j); fprintf('| +%.0f%% | %.6f | %.6f | %.6f | %.2f / %.2f / %.2f |\n',100*a.drift,a.before_rmse,a.after_rmse,a.b1_rmse,a.knobs);
+end
+report=struct('main',M,'ablation',A,'efficiency',E,'holdout',H,'sensitivity',V,'diagnostics',D,'replay',replay);
+fprintf('\nV2_RESULTS_JSON=%s\n',jsonencode(report));
+fprintf('All five engineering checks passed.\nTotal wall-clock time: %.2f s\n',toc(started));
 
-    subplot(2, numel(outs), numel(outs)+i);
-    plot(t, o.b2.u, 'Color', col2, 'LineWidth', 0.8); hold on;
-    plot(t, o.b3.u, 'Color', col3, 'LineWidth', 0.9);
-    grid on; box on; xlim([0 t(end)]);
-    xlabel('time [s]'); ylabel(sprintf('command [%s]', P.units.input));
-    title(sprintf('%s: command', titles{i}));
-end
-exportgraphics(fig, path, 'Resolution', 240);
-close(fig);
+function draw_showdown(z,folder)
+f=figure('Visible','off','Color','w','Position',[80 80 1450 1250]);
+tiledlayout(f,5,1,'TileSpacing','compact','Padding','compact');
+colors=[.15 .4 .7;.85 .33 .1;.1 .55 .35]; keep=1:5:numel(z.t);
+nexttile; hold on;
+for b=1:3, plot(z.t(keep),z.(sprintf('b%d',b)).x(keep),'Color',colors(b,:),'LineWidth',.8); end
+plot(z.t(keep),z.r(keep),'k--','LineWidth',.8); yline(1,':r'); yline(-1,':r');
+ylabel('State [rad]'); title('Four-stage physical stress test'); legend('B1 FF + PID','B2 conditional RBF','B3 layered core','Reference','Location','northoutside','Orientation','horizontal','AutoUpdate','off');
+nexttile; hold on;
+for b=1:3, plot(z.t(keep),z.(sprintf('b%d',b)).u(keep),'Color',colors(b,:),'LineWidth',.45); end
+ylabel('Command [N m]');
+nexttile; hold on;
+for b=1:3, plot(z.t,z.(sprintf('b%d',b)).contact_force,'Color',colors(b,:),'LineWidth',.6); end
+yline(20,':r','Contact budget'); ylabel('Contact force [N]');
+nexttile; plot(z.t,z.b3.residual,'Color',colors(3,:),'LineWidth',.8); hold on; yline(1,':r');
+ylabel('Normalized residual'); ylim([0 4]);
+nexttile; stairs(z.t,z.b3.regime,'Color',colors(3,:),'LineWidth',1.1); hold on;
+stairs(z.t,z.b3.gate,'Color',[.55 .35 .65],'LineWidth',.7); ylabel('Discrete state'); xlabel('Time [s]');
+legend('Regime','Gate','Location','northwest','AutoUpdate','off'); yticks(0:4);
+axeslist=findall(f,'Type','axes');
+for ax=axeslist', grid(ax,'on'); xlim(ax,[0 40]); for t=[10 20 30], xline(ax,t,':','Color',[.55 .55 .55]); end; end
+exportgraphics(f,fullfile(folder,'benchmark_4stages_showdown.png'),'Resolution',240); close(f);
 end
 
-function s = local_ok(flag)
-if flag
-    s = 'PASS';
-else
-    s = 'FAIL';
+function draw_mappings(z,folder)
+f=figure('Visible','off','Color','w','Position',[100 100 1500 650]);
+tiledlayout(f,2,3,'TileSpacing','compact','Padding','compact');
+titles={'Industrial WAAM / PLC servo','Edge VLA / fast-slow robotics','Closed-loop aDBS / SCS'};
+slow={'Process / load / contact class','Task / environment context','Biomarker / interface class'};
+fast={'Process / servo law + actuator limits','Torque / impedance + safe fallback','Device law + output / timing limits'};
+for j=1:3
+    nexttile; axis off; title(titles{j},'FontWeight','bold');
+    text(.03,.82,'10 Hz supervisor','FontWeight','bold','FontSize',13);
+    text(.03,.65,slow{j},'FontSize',11); text(.03,.47,'Regime + confidence + timestamp','FontSize',10);
+    text(.03,.28,'1 kHz deterministic core','FontWeight','bold','FontSize',13);
+    text(.03,.09,fast{j},'FontSize',10);
 end
+for j=1:3
+    nexttile; stairs(z.t,z.b3.regime,'LineWidth',1); grid on; ylim([.8 4.2]); yticks(1:4);
+    xlabel('Common fixture time [s]'); ylabel('Selected regime'); title('Shared normalized interface');
+end
+sgtitle('Three application mappings of a general control contract','FontWeight','bold');
+exportgraphics(f,fullfile(folder,'domain_profiles_comparison.png'),'Resolution',240); close(f);
 end

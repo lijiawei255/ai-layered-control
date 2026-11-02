@@ -1,98 +1,117 @@
 #!/usr/bin/env python3
-"""Minimal copy-paste layered-control skeleton (1 kHz core + 10 Hz slow loop)."""
-# [AGENT-CONTRACT] Copy c99_layered_core/layered_gatekeeper.{c,h} + this file only; do NOT copy the
-# 40 s benchmark harness (run_benchmark.py / sim_core_engine.m). Replace [USER-PLUGIN-SLOT 1..3].
+"""Reusable 10 Hz supervisor + 1 kHz C99 loop; replace the three device slots."""
 import ctypes, os, subprocess, sys
 from pathlib import Path
 import numpy as np
-ROOT = Path(__file__).resolve().parents[1]; CORE = ROOT / "c99_layered_core" / "layered_gatekeeper.c"; OUT = Path(__file__).resolve().parent / "build"
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "c99_layered_core" / "layered_gatekeeper.c"
+BUILD = Path(__file__).resolve().parent / "build"
 F, U, I = ctypes.c_float, ctypes.c_uint32, ctypes.c_int
 FLOAT_FIELDS = "dt_s outer_timeout_s max_physics_residual residual_clear_ratio min_ai_confidence confidence_clear_ratio state_safety_limit safety_trip_ratio safety_clear_ratio safety_predict_s u_max u_slew_max_per_s blend_alpha integ_limit windup_tau_s".split()
-
+BANK_FIELDS = ("kp", "kd", "ki", "ff_scale")
 class Config(ctypes.Structure):
-    _fields_ = [(n, F) for n in FLOAT_FIELDS] + [("min_dwell_ticks", U), ("ood_recovery_cooldown_ticks", U)] + [(g + str(i), F) for g in ("kp", "kd", "ki", "ff_scale") for i in range(4)]
+    _fields_ = [(n, F) for n in FLOAT_FIELDS] + [("min_dwell_ticks", U), ("ood_recovery_cooldown_ticks", U)] + [(n, F * 4) for n in BANK_FIELDS]
 class Input(ctypes.Structure):
     _fields_ = [(n, F) for n in "ai_regime ai_confidence outer_age_s physics_residual x x_dot r r_dot u_ff".split()]
 class Output(ctypes.Structure):
-    _fields_ = [("u", F), ("u_target", F), ("gate", I), ("regime", I), ("blend", F), ("fault", U), ("corrupted", I)]
+    _fields_ = [("u", F), ("u_target", F), ("gate", I), ("regime", I), ("blend", F), ("fault_audit_bitmask", U), ("corrupted", I)]
 class State(ctypes.Structure):
     _fields_ = [("initialized", I), ("u_applied", F), ("u_target", F), ("integ", F * 4), ("blend", F), ("control_started", I), ("regime", I), ("ood_latched", I), ("safety_latched", I), ("conf_latched", I)] + [(n, U) for n in "dwell_ticks recovery_ticks fault_audit_bitmask step_count safety_veto_count ood_veto_count low_confidence_veto_count latency_hold_count corrupted_frame_count".split()]
 class Tuning(ctypes.Structure):
     _fields_ = [(n, F) for n in "gain_scale damping_scale safety_margin_scale".split()]
 
 def load_core():
-    ext = ".dll" if os.name == "nt" else (".dylib" if sys.platform == "darwin" else ".so")
-    lib_path = OUT / ("layered_gatekeeper" + ext)
-    try:
-        if not lib_path.exists():
-            OUT.mkdir(parents=True, exist_ok=True); cc = os.environ.get("CC", "gcc")
-            flags = ["-shared"] if os.name == "nt" else (["-dynamiclib", "-fPIC"] if sys.platform == "darwin" else ["-shared", "-fPIC"])
-            subprocess.run([cc, "-std=c99", "-O2", *flags, "-o", str(lib_path), str(CORE)], check=True, capture_output=True)
-        lib = ctypes.CDLL(str(lib_path))
-        lib.Layered_Init.argtypes = [ctypes.POINTER(State), ctypes.POINTER(Config), ctypes.POINTER(Tuning)]
-        lib.Layered_Step.argtypes = [ctypes.POINTER(State), ctypes.POINTER(Config), ctypes.POINTER(Tuning), ctypes.POINTER(Input)]
-        lib.Layered_Step.restype = Output
-        return lib
-    except Exception as exc:
-        print(f"[fallback] C99 core unavailable ({exc}); using minimal Python gate")
-        return None
+    extension = ".dll" if os.name == "nt" else (".dylib" if sys.platform == "darwin" else ".so")
+    path = BUILD / ("layered_gatekeeper" + extension)
+    if not path.exists() or max(SOURCE.stat().st_mtime_ns, SOURCE.with_suffix(".h").stat().st_mtime_ns) > path.stat().st_mtime_ns:
+        BUILD.mkdir(exist_ok=True)
+        flags = ["-dynamiclib", "-fPIC"] if sys.platform == "darwin" else ["-shared"] + ([] if os.name == "nt" else ["-fPIC"])
+        subprocess.run([os.environ.get("CC", "gcc"), "-std=c99", "-O2", *flags, "-o", str(path), str(SOURCE)], check=True)
+    lib = ctypes.CDLL(str(path))
+    lib.Layered_Init.argtypes = [ctypes.POINTER(t) for t in (State, Config, Tuning)]
+    lib.Layered_Init.restype = None
+    lib.Layered_Step.argtypes = [ctypes.POINTER(t) for t in (State, Config, Tuning, Input)]
+    lib.Layered_Step.restype = Output
+    return lib
 
-class FallbackCore:
-    def __init__(self): self.u = 0.0
-    def step(self, inp):
-        e, ed = inp.r - inp.x, inp.r_dot - inp.x_dot
-        self.u = max(-20.0, min(20.0, 25.0 * e + 8.0 * ed))
-        return type("O", (), {"u": self.u, "gate": 4 if abs(inp.x) > 1.35 or inp.physics_residual > 0.65 else 0, "regime": 1})()
+class Core:
+    def __init__(self, cfg, tuning=(1, 1, 1)):
+        self.lib = load_core()
+        self.cfg = Config(**{n: (F * 4)(*v) if n in BANK_FIELDS else v for n, v in cfg.items()})
+        self.tuning, self.state = Tuning(*tuning), State()
+        self.lib.Layered_Init(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning))
+    def step(self, *frame):
+        inp = Input(*frame)
+        out = self.lib.Layered_Step(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning), ctypes.byref(inp))
+        return out.u, out.gate, out.regime, out.blend, out.fault_audit_bitmask, out.corrupted, out.u_target
 
-def read_plant_and_reference(t):
-    # [USER-PLUGIN-SLOT 1]: replace with real sensor (q, dq) and trajectory (q_ref, dq_ref, ddq_ref).
-    global Q, DQ
-    w = 2.0 * np.pi * 1.0
-    return Q, DQ, 0.4 * np.sin(w * t), 0.4 * w * np.cos(w * t), -0.4 * w * w * np.sin(w * t)
+def auto_calibrate(samples, labels):
+    samples, labels = np.asarray(samples), np.asarray(labels)
+    prototypes = np.array([samples[labels == k].mean(axis=0) for k in (1, 2, 3)])
+    distances = np.sort(np.linalg.norm(samples[:, None, :] - prototypes, axis=2), axis=1)
+    first, second = distances[:, 0], distances[:, 1]
+    gamma = 1 / max(float(np.quantile(first, .95)), 1e-6)
+    confidence = (second - first) / (second + first + 1e-9) * np.exp(-gamma * first)
+    threshold = .15 * float(np.quantile(confidence, .01))
+    return prototypes, gamma, threshold, 1.25 * threshold
 
-def compute_nominal_residual(q, dq, u_prev):
-    # [USER-PLUGIN-SLOT 2]: replace with a domain-specific nominal model residual |y - y_hat|.
-    return float(abs(q - (q - dq * 0.001))) / 0.5
+def auto_field_tune(evaluate, current=(1, 1, 1)):
+    best, score = current, float("inf")
+    for gain in (.75, 1., 1.5, 2.):
+        candidate = (gain, 1., current[2])
+        cost, valid = evaluate(candidate)
+        if valid and np.isfinite(cost) and cost < score:
+            best, score = candidate, cost
+    if not np.isfinite(score):
+        return current
+    gain = best[0]
+    for damping in (.5, .75):
+        candidate = (gain, damping, current[2])
+        cost, valid = evaluate(candidate)
+        if valid and np.isfinite(cost) and cost < score:
+            best, score = candidate, cost
+    return best
 
-def slow_loop_10hz_step(macro_features, prototypes, gamma):
-    # [USER-PLUGIN-SLOT 3]: 4-D dimensionless features -> coarse regime {1,2,3,4}.
-    d = np.linalg.norm(np.asarray(prototypes) - np.asarray(macro_features), axis=1)
-    order = np.argsort(d); d1, d2 = d[order[0]], d[order[1]]
-    conf = float(np.clip(((d2 - d1) / (d2 + d1 + 1e-9)) * np.exp(-gamma * d1), 0.0, 1.0))
-    regime = int(order[0]) + 1
-    if regime == 3 and macro_features[2] < 0.42: regime = 2  # S3 physical-residual mode guard
-    if conf < 0.08: regime = 4
-    return regime, conf
+def classify(features, model):
+    prototypes, gamma, _, _ = model
+    distance = np.linalg.norm(prototypes - features, axis=1)
+    order = np.argsort(distance); a, b = distance[order[:2]]
+    return int(order[0]) + 1, float((b - a) / (b + a + 1e-9) * np.exp(-gamma * a))
+
+def rollout(cfg, tuning=(1, 1, 1), model=None, damping=.4):
+    core = Core(cfg, tuning); dt = cfg["dt_s"]
+    q = velocity = prediction = u = error_sum = 0.; violations = 0
+    regime, confidence, stamp, samples = 1, 1., 0., []
+    for tick in range(1200):
+        t = tick * dt
+        # SLOT 1: real sensor/reference and actuator I/O; this demo uses a damped axis.
+        r, rd, rdd = .2 * np.sin(2*np.pi*t), .4*np.pi*np.cos(2*np.pi*t), -.8*np.pi**2*np.sin(2*np.pi*t)
+        # SLOT 2: commissioned predictor and dimensionless measured features.
+        residual = abs(q - prediction) / .005
+        features = np.array([abs(r-q)/.2, abs(u)/20, residual, abs(velocity)/2])
+        if tick % 100 == 0:
+            samples.append(features); stamp = t
+            if model is not None: regime, confidence = classify(features, model)
+        age = t - stamp
+        ai, conf = (4, 0.) if age > cfg["outer_timeout_s"] else (regime, confidence)
+        u = core.step(ai, conf, age, residual, q, velocity, r, rd, rdd + .4*rd)[0]
+        error_sum += (r-q)**2; violations += int(abs(q) > cfg["state_safety_limit"])
+        prediction = q + dt * (velocity + dt * (u - .4*velocity))
+        velocity += dt * (u - damping*velocity); q += dt*velocity
+    return (error_sum/1200)**.5, violations == 0, np.array(samples)
 
 def main():
-    global Q, DQ
-    Q, DQ, u, violations = 0.0, 0.0, 0.0, 0
-    lib, dt, protos = load_core(), 0.001, np.array([[0.05, 0.05, 0.05, 0.1], [0.2, 0.2, 0.3, 0.3], [0.8, 0.5, 0.9, 1.2]])
-    cfg = Config(**{n: 0.0 for n in FLOAT_FIELDS})
-    cfg.dt_s, cfg.outer_timeout_s, cfg.max_physics_residual, cfg.residual_clear_ratio = dt, 0.30, 0.65, 0.80
-    cfg.min_ai_confidence, cfg.confidence_clear_ratio, cfg.state_safety_limit = 0.01, 0.02, 1.5
-    cfg.safety_trip_ratio, cfg.safety_clear_ratio, cfg.safety_predict_s = 0.90, 0.75, 0.06
-    cfg.u_max, cfg.u_slew_max_per_s, cfg.blend_alpha, cfg.integ_limit, cfg.windup_tau_s = 20.0, 1000.0, 0.10, 10.0, 0.02
-    cfg.min_dwell_ticks, cfg.ood_recovery_cooldown_ticks = 150, 500
-    for i, (kp, kd) in enumerate([(25.0, 8.0), (18.0, 6.0), (12.0, 5.0), (8.0, 4.0)]):
-        setattr(cfg, "kp" + str(i), kp); setattr(cfg, "kd" + str(i), kd); setattr(cfg, "ff_scale" + str(i), 1.0)
-    state, fallback, tuning = State(), FallbackCore(), Tuning(1.0, 1.0, 1.0)
-    if lib is not None: lib.Layered_Init(ctypes.byref(state), ctypes.byref(cfg), ctypes.byref(tuning))
-    err_hist, res_hist = [], []
-    for k in range(1000):
-        t = k * dt; q, dq, qr, dqr, _ = read_plant_and_reference(t)
-        if k % 100 == 0:
-            macro = np.array([np.sqrt(np.mean(np.square(err_hist))) / 0.4 if err_hist else 0.0, abs(u) / 20.0, np.sqrt(np.mean(np.square(res_hist))) if res_hist else 0.0, abs(dq) / 2.0])
-            regime, conf, age = *slow_loop_10hz_step(macro, protos, 1.5), 0.0
-            err_hist, res_hist = [], []
-        residual = compute_nominal_residual(q, dq, u)
-        inp = Input(regime, conf, age, residual, q, dq, qr, dqr, 0.0)
-        out = lib.Layered_Step(ctypes.byref(state), ctypes.byref(cfg), ctypes.byref(tuning), ctypes.byref(inp)) if lib is not None else fallback.step(inp)
-        u = float(out.u); violations += int(out.gate == 4)
-        err_hist.append(qr - q); res_hist.append(residual)
-        Q += DQ * dt; DQ += u * dt  # trivial double-integrator plant for the template demo only
-    print(f"[OK] Minimal layered control loop completed ({violations} safety violations)")
-    return 0 if violations == 0 else 1
+    cfg = dict(zip(FLOAT_FIELDS, (.001, .35, 1., .5, .01, .02, 1., .9, .75, .025, 20., 2000., .3, .5, .1)))
+    cfg.update(min_dwell_ticks=150, ood_recovery_cooldown_ticks=300, kp=[25,35,12,2], kd=[8,10,8,2], ki=[2,8,1,0], ff_scale=[1,1,1,0])
+    # SLOT 3: labeled commissioning observations and a measured, safety-checked trial.
+    observations = np.vstack([rollout(cfg, damping=d)[2] for d in (.4, 2., 5.)])
+    model = auto_calibrate(observations, np.repeat((1, 2, 3), 12))
+    cfg.update(min_ai_confidence=model[2], confidence_clear_ratio=model[3])
+    evaluate = lambda tuning: rollout(cfg, tuning, model, damping=2.)[:2]
+    tuning = auto_field_tune(evaluate); error, valid = evaluate(tuning)
+    print(f"Template: tuning={tuning}, RMSE={error:.6f}, envelope={'PASS' if valid else 'FAIL'}")
+    return 0 if valid else 1
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,289 +1,178 @@
-# ai-layered-control
+# ai-layered-control · v2.0.0
 
-[English](README.md) | [简体中文](README_zh.md)
+[English](README.md) | [简体中文](README_zh.md) · [MIT](LICENSE) · [Agent guide](AGENTS.md)
 
-[![Release v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/lijiawei255/ai-layered-control/releases)
-[![ANSI C99 zero-heap core](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-00599C.svg)](c99_layered_core/)
-[![Python and MATLAB/Simulink benchmark](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-2ea44f.svg)](python_bench/)
-[![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+**A general reference architecture for slow qualitative AI, fast deterministic control, and adaptation without AI retraining.** The slow loop selects a regime or explicitly abstains. A zero-dependency C99 core owns the actuator at 1 kHz.
 
-**A reference architecture for closed-loop AI control: a slow, coarse AI classifier decides *which* control regime a machine is in; a fast, zero-dependency deterministic core decides *how* to move the actuator. In the layered path, no end-to-end `u = pi(x)` model ever touches the 1 kHz command path.**
+Three application families motivate the same separation: **industrial WAAM / PLC servo**, **edge VLA / fast-slow robotics**, and **closed-loop aDBS / SCS neuromodulation**. They are examples of a common control contract, open to other systems with scarce samples, unit variation, intermittent contact, uncertain context and strict output constraints.
 
-**TL;DR**
+## 1. Three competing control paths
 
-* **A few dozen calibration runs, not a thousand.** The 10 Hz coarse classifier maps four dimensionless macro-features onto one of three damping schedules. It reaches **100 % deployment quality with N = 40** calibration samples. The paired continuous regression needs ~120–500 nominal-unit samples for the same in-distribution quality.
-* **+35 % unit-to-unit drift, zero retraining.** On the four-stage benchmark the layered branch tracks at **0.0057 rad RMSE in S2** versus **0.1585 rad** for the end-to-end branch. The continuous policy trained only on nominal data is at **0 %** deployable success on the +35 % drifted unit even at N = 2000; a drifted-data oracle recovers to **100 %** at N = 120.
-* **Explicit abstention on an unseen OOD fault.** **0** safety-envelope violation ticks for the layered branch in S4, versus **2,574** for the end-to-end branch; the OOD veto latches **2.0 ms** after fault onset. The same 2.0 ms is measured for the resonance-only and sensor-spike-only probes, while S1–S3 carry **0** OOD veto ticks under 20× broadband measurement noise.
-* **A stage-forced mode-necessity ablation.** Dynamic selection gives **0.00710** S1–S3 RMSE, versus **0.01201 / 0.00935 / 0.05501** for any fixed R1 / R2 / R3; the 40 s totals are **0.01721** versus **0.01798 / 0.01777 / 0.05069**. The deployed 10 Hz classifier lands at **0.00700** / **0.01630**, marginally better than the stage-forced bound.
-* **A real trained baseline.** Branch 2 is a closed-form RBF inverse-dynamics model fitted to a nominal-unit teacher rollout plus a fixed PD stabilizer. Branch 3's 3×4 prototypes and confidence threshold are commissioned by `calibrate_coarse_classifier.m`; no prototype table is hard-coded.
+| Branch | Slow context | Continuous actuator command at 1 kHz |
+|---|---|---|
+| B1 · modern white-box baseline | Single fixed regime | Nominal inverse-dynamics feedforward + high-gain anti-windup PID |
+| B2 · learned fast-slow policy | Four measured macro-features at 10 Hz, delayed independently | Conditioned 512-center RBF action head, `u = π(x, x_dot, r, r_dot, r_ddot, z)` |
+| B3 · qualitative / quantitative separation | Model-agnostic regime + confidence + timestamp at 10 Hz | C99 controller bank, nine duties of protection, deterministic feedforward and field tuning |
 
-> **Scope.** This is a methodological reference implementation on a synthetic nonlinear plant; see the single **Scope and disclaimer** statement at the end. All numbers below are produced by the acceptance run in §6.
+B1 and B3 receive the **same nominal feedforward**. All branches share actuator magnitude and slew limits, sensor processing, noise, reference, plant and fault realization. B1 has no `blend_alpha` smoother. B2 performs **40,000 action evaluations in 40 s**; latency applies only to context. Its policy contains no integrator input or external PD stabilizer. B3's first-order command smoothing operates on every tick.
 
----
+Learning-based fast-slow systems are an active engineering direction; [Helix 02](https://www.figure.ai/news/helix-02) is one example. B2 is a reproducible representative of the continuous-action route, not a reproduction of that system. The design horizon is **2027+ deployment across constrained devices**.
 
-## 1. The architecture
+## 2. Four-stage benchmark and field tuning
 
-```text
-+------------------------------ slow outer loop: 10 Hz ------------------------------+
-|  4 dimensionless macro-features -> coarse 3-class classifier -> regime in {1,2,3}  |
-|  (rms error, rms effort, max(slow residual, HF residual), rms velocity)             |
-|  margin x proximity confidence  -- collapses on ambiguity and on novelty            |
-|  independent nominal observer -> residual probe                                    |
-+-------------------------------------------------------------------------------------+
-               |  mailbox: {regime, confidence, frame age}
-               v
-+------------------------------ fast inner loop: 1 kHz ------------------------------+
-|  0  input firewall   NaN/Inf/out-of-range frame -> hold actuator, latch audit bit   |
-|  1  safety envelope  |x| > 90 % of limit, or |x| + 60 ms*|xdot| > limit -> SAFE      |
-|  2  OOD residual     spike channel OR narrowband HF channel -> ABSTAIN             |
-|  3  confidence       confidence below calibrated threshold or AI self-abstains      |
-|  4  heartbeat        stale frame -> GATE_HOLD_LATENCY, command and state frozen     |
-|  5  dwell            150 ms minimum between normal regime changes                   |
-|  6  cooldown         500 ms of consecutive clean ticks before the AI is re-armed    |
-|  7  controller bank  4 x PID + per-bank deterministic feedforward scale, anti-windup|
-|  8  clamps           bumpless transfer, |u| <= u_max, |du| <= slew_rate*dt           |
-|  9  audit            5 sticky fault bits: why the unit went safe, without the AI    |
-+-------------------------------------------------------------------------------------+
-               |
-               v
-      actuator   +   u_ff = white-box plant inverse from the commissioning model
+40 s, four 10 s stages, a 1 ms control period and two 0.5 ms physical substeps. Actuator limits are **20 N·m** and **2,000 N·m/s**. The state envelope is **|x| ≤ 1 rad**; S3's contact-force budget is **20 N**, using a 0.25 m lever arm.
+
+RMSE compares reference and true state at the same tick. TV is the within-stage sum of absolute command changes. A violation tick means the true state lies outside the envelope; it is separate from a gate activation. Tables use the Python + C99 run, seed 7. MATLAB independently reproduces the metrics within the declared 1% tolerance.
+
+| Stage | Branch | RMSE / rad | TV(u) / N·m | Violation ticks | Peak contact / N |
+|---|---|---:|---:|---:|---:|
+| S1 | B1 | 0.000664 | 8217.67 | 0 | — |
+| S1 | B2 | 0.004663 | 5804.16 | 0 | — |
+| S1 | B3 | 0.000630 | 1567.40 | 0 | — |
+| S2 | B1 | 0.017125 | 8100.68 | 0 | — |
+| S2 | B2 | 0.052245 | 5927.32 | 0 | — |
+| S2 | B3 | 0.020819 | 2083.14 | 0 | — |
+| S3 | B1 | 0.030182 | 18257.53 | 0 | 74.49 |
+| S3 | B2 | 0.036630 | 16743.89 | 0 | 18.95 |
+| S3 | B3 | 0.049949 | 9002.59 | 0 | 12.72 |
+| S4 | B1 | 0.412180 | 10393.22 | 880 | — |
+| S4 | B2 | 0.322109 | 11891.10 | 218 | — |
+| S4 | B3 | 0.275673 | 397.19 | 0 | — |
+
+**Zero-retraining unit adaptation, adjacent to the main result.** The classifier remains frozen. The following independent S2 validation uses a 6 s trajectory of amplitude 0.43 rad, seed 811; B1, factory B3 and tuned B3 use that same trajectory. These values are not mixed with the 10 s S2 window above. RMSE is in rad; TV is in N·m.
+
+| Inertia drift | B1 fixed PID | B3 factory `(1,1,1)` | B3 tuned `(2,1,1)` | RMSE reduction | B3 TV: factory → tuned | Violations |
+|---|---:|---:|---:|---:|---:|---:|
+| +35% | 0.016682 | 0.020331 | **0.009443** | 53.6% | 1249.03 → 1523.91 | 0 → 0 |
+| +50% | 0.023648 | 0.027846 | **0.013028** | 53.2% | 1254.20 → 1536.43 | 0 → 0 |
+
+Each search evaluates four gains `{0.75,1,1.5,2}`, then two damping values `{0.5,0.75}` at the best gain. Six 4 s trials give **24 s of device-side search**, followed by two 6 s validation rollouts. Host simulation time and device time are distinct. The safety-margin knob stays at 1.0. Rejected trials cannot become the selected candidate; if all candidates fail, the current knobs are retained.
+
+The tuned full 40 s missions also have **zero violations**, with S3 peak forces **14.38 / 13.23 N** for +35% / +50% inertia. B1 is more accurate than factory B3 in S2; tuned B3 is more accurate than B1 on the independent validation. In S3, B3 accepts more position error to reduce contact force and command variation. B2 also meets the S3 force budget in this run.
+
+![Four-stage comparison](assets/benchmark_4stages_showdown.png)
+
+### Physical fixture
+
+| Stage | Physical mechanism |
+|---|---|
+| S1 · nominal tracking | Inertia 0.010 kg·m², viscous damping 0.060 N·m·s/rad, ground stiffness 0.300 N·m/rad; dynamic/static friction 0.6 / 1.0 N·m |
+| S2 · unit-to-unit gap | Inertia +35%; dynamic/static friction 3.09 / 6.2625 N·m. Karnopp zero-speed band 0.003 rad/s; insufficient drive locks the state, breakaway switches to sliding friction |
+| S3 · contact and edge jitter | One-sided wall: stiffness 300 N·m/rad, damping 0.8 N·m·s/rad; position 0.43 + 0.025 sin(2π·0.73t + phase) rad with continuous approach. Measurement white-noise standard deviation 0.015 rad; context delay 60–120 ms and 8% frame drops |
+| S4 · unseen compound OOD | At 30.037 s, a passive motor/load pair with 20%/80% inertia split replaces the rigid actuator; positive stiffness/damping create a 12→24 Hz swept mode. Load sensing also receives 0.025 rad bias and 0.18 rad spikes |
+
+The inertia change persists through S3/S4; elevated friction belongs to S2. Both engines use the same 32-bit LCG and bounded, unit-variance white-noise construction. There is no sinusoidal measurement-noise tone. The flexible plant has a decaying zero-input response: the fault introduces no negative-damping source.
+
+B2 trains on **16,000 nominal-model action labels**, spanning tracking errors, reference derivatives and context. Contact-like context softens its nominal action target. Strong static friction, the moving wall and the flexible actuator are deployment shifts. Panel A separately trains on shifted-unit labels to measure adaptation; no test trajectory is used as a training label. The comparison tests this memoryless action head and training distribution, not every possible learned controller.
+
+### Controller bank
+
+| Controller | Kp | Ki | Kd | Feedforward scale |
+|---|---:|---:|---:|---:|
+| B1 | 110 | 300 | 1.5 | 1 |
+| B3 R1 · nominal | 60 | 60 | 1.2 | 1 |
+| B3 R2 · load / friction | 110 | 300 | 1.5 | 1 |
+| B3 R3 · compliant contact | 8 | 2 | 0.8 | 1 |
+| B3 R4 · safe fallback | 2 | 0 | 0.35 | **0** |
+
+R4 suppresses nominal trajectory feedforward by design. Its feedback law and the physical damping remain deterministic.
+
+## 3. Mode necessity and independent protection
+
+Fixed-bank ablations retain the **same fast safety gates**. Dynamic classification and physical rules read only measured features. All six variants below have zero state-envelope violations.
+
+| Supervisor | S1 RMSE | S2 RMSE | S3 RMSE | S4 RMSE | S3 TV | S3 peak / N |
+|---|---:|---:|---:|---:|---:|---:|
+| R1 | 0.000630 | 0.048769 | 0.038107 | 0.276310 | 12993.85 | 35.12 |
+| R2 | 0.000715 | 0.019624 | 0.030081 | 0.276936 | 14779.48 | 71.34 |
+| R3 | 0.002368 | 0.416069 | 0.066815 | 0.275729 | 8899.58 | 8.76 |
+| R4 | 0.244245 | 0.491956 | 0.245783 | 0.297341 | 3904.54 | 0.00 |
+| dynamic | 0.000630 | 0.020819 | 0.049949 | 0.275673 | 9002.59 | 12.72 |
+| rules | 0.000630 | 0.020819 | 0.049949 | 0.275673 | 9002.59 | 12.72 |
+
+The fixed-bank results expose the load/contact tradeoff. The rule supervisor and the prototype classifier produce the same main-run result, supporting the **model-agnostic slow interface**. A rule tree or compact VLM can replace the prototype classifier without changing actuator ownership.
+
+The probe combines a median-based spike channel with a **broadband high-frequency innovation envelope**: time-aligned nominal acceleration prediction, two-pole 25 Hz low-pass processing, 5 Hz high-pass innovation, an 8 ms energy window, normalization by 500 rad/s² and a 1 s release envelope. A separate slow innovation feature supports classification. No fault frequency enters the deployed probe.
+
+The full compound fault's first spike triggers a veto in the same control tick. **Anomaly detection delay and core response time are different measurements.** With the spike channel disabled, a 0.2 rad sensor oscillation at 12 / 18 / 37 / 83 / 137 Hz is detected after **30 / 6 / 4 / 3 / 3 ms**, following a quiet initialization interval. With spikes, confidence, envelope and timeout vetoes removed from the compound-fault test, the independent broadband probe detects after **947 ms**, retains zero violations and limits maximum |x| to **0.7482 rad**.
+
+The main run selects R1 throughout S1, R2 for 96.8% of S2 and R3 for 98.22% of S3; the remaining normal-stage ticks cover transitions. S4 stays in R4 after fault onset. The main run has no normal-stage low-confidence veto. In five additional noise/phase runs, B1/B2 S4 violations range over **798–862 / 131–199 ticks**, while B3 remains at zero; B3 S3 peak force is **7.64–9.68 N**. Two runs each contain one fresh low-confidence frame at the S3 transition, producing 103 / 111 veto ticks; stale-frame ticks and recovery cooldown are counted separately.
+
+Removing only OOD veto leaves other gates active but produces **75 violation ticks**, maximum **|x| = 1.4819 rad** and S4 TV **2,894.99 N·m**. Restoring R4 feedforward in a separate ablation still gives zero violations, so zero feedforward is a fallback design convention rather than a uniquely necessary safety mechanism. Higher sweep bands 18→36 and 24→48 Hz do not produce B2 envelope breaches. Removing context jitter changes B2's S3 peak force only from **18.95 to 18.86 N**; the dominant comparison here is friction, contact and measurement noise. One/two/four-substep runs retain the main safety and contact conclusions.
+
+## 4. Small-sample commissioning and resource accounting
+
+`auto_calibrate(samples, labels)` builds three four-dimensional prototypes and confidence parameters from **36 labeled macro-windows**, twelve from each of three 10 s commissioning probes. Windows are not independent experiments. The resulting model has **15 stored scalars**: twelve prototype values, a distance-decay coefficient and two confidence thresholds.
+
+`auto_field_tune(evaluate, current)` freezes that model and searches physical gains using measured error and an explicit validity result. The two reusable helpers fit in 20–30 lines inside the [117-line template](python_bench/minimal_template.py).
+
+![Sample budgets, field tuning and storage](assets/efficiency_and_generalization.png)
+
+Panel A uses the actual conditional RBF at 64 / 256 / 1,024 / 4,096 / 16,000 action labels, with up to 512 centers. It reports nominal performance, frozen transfer and retrained transfer. The curves are non-monotonic; retraining improves some budgets without restoring nominal accuracy. Action labels and macro-windows are distinct sample units and are not divided into a sample-efficiency ratio.
+
+| Resource category | Size |
+|---|---:|
+| Conditional RBF, including normalization, centers, width and output coefficients | 5,149 scalars; 41,192 B FP64 / 20,596 B FP32 storage |
+| Prototype classifier | 15 scalars; 60 B FP32 storage |
+| C99 state / configuration / field knobs | **88 / 132 / 12 B** |
+| C99 object text, GCC 4.9.2 x86-64 | 3,880 B at `-Os`; 4,568 B at `-O2` |
+
+FP32 model bytes are a storage calculation; numerical RBF runs use FP64. State RAM, model storage and code size are separate quantities. Python prints measured RBF and C-call host times, including ctypes overhead; they are not target WCET. The core uses only `<stdint.h>`, fixed-size arithmetic and no heap, I/O, libm or mutable globals.
+
+## 5. Port the contract to a new system
+
+| Application example | Slow qualitative decision | Deterministic fast loop |
+|---|---|---|
+| Industrial WAAM / PLC servo | Process, load and contact regime | Process/servo law, actuator constraints, field tuning |
+| Edge VLA / fast-slow robotics | Task and environment context | Torque/impedance law, disturbance handling, fallback |
+| Closed-loop aDBS / SCS | Biomarker and interface-state class | Device-defined control law, output envelope and timing |
+
+![Three mappings of the common control contract](assets/domain_profiles_comparison.png)
+
+Define variables and a safe fallback → commission the nominal model and controller bank → calibrate measured macro-features → freeze AI and field-tune. A new physical domain needs new units, limits, control laws and probes. A new unit in the same domain can retain the commissioned classifier.
+
+```c
+LayeredState_t state;
+LayeredConfig_t config;       /* device-defined units, limits and bank */
+FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
+LayeredInput_t input;         /* measured signals and timestamped regime frame */
+/* Populate config and input before calling. */
+Layered_Init(&state, &config, &field_tuning);
+LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 ```
 
-Zero heap. No `math.h`. No recursion. No OS calls. Straight-line code, O(1) worst-case execution time. `LayeredState_t` is 88 B; `LayeredConfig_t` is 132 B. The AI is allowed to be slow, jittery and occasionally absent; the inner loop never waits on it.
+The nine core duties are input/configuration validation, predictive envelope veto, residual veto, confidence/abstention veto, heartbeat watchdog, minimum dwell, recovery cooldown, controller-bank execution with anti-windup and output limits, and sticky fault reporting. Each integrator tracks the applied command; output magnitude is clamped before slew. The C ABI and function signatures remain fixed.
 
-The key v1.1.0 detail is the **orthogonal residual probe**:
+Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share read-only configuration only where units and limits agree; coupled constraints belong in the device adapter. On a **350 ms** slow-loop timeout the adapter sends explicit R4 abstention and preserves real frame age. Clean recovery passes through the core's **300 ms** cooldown. Native C `HOLD` freezes the **actuator command**, not mechanical position.
 
-* **spike channel** — median-5 deviation of the position measurement, normalized by `res_fast_scale`;
-* **HF resonance channel** — a 2nd-order narrowband resonator at the profile's OOD mode (42 Hz industrial), 8 Hz bandwidth, 4 ms RMS energy, 2-tick confirmation;
-* **slow channel** — LP(innovation), used only as a classifier feature.
+See [AGENTS.md](AGENTS.md), the [domain mapping guide](docs/domain_mapping_guide.md), and the [systems engineering rationale](docs/systems_engineering_manifesto_en.md). Deployment code does not accept stage labels, injected fault frequency or simulator truth.
 
-The gate receives `max(res_fast, res_hf_gated)`. This is why 20× broadband measurement noise (S3) does not trip the OOD veto, while a 42 Hz structural resonance does.
+## 6. Reproduce
 
-### Engineering-systems division of labour
-
-This is not a bid for a larger single-point model. It is a structural division of labour: the **10 Hz slow loop** is given the job AI is actually good at — qualitative pattern recognition and coarse semantic classification in a dimensionless feature space — and is deliberately kept away from high-frequency continuous control, where an end-to-end model can overfit the old machine's inverse-dynamics manifold, jitter under edge inference, and hallucinate a confident command in an unseen OOD condition. The **1 kHz fast loop** is given the job deterministic control is good at — continuous high-rate regulation, quantitative drift absorption, and hard-real-time safety — with an O(1) gate and a minimal physics-residual probe enforcing the envelope.
-
-### Why a synthetic isomorphic benchmark?
-
-As a general architecture reference, the repository deliberately uses a **parameterised synthetic nonlinear plant** as a controlled stress test. On a real production line or clinical device one cannot safely and repeatably inject an unseen structural resonance (Stage 4) to measure an end-to-end model's destructive envelope breach, cannot lock a unit to exactly +35 % parameter drift, and cannot sweep `N = 15…2000` calibration samples for a clean counterfactual ablation. The synthetic benchmark makes those counterfactuals exact and reproducible; the domain presets are isomorphic mappings, not claims of hardware validation.
-
-## 2. Headline numbers
-
-Industrial reference preset, 40 s, 4 stages, 1 kHz inner loop, three branches on the identical plant, reference, noise realisation and fault schedule:
-
-| Metric | Branch 1: fixed PID | Branch 2: end-to-end AI | Branch 3: layered |
-| :--- | ---: | ---: | ---: |
-| RMSE S1 fast tracking [rad] | 0.0566 | 0.0397 | **0.0077** |
-| RMSE S2 +35 % load/Stribeck [rad] | 0.1790 | 0.1585 | **0.0057** |
-| RMSE S3 contact/HF noise/edge latency [rad] | 0.1921 | 0.1670 | **0.0074** |
-| RMSE S4 unseen OOD [rad] | 0.1693 | 0.8308 | **0.0303** |
-| Safety Violation Ticks S4 [ms] | 0 | 2574 | **0** |
-| OOD veto latency | - | - | **2.0 ms** |
-| Calibration Samples N (classifier / continuous) | - | ~500 | **≤ 40** |
-| Compute (MAC/s) | - | 2.40e9 | **2.41e4** |
-| Memory footprint | - | 5.60e6 B | **2.21e3 B** |
-
-`Safety Violation Ticks` are 1 kHz samples with `|x| > x_limit`; at `dt = 1 ms` the count equals milliseconds. `Control Effort TV(u) = Σ|u_k − u_{k−1}|` is the actuator-command total variation. `N` is the number of calibration samples used to fit the classifier or the continuous head.
-
-**Control Effort TV(u), S1–S3:** layered **0.41e3 N·m** vs 1.24e3 (B1) and 1.33e3 (B2). In S4 the layered safe-fallback regulator spends **1.97e3 N·m** because it holds the axis inside the envelope while the OOD mode is active; the end-to-end branch has lower S4 TV but 2,574 violation ticks. Read TV together with the safety column, never alone.
-
-## 3. Mode-necessity ablation
-
-`run_all_benchmarks` runs three fixed-bank 40 s simulations and one stage-forced oracle (S1→R1, S2→R2, S3→R3, S4→safe fallback), plus the deployed 10 Hz classifier:
-
-| controller | S1 | S2 | S3 | S4 | S1–S3 | 40 s |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Stage-forced oracle | 0.0083 | 0.0056 | 0.0071 | 0.0322 | **0.00710** | **0.01721** |
-| Fixed R1 | 0.0083 | 0.0077 | 0.0175 | 0.0293 | 0.01201 | 0.01798 |
-| Fixed R2 | 0.0095 | 0.0058 | 0.0117 | 0.0316 | 0.00935 | 0.01777 |
-| Fixed R3 | 0.0938 | 0.0150 | 0.0072 | 0.0346 | 0.05501 | 0.05069 |
-| Deployed 10 Hz classifier | 0.0077 | 0.0057 | 0.0074 | 0.0303 | 0.00700 | 0.01630 |
-
-The oracle is the ideal-classifier bound; the deployed classifier is within 2 % of its S1–S3 RMSE (0.00700 vs 0.00710). The stage-forced dynamic passes the `<0.8 ×` fixed-bank criterion (`0.00710 / 0.00935 = 0.759`) and the 40 s criterion.
-
-## 4. Paired sample complexity (Figure 2, Panel A)
-
-Both learners receive the **same N paired samples from the nominal unit** (`drift = 0`); the test deployment is the same unit at 0 % drift and a +35 % drifted unit. The oracle is the same 495-term continuous head retrained on +35 % drifted data.
-
-| N | Layered @ +35 % | Continuous nominal-only @ 0 % | Continuous nominal-only @ +35 % | Oracle @ +35 % |
-| ---: | ---: | ---: | ---: | ---: |
-| 15 | **100.0 %** | 78.1 % | 3.1 % | 59.4 % |
-| 40 | **100.0 %** | 84.4 % | 0.0 % | 71.9 % |
-| 120 | **100.0 %** | 96.9 % | 3.1 % | **100.0 %** |
-| 500 | **100.0 %** | 100.0 % | 6.2 % | 100.0 % |
-| 2000 | **100.0 %** | 100.0 % | **0.0 %** | 100.0 % |
-
-The shape is the argument: the coarse classifier saturates at N = 40 on a unit it never saw; the continuous regression trained only on nominal data never recovers on the drifted unit, even with 2,000 samples. The oracle recovers at N = 120, proving that the gap is **data coverage**, not model capacity.
-
-## 5. The three figures
-
-![Four-stage showdown: state tracking inside the safety envelope, actuator command, residual and confidence, regime and gate timeline](assets/benchmark_4stages_showdown.png)
-
-**Figure 1 — 40 s, four stages, three branches.** (a) state tracking against the hard envelope; (b) actuator command; (c) spike and HF residual channels with the AI confidence; (d) active regime and gate timeline. The S4 transition into `REGIME_SAFE_FALLBACK (4)` is a named decision, not a silent clamp.
-
-![Paired sample complexity, zero-retraining drift robustness, compute and memory footprint](assets/efficiency_and_generalization.png)
-
-**Figure 2 — paired data efficiency.** (a) layered classifier vs nominal-only continuous head vs +35 %-trained oracle; (b) full-loop drift sweep with the AI frozen; (c) compute, memory and inference rate.
-
-![Cross-domain trajectories for industrial servo, edge VLA and closed-loop neuromodulation](assets/domain_profiles_comparison.png)
-
-**Figure 3 — the same architecture on three domains.** Only the physical constants, stage names and envelope units change; the C99 core and gate semantics do not.
-
-## 6. Run and verify
-
-### Full MATLAB acceptance run
-
-```powershell
-matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
-```
-
-Success criteria:
-
-| Signal | Expected |
-| :--- | :--- |
-| checks `[1]`–`[5]` | all `PASS` |
-| final line | `All five engineering checks passed.` |
-| figures | `assets/benchmark_4stages_showdown.png`, `assets/efficiency_and_generalization.png`, `assets/domain_profiles_comparison.png` rewritten at 240 dpi |
-| model | `matlab_simulink/ai_layered_control_bench.slx` rebuilt (built-in blocks only) if Simulink is installed and the model is not open with unsaved edits |
-| exit code | `0` |
-
-If Simulink is not installed, the numeric benchmark and all five checks still run; the `.slx` step prints a skip line.
-
-### C99 core regression test
-
-```powershell
-cd c99_layered_core
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe layered_gatekeeper.c test_gatekeeper_standalone.c
-.\test_gatekeeper_standalone.exe
-$LASTEXITCODE
-```
-
-Linux / macOS (bash / zsh):
-
-```bash
-cd c99_layered_core
-cc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone layered_gatekeeper.c test_gatekeeper_standalone.c
-./test_gatekeeper_standalone
-echo $?
-```
-
-Expected: `SUMMARY: n_pass=116, n_fail=0`, exit code 0, no compiler diagnostics.
-
-### C99 ↔ MATLAB closed-loop equivalence
-
-```powershell
-matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
-```
-
-Expected: `PASS: 6000 closed-loop ticks; gate/regime/fault exact; max|du|=4.82e-07, max|du_target|=4.82e-07, max|dblend|=9.5e-08` (tolerances `1e-4`). No compiler => `SKIP`.
-
-### 3-step C99 porting
-
-1. Copy `c99_layered_core/layered_gatekeeper.c` and `.h` into the target; compile as ANSI C99 (`-std=c99`), with no heap, no `libm`, no recursion.
-2. Fill `LayeredConfig_t` with the target's units, limits and bank gains, then call `Layered_Init(&state, &config)` once at boot.
-3. In the 1 kHz (1 ms) ISR fill `LayeredInput_t` and call `Layered_Step(&state, &in, &out)`; write `out.u` to the actuator and persist/log `out.gate`, `out.regime` and the sticky fault bits.
-
-### Python-only quickstart (no MATLAB)
+Python 3 + the existing NumPy/matplotlib requirements; C99 compiler for the core-backed path:
 
 ```powershell
 python -m pip install -r python_bench/requirements.txt
 python python_bench/run_benchmark.py
-```
-
-The entry tries to compile `c99_layered_core/layered_gatekeeper.c` with `ctypes` (Windows `.dll`, macOS `.dylib`, Linux `.so`); if no compiler is present it prints one line and falls back to the pure-Python/NumPy gatekeeper mirror. `--no-c` forces the mirror; `--selftest` replays 500 deterministic frames through both implementations and requires exact gate/regime and `|du| <= 1e-5`.
-
-The **1 kHz C99 gatekeeper is frame-for-frame equivalent** between the MATLAB engine and the Python implementation (`--selftest` max `|du| = 1.55e-07 < 1e-6`). The standalone Python benchmark's 10 Hz outer probe uses adaptive noise floors and a confidence EMA; therefore its B3 S1–S4 RMSE is **0.0090 / 0.0053 / 0.0343 / 0.0873**, OOD veto **9.0 ms** (< 10 ms), and its safety-violation tick count is **0** in every stage. Those Python-run numbers intentionally differ from the MATLAB 40 s table; the gate semantics and C core do not.
-
-### Reusable core vs benchmark harness
-
-| Role | Files | What to do |
-| :--- | :--- | :--- |
-| **[REUSABLE CORE]** | `c99_layered_core/layered_gatekeeper.c/.h` + `python_bench/minimal_template.py` | Copy these into the target project. The template is a 10 Hz + 1 kHz copy-paste skeleton; it loads the C core via `ctypes` or falls back to a minimal Python gate. |
-| **[BENCHMARK HARNESS]** | `matlab_simulink/run_all_benchmarks.m`, `matlab_simulink/sim_core_engine.m`, `python_bench/run_benchmark.py` | Reproduces the 40 s paper/repo figures. **Do not copy the synthetic plant into production.** |
-
-`python_bench/minimal_template.py` has exactly three replacement slots:
-
-1. `[USER-PLUGIN-SLOT 1]` — `read_plant_and_reference(t)`: real sensor `(q, dq)` and reference `(q_ref, dq_ref, ddq_ref)`;
-2. `[USER-PLUGIN-SLOT 2]` — `compute_nominal_residual(q, dq, u_prev)`: the domain's minimal nominal-physics residual probe;
-3. `[USER-PLUGIN-SLOT 3]` — `slow_loop_10hz_step(...)`: 4-D dimensionless macro-features, margin × proximity confidence, S3 residual guard, coarse `ai_regime ∈ {1,2,3,4}`.
-
-It runs a one-second, 1 kHz closed-loop demo and exits with `[OK] Minimal layered control loop completed (0 safety violations)`:
-
-```powershell
+python python_bench/run_benchmark.py --no-c
+python python_bench/run_benchmark.py --selftest
 python python_bench/minimal_template.py
+gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
+.\c99_layered_core\test_gatekeeper_standalone.exe
 ```
 
-### Simulink model as a standalone artifact
+The template recompiles when either C source or header changes; compiler failure is explicit. The benchmark's `--no-c` path uses a complete Python mirror. C regression: **120 passes, zero failures**. Python/C shared-input replay: **6,000 frames**, exact gate/regime/fault agreement, maximum command difference below `1e-4`.
+
+MATLAB R2024b + Simulink, built-in functions and blocks:
 
 ```powershell
-matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('model runs standalone')"
+matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
+matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
+matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('standalone model PASS')"
 ```
 
-The model is built from built-in blocks only, with every numeric parameter inlined. It is a visualization of the three branches; the quantitative benchmark lives in `sim_core_engine.m`.
+The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits a JSON report. MATLAB/C replay uses **40,000 common frames** with exact discrete outputs. The `.slx` is a self-contained architectural sketch; the numerical engines generate the quantitative results. Its B2 delay/hold is on the context path, while the action path runs at 1 kHz. Read [the builder](matlab_simulink/build_simulink_model.m) as the model's source.
 
-## 7. The three domain presets
+The safety partition relates to Simplex / runtime assurance; see [AFRL RTA](https://github.com/act3-ace/run-time-assurance) and [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html).
 
-| Domain | S1 | S2 | S3 | S4 |
-| :--- | :--- | :--- | :--- | :--- |
-| **industrial WAAM** | Fast torch/axis tracking (light deposition load) | +35 % layer-heat equivalent load drift & wire-feed Stribeck friction | Arc/contact stiffness + arc-voltage HF noise + fieldbus latency | Unseen structural resonance & sensor spikes |
-| **edge VLA** | High-speed free-space motion (light payload) | +35 % payload drift & joint static friction | Contact stiffness step + vision/force HF noise + 10 Hz edge inference jitter | Unseen structural resonance & sensor spikes |
-| **neuromodulation** | Fast phasic biomarker tracking | +35 % electrode–tissue impedance drift & activation-threshold nonlinearity | High-coupling neural rebound + EMG/artifact HF noise + telemetry jitter | Unseen OOD pathological oscillation & lead micro-dislodgement spikes |
-
-The shared dimensionless fields are `friction_scale`, `k_scale`, `noise_scale` and per-bank `ff_scale`; the domain comments in `load_domain_profile.m` and `docs/domain_mapping_guide.md` use the domain's own physics. Neuromodulation never uses mechanical-arm wording.
-
-+35 % drift in the industrial preset means: `J ×1.35, b ×1.25, k ×1.10, fc ×2.00, fs ×2.40, vs ×0.25, fvisc ×1.20`.
-
-## 8. Repository contents
-
-```text
-ai-layered-control/
-├── README.md / README_zh.md            this file / 中文版
-├── AGENTS.md                           machine-readable invariants, playbook, commands
-├── docs/
-│   ├── systems_engineering_manifesto_en.md / _zh.md
-│   └── domain_mapping_guide.md
-├── c99_layered_core/
-│   ├── layered_gatekeeper.h            88 B state / 132 B config contract
-│   ├── layered_gatekeeper.c            zero-dependency 1 kHz core
-│   ├── test_gatekeeper_standalone.c    116 deterministic checks
-│   └── verify_core_equivalence.c       closed-loop C replay harness (test-only)
-├── matlab_simulink/
-│   ├── load_domain_profile.m
-│   ├── sim_core_engine.m
-│   ├── calibrate_coarse_classifier.m
-│   ├── train_continuous_policy.m
-│   ├── run_efficiency_analysis.m
-│   ├── run_all_benchmarks.m
-│   ├── build_simulink_model.m
-│   ├── verify_core_equivalence.m
-│   └── ai_layered_control_bench.slx    generated artifact
-├── python_bench/
-│   ├── minimal_template.py             98-line reusable copy-paste skeleton
-│   ├── run_benchmark.py                ctypes C core or NumPy fallback (40 s harness)
-│   ├── README.md                       reusable-core / harness distinction
-│   └── requirements.txt
-└── assets/                             three generated 240 dpi figures
-```
-
-Plain text: C99, MATLAB, Python, Markdown. No committed weights or datasets: the RBF policy is fitted deterministically at commissioning time from a synthetic nominal-unit rollout; the classifier prototypes are fitted from three stage probes; the C core is the deployable artifact.
-
-## 9. Scope and disclaimer
-
-This repository is a methodological reference implementation of a fast/slow-loop decoupled control architecture: a coarse semantic classifier, an independent physics-residual abstention probe, and a deterministic 1 kHz safety gate. The `neuromodulation` (aDBS/SCS) preset is a lumped-parameter synthetic nonlinear-dynamics and isomorphic biomarker-envelope model; it contains no patient records and is not a clinical physiological or pathological model of any specific disease. The C99 core follows defensive embedded principles (zero dynamic allocation, O(1) worst-case execution, NaN firewall, sticky fault audit), but it has not been certified and makes no claim of compliance with IEC 62304, ISO 14971, IEC 60601, or IEC 61508. Any clinical implant/wearable neuromodulation or high-risk industrial deployment must add independent hardware charge-balance protection, an external watchdog, and complete clinical/regulatory validation.
-
-## 10. Citation
-
-If you use this reference architecture or benchmark in your work, please cite:
-
-```bibtex
-@software{li2026ailayeredcontrol,
-  author       = {Li, Jiawei},
-  title        = {ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control},
-  year         = {2026},
-  version      = {1.1.0},
-  url          = {https://github.com/lijiawei255/ai-layered-control},
-  license      = {MIT}
-}
-```
-
-**Sister project:** [jev-tune](https://github.com/lijiawei255/jev-tune) — continuous parameter-layer tuning inside a single controller, with a C99 safety-boundary fallback.
+**Scope.** This repository supplies a reference control contract and reproducible numerical evidence for the specified fixture. Application mappings do not constitute hardware, clinical or functional-safety validation or certification; deployment requires device-specific hazard analysis, envelope definition and validation.

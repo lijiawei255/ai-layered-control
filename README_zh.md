@@ -1,289 +1,178 @@
-# ai-layered-control
+# ai-layered-control · v2.0.0
 
-[English](README.md) | [简体中文](README_zh.md)
+[English](README.md) | [简体中文](README_zh.md) · [MIT](LICENSE) · [Agent 指引](AGENTS.md)
 
-[![Release v1.1.0](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/lijiawei255/ai-layered-control/releases)
-[![ANSI C99 零堆核心](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-00599C.svg)](c99_layered_core/)
-[![Python 与 MATLAB/Simulink 基准](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-2ea44f.svg)](python_bench/)
-[![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+**面向慢环定性 AI、快环确定性控制与 AI 零重训适配的通用参考架构。** 慢环只选择工况或显式弃权，零依赖 C99 核在 1 kHz 独占执行器。
 
-**面向闭环 AI 控制的参考架构：慢速粗粒度 AI 分类器只决定机器处于*哪一种*控制模态；快速、零依赖的确定性核心决定*如何*驱动执行器。分层路径中，任何端到端 `u = pi(x)` 模型都不会进入 1 kHz 指令通路。**
+三类应用共同体现这一分工：**工业增材 WAAM／PLC 伺服**、**边缘 VLA／快慢分层机器人**、**闭环 aDBS／SCS 神经调控**。它们是同一控制契约的实例；任何面临小样本、跨设备差异、间歇接触、上下文不确定性与严格输出约束的系统，都可以按此契约建立适配层。
 
-**核心结论（TL;DR）**
+## 1. 三条控制路线
 
-* **几十次标定，而不是上千次。** 10 Hz 粗分类器把 4 维无量纲宏观特征映射到 3 档阻尼策略；在 **N = 40** 个标定样本时达到 **100% 部署质量**。同分布的连续回归需要约 120–500 个名义机组样本才能达到同样的分布内质量。
-* **+35% 整机漂移，零重训。** 四阶段基准中，分层支路 S2 RMSE 为 **0.0057 rad**，端到端支路为 **0.1585 rad**。仅在名义数据上训练的连续策略，在 +35% 漂移机组上即使 N=2000 仍是 **0%** 达标；用漂移数据训练的 oracle 在 N=120 恢复到 **100%**。
-* **未见 OOD 故障显式弃权。** 分层支路 S4 安全包络越界 **0** 个采样点，端到端支路 **2574** 个；OOD 否决在故障后 **2.0 ms** 锁存。只保留 42 Hz 谐振或只保留传感器尖峰时同样 **2.0 ms** 触发；S1–S3 在 20 倍宽带测量噪声下 OOD 否决采样点 **0**。
-* **模态必要性消融。** 动态选择的 S1–S3 RMSE 为 **0.00710**，固定 R1/R2/R3 分别为 **0.01201 / 0.00935 / 0.05501**；40 s 综合为 **0.01721** 对 **0.01798 / 0.01777 / 0.05069**。实际 10 Hz 分类器为 **0.00700 / 0.01630**，与 stage-forced 上界相差 2% 以内（0.00700 对 0.00710，略优）。
-* **真正训练出的基线。** Branch 2 是由名义机组教师 rollout 闭式拟合的 RBF 逆动力学模型 + 固定 PD 稳定器；Branch 3 的 3×4 原型与置信度阈值由 `calibrate_coarse_classifier.m` 从闭环探针生成，没有硬编码原型表。
+| 支路 | 慢环上下文 | 1 kHz 连续执行器指令 |
+|---|---|---|
+| B1 · 现代白盒基线 | 单组固定档位 | 标称逆动力学前馈＋高增益抗饱和 PID |
+| B2 · 学习式快慢策略 | 10 Hz 四维可测宏观特征，独立延迟 | 512 中心条件 RBF 动作头，`u = π(x, x_dot, r, r_dot, r_ddot, z)` |
+| B3 · 定性／定量解耦 | 10 Hz 与算法解耦的档位＋置信度＋时间戳 | C99 控制器组、九项保护职责、确定性前馈及现场整定 |
 
-> **适用范围。** 本仓库是合成非线性被控对象上的方法论参考实现；完整边界见文末唯一的**适用范围与免责声明**。文中所有数字均由 §6 的验收命令产生。
+B1 与 B3 使用**完全相同的标称前馈**。三支路共享执行器幅值与斜率限制、测量处理、噪声、参考、对象及故障实现。B1 不使用 `blend_alpha` 平滑器。B2 在 40 s 中实际执行 **40,000 次动作推理**；延迟只作用于上下文，策略没有积分器输入或外接 PD 稳定器。B3 的一阶指令平滑作用于每个 tick。
 
----
+学习式快慢系统正在持续演进，[Helix 02](https://www.figure.ai/news/helix-02) 是其中一个实例。B2 是连续动作路线的可复现代表，并非对该系统的复刻。本仓库的设计目标是 **2027 年及之后受限设备上的工程落地**。
 
-## 1. 架构
+## 2. 四阶段基准与现场整定
 
-```text
-+------------------------------ 慢环：10 Hz --------------------------------+
-|  4 维无量纲宏观特征 -> 3 类粗分类器 -> regime ∈ {1,2,3}                  |
-|  (rms 误差, rms 指令, max(慢残差, 高频残差), rms 速度)                    |
-|  margin x proximity 置信度 -- 在类别歧义与远离原型时同时下降              |
-|  独立名义观测器 -> 物理残差探针                                          |
-+---------------------------------------------------------------------------+
-               |  邮箱：{regime, confidence, frame age}
-               v
-+------------------------------ 快环：1 kHz --------------------------------+
-|  0  输入防火墙   NaN/Inf/越界帧 -> 保持执行器，锁存审计位                 |
-|  1  安全包络     |x| > 90% 限制，或 |x| + 60 ms*|xdot| > 限制 -> SAFE        |
-|  2  OOD 残差     尖峰通道 或 窄带高频通道 -> 显式弃权                     |
-|  3  置信度       低于标定阈值或 AI 主动弃权 -> 显式弃权                   |
-|  4  心跳         慢环帧过期 -> GATE_HOLD_LATENCY，指令与状态冻结          |
-|  5  驻留         正常模态切换至少 150 ms                                  |
-|  6  冷却         500 ms 连续干净采样后才重新武装 AI                       |
-|  7  控制器 bank  4 × PID + 每档确定性前馈缩放，逐控制器抗饱和             |
-|  8  钳位         无扰切换，|u| <= u_max，|du| <= slew_rate*dt              |
-|  9  审计         5 位粘滞故障位：为什么进入安全态，无需 AI 自省           |
-+---------------------------------------------------------------------------+
-               |
-               v
-      执行器  +  u_ff = 由调试模型给出的白盒被控对象逆模型
+总时长 40 s，每阶段 10 s；控制周期 1 ms，物理积分采用两个 0.5 ms 子步。执行器限制为 **20 N·m** 与 **2,000 N·m/s**。状态包络为 **|x| ≤ 1 rad**；S3 接触力预算为 **20 N**，通过 0.25 m 力臂换算。
+
+RMSE 比较同一 tick 的参考与真实状态。TV 为阶段内指令变化绝对值之和。越界 tick 按真实状态超包络计数，与门控激活次数分别统计。表格来自种子 7 的 Python＋C99 实测；MATLAB 独立实现的指标满足 1% 一致性要求。
+
+| 阶段 | 支路 | RMSE / rad | TV(u) / N·m | 越界 tick | 峰值接触力 / N |
+|---|---|---:|---:|---:|---:|
+| S1 | B1 | 0.000664 | 8217.67 | 0 | — |
+| S1 | B2 | 0.004663 | 5804.16 | 0 | — |
+| S1 | B3 | 0.000630 | 1567.40 | 0 | — |
+| S2 | B1 | 0.017125 | 8100.68 | 0 | — |
+| S2 | B2 | 0.052245 | 5927.32 | 0 | — |
+| S2 | B3 | 0.020819 | 2083.14 | 0 | — |
+| S3 | B1 | 0.030182 | 18257.53 | 0 | 74.49 |
+| S3 | B2 | 0.036630 | 16743.89 | 0 | 18.95 |
+| S3 | B3 | 0.049949 | 9002.59 | 0 | 12.72 |
+| S4 | B1 | 0.412180 | 10393.22 | 880 | — |
+| S4 | B2 | 0.322109 | 11891.10 | 218 | — |
+| S4 | B3 | 0.275673 | 397.19 | 0 | — |
+
+**换机台零重训：冻结 AI，只调底层旋钮。** 紧接主表的独立 S2 验证采用 6 s、0.43 rad 幅值轨迹，种子 811；B1、出厂 B3 与整定 B3 使用同一轨迹。这些数值不与上面 10 s 的 S2 窗口混用。RMSE 单位为 rad，TV 单位为 N·m。
+
+| 惯量漂移 | B1 固定 PID | B3 出厂 `(1,1,1)` | B3 整定 `(2,1,1)` | RMSE 降幅 | B3 TV：出厂 → 整定 | 越界 |
+|---|---:|---:|---:|---:|---:|---:|
+| +35% | 0.016682 | 0.020331 | **0.009443** | 53.6% | 1249.03 → 1523.91 | 0 → 0 |
+| +50% | 0.023648 | 0.027846 | **0.013028** | 53.2% | 1254.20 → 1536.43 | 0 → 0 |
+
+每次搜索先评估增益 `{0.75,1,1.5,2}`，再在最佳增益处评估阻尼 `{0.5,0.75}`。六次 4 s 试验对应 **24 s 设备侧搜索**，之后进行两次 6 s 验证。主机计算耗时与设备运行时间分开报告。安全裕度旋钮保持 1.0；不合格候选不参与选择，全部不合格时保留当前旋钮。
+
+整定后的完整 40 s 任务同样**零越界**；+35%／+50% 惯量机台的 S3 峰力分别为 **14.38／13.23 N**。B1 的 S2 精度优于出厂 B3，整定 B3 则在独立验证中优于 B1。S3 的 B3 接受更大的位置偏差，以降低接触力和指令变化；本轮 B2 也满足 S3 接触力预算。
+
+![四阶段闭环对比](assets/benchmark_4stages_showdown.png)
+
+### 物理试验场
+
+| 阶段 | 物理机制 |
+|---|---|
+| S1 · 标称跟踪 | 惯量 0.010 kg·m²，黏性阻尼 0.060 N·m·s/rad，接地刚度 0.300 N·m/rad；动／静摩擦 0.6／1.0 N·m |
+| S2 · 跨机台鸿沟 | 惯量 +35%；动／静摩擦 3.09／6.2625 N·m。Karnopp 零速带 0.003 rad/s；驱动力不足时锁止，突破静摩擦后进入滑动 |
+| S3 · 接触与边缘抖动 | 单边墙刚度 300 N·m/rad、阻尼 0.8 N·m·s/rad；位置 0.43 + 0.025 sin(2π·0.73t + phase) rad，并连续接近。测量白噪声标准差 0.015 rad；上下文延迟 60～120 ms、丢帧率 8% |
+| S4 · 未知复合 OOD | 30.037 s 起，由惯量按 20%／80% 分配的被动电机／负载双惯量代替刚性执行器；正刚度、正阻尼产生 12→24 Hz 扫频模态。负载测量另含 0.025 rad 偏置与 0.18 rad 尖峰 |
+
+惯量偏差延续至 S3／S4，摩擦强化仅属于 S2。双引擎使用同一 32 位 LCG 及有界、单位方差白噪声构造，不叠加正弦测量杂音。柔性对象的零输入自由响应衰减，故障模型没有负阻尼发散源。
+
+B2 使用 **16,000 条标称模型动作标签**训练，覆盖跟踪误差、参考导数与上下文；接触型上下文会降低标称动作目标的刚度。强静摩擦、运动接触墙和柔性执行器属于部署分布变化。Panel A 另用漂移机台标签重训，测量适配效果；测试轨迹不参与标签生成。对比结论针对这里的无记忆动作头和训练分布。
+
+### 控制器组
+
+| 控制器 | Kp | Ki | Kd | 前馈比例 |
+|---|---:|---:|---:|---:|
+| B1 | 110 | 300 | 1.5 | 1 |
+| B3 R1 · 标称 | 60 | 60 | 1.2 | 1 |
+| B3 R2 · 重载／摩擦 | 110 | 300 | 1.5 | 1 |
+| B3 R3 · 柔顺接触 | 8 | 2 | 0.8 | 1 |
+| B3 R4 · 安全回退 | 2 | 0 | 0.35 | **0** |
+
+R4 按设计切断标称轨迹前馈，保留确定性反馈律与物理阻尼。
+
+## 3. 模态必要性与独立保护
+
+固定档位消融保留**同一套快速安全门控**。动态分类器和物理规则只读取可测特征。下面六种配置均为零状态包络越界。
+
+| 监督方式 | S1 RMSE | S2 RMSE | S3 RMSE | S4 RMSE | S3 TV | S3 峰力 / N |
+|---|---:|---:|---:|---:|---:|---:|
+| R1 | 0.000630 | 0.048769 | 0.038107 | 0.276310 | 12993.85 | 35.12 |
+| R2 | 0.000715 | 0.019624 | 0.030081 | 0.276936 | 14779.48 | 71.34 |
+| R3 | 0.002368 | 0.416069 | 0.066815 | 0.275729 | 8899.58 | 8.76 |
+| R4 | 0.244245 | 0.491956 | 0.245783 | 0.297341 | 3904.54 | 0.00 |
+| 动态原型分类器 | 0.000630 | 0.020819 | 0.049949 | 0.275673 | 9002.59 | 12.72 |
+| 物理规则监督器 | 0.000630 | 0.020819 | 0.049949 | 0.275673 | 9002.59 | 12.72 |
+
+固定档位呈现了重载与接触之间的取舍。规则监督器与原型分类器在主实验中得到相同结果，支持**慢环接口与算法解耦**：规则树或轻量 VLM 可替换原型分类器，执行器控制权保持不变。
+
+探针由中值尖峰通道与**宽频高频新息能量包络**组成：时间对齐的标称加速度预测、25 Hz 双极点低通、5 Hz 高通新息、8 ms 能量窗口、500 rad/s² 归一化及 1 s 释放包络。另一个慢新息特征服务于分类器。部署探针不接收故障频率。
+
+完整复合故障的首个尖峰在同一控制 tick 触发否决。**异常检出时间与核心响应时间分别报告。** 禁用尖峰通道，经过安静初始化后，0.2 rad 传感振荡在 12／18／37／83／137 Hz 下分别于 **30／6／4／3／3 ms** 检出。在复合故障试验中同时去掉尖峰、置信度、包络和超时否决，仅保留独立宽频探针时，检出延迟为 **947 ms**，仍为零越界，最大 **|x| = 0.7482 rad**。
+
+主实验 S1 全程 R1，S2 有 96.8% 时间处于 R2，S3 有 98.22% 时间处于 R3，其余正常阶段 tick 属于档位过渡；S4 故障后保持 R4。主实验正常阶段没有低置信否决。另五组独立噪声与墙相位试验中，B1／B2 的 S4 越界范围为 **798～862／131～199 tick**，B3 全部为零，S3 峰力为 **7.64～9.68 N**。其中两组在 S3 入口各有一帧新鲜低置信输出，分别产生 103／111 个否决 tick；真实超时与恢复冷却单独统计。
+
+只关闭 OOD 否决、保留其他门控时，出现 **75 个越界 tick**，最大 **|x| = 1.4819 rad**，S4 TV 为 **2,894.99 N·m**。另一个恢复 R4 前馈的消融仍为零越界，因此零前馈是回退控制设计约定，而不是此次安全结果的唯一必要条件。在 18→36、24→48 Hz 扫频下，B2 没有越界。取消上下文抖动仅使 B2 的 S3 峰力从 **18.95 变为 18.86 N**，当前主对比主要体现摩擦、接触和测量噪声的冲突。一个、两个、四个物理子步均保留主要安全与接触结论。
+
+## 4. 小样本建档与资源核算
+
+`auto_calibrate(samples, labels)` 从三段各 10 s 的建档探测中，各取十二个标注宏观窗口，共 **36 个窗口**，生成三组四维原型与置信参数。窗口数量不等于独立试验次数。模型实际存储 **15 个标量**：十二个原型值、一个距离衰减系数和两个置信阈值。
+
+`auto_field_tune(evaluate, current)` 冻结上述模型，根据实测误差与明确的合格标志搜索物理增益。两个可复用帮助函数合计 20～30 行，位于 [117 行极简模板](python_bench/minimal_template.py) 中。
+
+![样本预算、现场整定与存储](assets/efficiency_and_generalization.png)
+
+Panel A 使用真实条件 RBF，在 64／256／1,024／4,096／16,000 个动作标签和最多 512 个中心下，分别报告标称性能、冻结迁移与重训迁移。曲线并不单调：重训改善部分样本预算下的结果，但未恢复标称精度。动作标签与宏观窗口采用不同样本单位，不将两者直接相除构造样本效率倍数。
+
+| 资源类别 | 大小 |
+|---|---:|
+| 条件 RBF，含归一化、中心、宽度和输出系数 | 5,149 个标量；FP64 41,192 B／FP32 存储 20,596 B |
+| 原型分类器 | 15 个标量；FP32 存储 60 B |
+| C99 状态／配置／现场旋钮 | **88／132／12 B** |
+| C99 对象文件 text，GCC 4.9.2 x86-64 | `-Os` 为 3,880 B；`-O2` 为 4,568 B |
+
+FP32 模型字节数是存储换算，RBF 数值试验使用 FP64。状态 RAM、模型存储与代码体积分别计量。Python 输出 RBF 与 C 调用的主机实测时间，包含 ctypes 开销，不作为目标设备 WCET。C 核只依赖 `<stdint.h>`，采用固定规模算术，不使用堆、I/O、libm 或可变全局状态。
+
+## 5. 将契约接入新系统
+
+| 应用实例 | 慢环定性决策 | 确定性快环 |
+|---|---|---|
+| 工业 WAAM／PLC 伺服 | 工艺、负载和接触工况 | 过程／伺服调节律、执行器约束、现场整定 |
+| 边缘 VLA／快慢机器人 | 任务与环境上下文 | 力矩／阻抗律、快速扰动处理、回退 |
+| 闭环 aDBS／SCS | 生物标志物和接口状态分类 | 设备定义的调节律、输出包络和时序 |
+
+![通用控制契约的三类映射](assets/domain_profiles_comparison.png)
+
+定义变量与安全回退 → 建立标称模型和控制器组 → 从可测宏观特征小样本建档 → 冻结 AI、现场整定。全新物理场景需要重新定义单位、限制、控制律与探针；同场景更换机台可以保留已建档分类器。
+
+```c
+LayeredState_t state;
+LayeredConfig_t config;       /* 设备定义的单位、限制与控制器组 */
+FieldTuning_t field_tuning = {1.0f, 1.0f, 1.0f};
+LayeredInput_t input;         /* 实测信号与带时间戳的工况帧 */
+/* 先填入 config 和 input。 */
+Layered_Init(&state, &config, &field_tuning);
+LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 ```
 
-零堆、无 `math.h`、无递归、无 OS 调用；固定直线代码，O(1) 最坏执行时间。`LayeredState_t` 为 88 B，`LayeredConfig_t` 为 132 B。AI 可以慢、可以抖动、可以短暂缺席；内环从不等待它。
+核心的九项职责为：输入／配置校验、预测包络否决、物理残差否决、低置信／弃权否决、心跳监视、最小驻留、恢复冷却、带抗饱和和输出限制的控制器组执行、粘性故障记录。每个积分器跟踪实际施加指令；先限幅，再限斜率。C ABI 与函数签名保持固定。
 
-v1.1.0 的关键细节是**正交残差探针**：
+多轴／多通道采用**独立状态、探针、旋钮与时间戳**。只有单位与限制一致时才共享只读配置，耦合约束由设备适配层处理。慢环超时默认 **350 ms**；适配层发送显式 R4 弃权并保留真实帧龄。新鲜帧恢复后经过 **300 ms** 核心冷却。C 原生 `HOLD` 保持的是**执行器命令**，不是机械位置。
 
-* **尖峰通道**：位置测量的 median-5 偏差，按 `res_fast_scale` 归一化；
-* **高频谐振通道**：以该域 OOD 模态频率（工业 42 Hz）为中心的 2 阶窄带谐振器，8 Hz 带宽、4 ms RMS 能量、连续 2 拍确认；
-* **慢通道**：LP(innovation)，只作为分类器特征。
+移植细节见 [AGENTS.md](AGENTS.md)、[领域映射指南](docs/domain_mapping_guide.md) 和[系统工程论述](docs/systems_engineering_manifesto_zh.md)。部署控制接口不接收阶段标签、注入故障频率或仿真器真值。
 
-门控接收 `max(res_fast, res_hf_gated)`。因此 20 倍宽带测量噪声（S3）不会触发 OOD，而 42 Hz 结构谐振会。
+## 6. 复现
 
-### 工程系统论的职责解耦
-
-本架构不是去卷更大的单点模型，而是从工程系统论出发做结构层分工：**10 Hz 慢环 AI** 发挥其“模式识别与定性语义归类”的长处，仅在无量纲空间做粗粒度工况选择题，规避端到端 AI 在高频连续控制中易过拟合旧机台逆动力学流形、推理抖动及 OOD 强行乱输出的短板；**1 kHz 快环确定性 C99 核心**发挥其“高频连续调节、定量漂移吸收与硬实时安全兜底”的长处，以常数时间 O(1) 门控与极简物理残差探针锁死安全边界。
-
-### 为什么采用合成同构基准？
-
-作为通用架构参考库，本仓库蓄意采用**参数化合成非线性被控对象**作为受控压力测试（Controlled Stress-Testing）。在真实工业产线或临床设备上，无法安全、可重复地注入极端未见共振故障（Stage 4）来检验端到端模型的越界破坏力，也无法精确锁定 `+35%` 参数漂移或精确扫描 `N = 15..2000` 样本复杂度来做严格的反事实消融（Ablation）。合成基准让这些反事实精确、可复现；三个域预设是同构映射，不是硬件验证结论。
-
-## 2. 主指标
-
-工业参考预设，40 s，4 阶段，1 kHz 内环；三条支路使用相同对象、参考、噪声实现与故障时序：
-
-| 指标 | Branch 1: 固定 PID | Branch 2: 端到端 AI | Branch 3: 分层 |
-| :--- | ---: | ---: | ---: |
-| RMSE S1 快速跟踪 [rad] | 0.0566 | 0.0397 | **0.0077** |
-| RMSE S2 +35% 负载/Stribeck [rad] | 0.1790 | 0.1585 | **0.0057** |
-| RMSE S3 接触/高频噪声/边缘时延 [rad] | 0.1921 | 0.1670 | **0.0074** |
-| RMSE S4 未见 OOD [rad] | 0.1693 | 0.8308 | **0.0303** |
-| 安全包络越界采样点 S4 [ms] | 0 | 2574 | **0** |
-| OOD 否决延迟 | - | - | **2.0 ms** |
-| 标定样本数 N（分类器 / 连续策略） | - | ~500 | **≤ 40** |
-| 算力 (MAC/s) | - | 2.40e9 | **2.41e4** |
-| 内存占用 | - | 5.60e6 B | **2.21e3 B** |
-
-`Safety Violation Ticks` 是 `|x| > x_limit` 的 1 kHz 采样点数；在 `dt = 1 ms` 时数值等于毫秒数。`Control Effort TV(u) = Σ|u_k − u_{k−1}|` 是控制指令总变差，反映高频抖振/磨损。`N` 是用于拟合分类器或连续策略的标定样本数。
-
-**Control Effort TV(u)，S1–S3：** 分层 **0.41e3 N·m**，固定 PID **1.24e3**，端到端 **1.33e3**。S4 中分层安全回退调节器为把轴保持在包络内，TV 为 **1.97e3 N·m**；端到端 S4 TV 更低，但有 **2574** 个越界采样点。TV 必须与安全列一起读。
-
-## 3. 模态必要性消融
-
-`run_all_benchmarks` 额外运行三次固定 bank 的 40 s 仿真和一个 stage-forced oracle（S1→R1、S2→R2、S3→R3、S4→安全回退），并打印实际 10 Hz 分类器：
-
-| 控制器 | S1 | S2 | S3 | S4 | S1–S3 | 40 s |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Stage-forced oracle | 0.0083 | 0.0056 | 0.0071 | 0.0322 | **0.00710** | **0.01721** |
-| 固定 R1 | 0.0083 | 0.0077 | 0.0175 | 0.0293 | 0.01201 | 0.01798 |
-| 固定 R2 | 0.0095 | 0.0058 | 0.0117 | 0.0316 | 0.00935 | 0.01777 |
-| 固定 R3 | 0.0938 | 0.0150 | 0.0072 | 0.0346 | 0.05501 | 0.05069 |
-| 实际 10 Hz 分类器 | 0.0077 | 0.0057 | 0.0074 | 0.0303 | 0.00700 | 0.01630 |
-
-oracle 是理想分类器的上界；实际分类器 S1–S3 RMSE 与上界相差 2% 以内（0.00700 对 0.00710，略优）。stage-forced 动态满足 `<0.8 ×` 固定 bank 判据（`0.00710 / 0.00935 = 0.759`）与 40 s 判据。
-
-## 4. 成对样本复杂度（图 2 左子图，Panel A）
-
-两个学习器**严格共用同一批名义机组（drift = 0）的 N 个成对样本**；部署在 0% 漂移与 +35% 漂移的同一机组上。oracle 是同一 495 项连续头改用 +35% 漂移数据训练：
-
-| N | 分层 @ +35% | 连续 nominal-only @ 0% | 连续 nominal-only @ +35% | Oracle @ +35% |
-| ---: | ---: | ---: | ---: | ---: |
-| 15 | **100.0%** | 78.1% | 3.1% | 59.4% |
-| 40 | **100.0%** | 84.4% | 0.0% | 71.9% |
-| 120 | **100.0%** | 96.9% | 3.1% | **100.0%** |
-| 500 | **100.0%** | 100.0% | 6.2% | 100.0% |
-| 2000 | **100.0%** | 100.0% | **0.0%** | 100.0% |
-
-形状本身就是结论：粗分类器在它从未见过的漂移机组上 N=40 即饱和；只在名义数据上训练的连续回归器，即使 N=2000 也无法在漂移机组上恢复；oracle 在 N=120 恢复，说明差距来自**数据覆盖**，不是模型容量。
-
-## 5. 三张图
-
-![四阶段对比：安全包络内的状态跟踪、执行器指令、残差与置信度、regime/gate 时序](assets/benchmark_4stages_showdown.png)
-
-**图 1 — 40 s，四阶段，三条支路。** (a) 状态与硬安全包络；(b) 执行器指令；(c) 尖峰/高频残差通道与 AI 置信度；(d) 有效 regime 与 gate 时序。S4 进入 `REGIME_SAFE_FALLBACK (4)` 是一个有名字的决策，不是静默钳位。
-
-![成对样本复杂度、零重训漂移鲁棒性、算力与内存](assets/efficiency_and_generalization.png)
-
-**图 2 — 成对数据效率。** (a) 分层分类器 vs 仅名义数据连续头 vs +35% 训练 oracle；(b) AI 冻结下的全闭环漂移扫描；(c) 算力、内存与推理频率。
-
-![工业伺服、边缘 VLA 与闭环神经调控的跨域轨迹](assets/domain_profiles_comparison.png)
-
-**图 3 — 同一套架构用于三个域。** 只改变物理常数、阶段名称与包络单位；C99 核心与门控语义不变。
-
-## 6. 运行与验收
-
-### MATLAB 全量验收
-
-```powershell
-matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
-```
-
-判据：
-
-| 信号 | 期望 |
-| :--- | :--- |
-| `[1]`–`[5]` | 全部 `PASS` |
-| 末行 | `All five engineering checks passed.` |
-| 图 | `assets/` 下三张 240 dpi 图重写 |
-| 模型 | 有 Simulink 且模型无未保存编辑时，重建 `matlab_simulink/ai_layered_control_bench.slx` |
-| 退出码 | `0` |
-
-没有 Simulink 时，数值基准与五项检查仍全部运行，`.slx` 步骤打印 skip。
-
-### C99 核心回归测试
-
-```powershell
-cd c99_layered_core
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe layered_gatekeeper.c test_gatekeeper_standalone.c
-.\test_gatekeeper_standalone.exe
-$LASTEXITCODE
-```
-
-Linux / macOS（bash / zsh）：
-
-```bash
-cd c99_layered_core
-cc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone layered_gatekeeper.c test_gatekeeper_standalone.c
-./test_gatekeeper_standalone
-echo $?
-```
-
-期望：`SUMMARY: n_pass=116, n_fail=0`，退出码 0，无编译诊断。
-
-### C99 ↔ MATLAB 闭环等价
-
-```powershell
-matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
-```
-
-期望：`PASS: 6000 closed-loop ticks; gate/regime/fault exact; max|du|=4.82e-07, max|du_target|=4.82e-07, max|dblend|=9.5e-08`（容差 `1e-4`）。无编译器时 `SKIP`。
-
-### C99 核心 3 步嵌入式移植
-
-1. 把 `c99_layered_core/layered_gatekeeper.c` 与 `.h` 拷贝到目标工程，按 ANSI C99（`-std=c99`）编译；无堆、无 `libm`、无递归。
-2. 用目标机的单位、限幅与 bank 增益填好 `LayeredConfig_t`，启动时调用一次 `Layered_Init(&state, &config)`。
-3. 在 1 kHz（1 ms）中断里填 `LayeredInput_t`，调用 `Layered_Step(&state, &in, &out)`；把 `out.u` 写执行器，并持久化/记录 `out.gate`、`out.regime` 与粘滞故障位。
-
-### 纯 Python 快速入口（无 MATLAB）
+Python 3 与现有 NumPy／matplotlib 依赖；C 核路径需要 C99 编译器：
 
 ```powershell
 python -m pip install -r python_bench/requirements.txt
 python python_bench/run_benchmark.py
-```
-
-入口优先用 `ctypes` 编译 `c99_layered_core/layered_gatekeeper.c`（Windows `.dll`、macOS `.dylib`、Linux `.so`）；没有编译器时打印一行提示并回退到纯 Python/NumPy 门控镜像。`--no-c` 强制镜像；`--selftest` 用 500 个确定性随机帧比较两套实现，要求 gate/regime 完全一致且 `|du| <= 1e-5`。
-
-**1 kHz C99 门控核在 MATLAB 与 Python 中逐帧完全等价**（`--selftest` 误差 `max|du| = 1.55e-07 < 1e-6`）。Python 独立基准的 10 Hz 外环探针采用自适应噪声底与置信度 EMA，因此其 B3 S1–S4 RMSE 为 **0.0090 / 0.0053 / 0.0343 / 0.0873**，OOD 弃权延迟 **9.0 ms**（<10 ms），各阶段安全越界采样点均为 **0**。这些 Python 运行数字有意与 MATLAB 40 s 表不同；门控语义与 C 核心相同。
-
-### 可复用核心 vs 基准脚手架
-
-| 角色 | 文件 | 用法 |
-| :--- | :--- | :--- |
-| **[REUSABLE CORE]** | `c99_layered_core/layered_gatekeeper.c/.h` + `python_bench/minimal_template.py` | 直接拷贝进目标工程。模板是 10 Hz + 1 kHz 的可复制骨架；自动 `ctypes` 加载 C 核，无编译器时回退最小 Python 门控。 |
-| **[BENCHMARK HARNESS]** | `matlab_simulink/run_all_benchmarks.m`、`matlab_simulink/sim_core_engine.m`、`python_bench/run_benchmark.py` | 仅用于复现 40 s 论文/仓库图。**不要把合成被控对象拷入生产工程。** |
-
-`python_bench/minimal_template.py` 只有三个替换插槽：
-
-1. `[USER-PLUGIN-SLOT 1]` — `read_plant_and_reference(t)`：真实传感器 `(q, dq)` 与参考 `(q_ref, dq_ref, ddq_ref)`；
-2. `[USER-PLUGIN-SLOT 2]` — `compute_nominal_residual(q, dq, u_prev)`：目标域的极简名义物理残差探针；
-3. `[USER-PLUGIN-SLOT 3]` — `slow_loop_10hz_step(...)`：4 维无量纲宏观特征、margin × proximity 置信度、S3 残差守卫、粗粒度 `ai_regime ∈ {1,2,3,4}`。
-
-运行一秒、1 kHz 闭环演示，成功输出 `[OK] Minimal layered control loop completed (0 safety violations)`：
-
-```powershell
+python python_bench/run_benchmark.py --no-c
+python python_bench/run_benchmark.py --selftest
 python python_bench/minimal_template.py
+gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
+.\c99_layered_core\test_gatekeeper_standalone.exe
 ```
 
-### `.slx` 独立运行
+模板在 C 源码或头文件变更后自动重编，编译失败直接报错。基准的 `--no-c` 路径使用完整 Python 镜像。C 回归为 **120 项通过、零失败**；Python／C 共同输入回放 **6,000 帧**，gate／regime／fault 精确一致，最大指令差小于 `1e-4`。
+
+MATLAB R2024b＋Simulink，仅使用内置函数与模块：
 
 ```powershell
-matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('model runs standalone')"
+matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
+matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
+matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('standalone model PASS')"
 ```
 
-模型只使用内置模块，所有数值参数已内联；它是三条支路的可视化，定量基准在 `sim_core_engine.m`。
+验收运行输出五项 PASS，重建现有模型和三张 240 dpi 图片，并输出 JSON 结果。MATLAB／C 使用 **40,000 帧共同输入**验证离散输出精确一致。`.slx` 是无需工作区初始化的架构示意模型，定量结果由数值引擎生成；B2 的延迟与保持位于上下文路径，动作路径按 1 kHz 更新。[构建脚本](matlab_simulink/build_simulink_model.m) 是模型的源码。
 
-## 7. 三个域预设
+这一安全分工与 Simplex／运行时保障相关，参见 [AFRL RTA](https://github.com/act3-ace/run-time-assurance) 与 [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html)。
 
-| 域 | S1 | S2 | S3 | S4 |
-| :--- | :--- | :--- | :--- | :--- |
-| **工业 WAAM** | 焊枪/轴快速跟踪（轻沉积负载） | +35% 层间热累积等效负载漂移 + 送丝 Stribeck 摩擦 | 弧长/接触刚度 + 弧压高频噪声 + 现场总线时延 | 未见结构谐振 + 传感器尖峰 |
-| **边缘 VLA** | 高速自由空间运动（轻负载） | +35% 负载漂移 + 关节静摩擦 | 接触刚度突变 + 视觉/力觉高频噪声 + 10 Hz 边缘推理抖动 | 未见结构谐振 + 传感器尖峰 |
-| **闭环神经调控** | 快速相位生物标记物跟踪 | +35% 电极-组织阻抗漂移 + 激活阈值非线性 | 高耦合神经反弹 + EMG/刺激伪迹高频噪声 + 遥测抖动 | 未见 OOD 病理振荡 + 导联微脱位尖峰 |
-
-共享的无量纲字段是 `friction_scale`、`k_scale`、`noise_scale` 与每档 `ff_scale`；`load_domain_profile.m` 与 `docs/domain_mapping_guide.md` 的注释使用各域自己的物理语义。神经调控域不使用机械臂/摩擦/接触刚度措辞。
-
-工业预设的 +35% 漂移为：`J ×1.35, b ×1.25, k ×1.10, fc ×2.00, fs ×2.40, vs ×0.25, fvisc ×1.20`。
-
-## 8. 仓库内容
-
-```text
-ai-layered-control/
-├── README.md / README_zh.md            本文件 / 中文版
-├── AGENTS.md                           机器可读不变量、移植菜谱、命令
-├── docs/
-│   ├── systems_engineering_manifesto_en.md / _zh.md
-│   └── domain_mapping_guide.md
-├── c99_layered_core/
-│   ├── layered_gatekeeper.h            88 B 状态 / 132 B 配置契约
-│   ├── layered_gatekeeper.c            零依赖 1 kHz 核心
-│   ├── test_gatekeeper_standalone.c    116 项确定性检查
-│   └── verify_core_equivalence.c       闭环 C 回放夹具（仅测试）
-├── matlab_simulink/
-│   ├── load_domain_profile.m
-│   ├── sim_core_engine.m
-│   ├── calibrate_coarse_classifier.m
-│   ├── train_continuous_policy.m
-│   ├── run_efficiency_analysis.m
-│   ├── run_all_benchmarks.m
-│   ├── build_simulink_model.m
-│   ├── verify_core_equivalence.m
-│   └── ai_layered_control_bench.slx    生成产物
-├── python_bench/
-│   ├── minimal_template.py             98 行可复用复制骨架
-│   ├── run_benchmark.py                ctypes C 核心或 NumPy 回退（40 s 基准）
-│   ├── README.md                       可复用核心 / 脚手架区分
-│   └── requirements.txt
-└── assets/                             三张生成的 240 dpi 图
-```
-
-纯文本：C99、MATLAB、Python、Markdown。仓库不提交权重或数据集：RBF 策略在调试时由合成名义 rollout 确定性拟合；分类器原型由三个 stage 探针拟合；C 核心是可部署产物。
-
-## 9. 适用范围与免责声明
-
-本仓库是“快慢双环解耦 + 显式拒识 + 确定性安全门控”控制架构的方法论参考实现。`neuromodulation`（aDBS/SCS）预设基于集总参数合成非线性动力学与同构生物标记物包络模型，不含任何真实患者临床记录，也不构成特定疾病的临床生理/病理模型。C99 核心遵循零动态内存、O(1) 最坏执行时间、NaN 防火墙与粘滞故障审计等防御性嵌入式设计原则，但未经过且不声称具备 IEC 62304、ISO 14971、IEC 60601 或 IEC 61508 认证。任何面向临床植入/穿戴式神经调控或高危工业设备的实际部署，均须配合独立硬件电荷平衡保护电路、硬件看门狗及完整的临床与法规审批验证。
-
-## 10. 引用
-
-如果本参考架构或基准对你的工作有帮助，请引用：
-
-```bibtex
-@software{li2026ailayeredcontrol,
-  author       = {Li, Jiawei},
-  title        = {ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control},
-  year         = {2026},
-  version      = {1.1.0},
-  url          = {https://github.com/lijiawei255/ai-layered-control},
-  license      = {MIT}
-}
-```
-
-**姊妹项目：** [jev-tune](https://github.com/lijiawei255/jev-tune) —— 单一控制器内部的连续参数层整定，C99 安全边界兜底。
+**适用范围。** 本仓库提供参考控制契约及指定试验场的可复现数值证据。应用映射不构成硬件、临床或功能安全验证及认证；部署需要针对设备完成危险分析、安全包络定义与验证。

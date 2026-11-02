@@ -136,7 +136,7 @@ typedef struct {
     float ai_regime;        /* 1..3 from the coarse classifier (4 = abstain)  */
     float ai_confidence;    /* classifier confidence in [0,1]                 */
     float outer_age_s;      /* age of the freshest slow-loop frame            */
-    float physics_residual; /* normalized |y - y_hat| from the nominal model  */
+    float physics_residual; /* normalized nominal-physics innovation envelope */
     float x;                /* measured state                                 */
     float x_dot;            /* measured state derivative                      */
     float r;                /* reference state                                */
@@ -197,18 +197,19 @@ void Layered_Init(LayeredState_t *state,
                   const FieldTuning_t *tuning);
 
 /* Executes exactly one 1 kHz step and returns the command actually applied.
- * The function is O(1): a fixed number of branches, no loops over memory, no
+ * The function is O(1): fixed-size checks and controller arithmetic, no
  * allocation, no library calls.
  *
  * 0. INPUT FIREWALL (executed before any controller state is touched)
- *    Any non-finite input (NaN/Inf) or out-of-range enum (ai_regime outside
+ *    Any non-finite input, configuration or tuning value (NaN/Inf), or
+ *    out-of-range enum (ai_regime outside
  *    [1,4], confidence outside [0,1], negative residual/age) is rejected:
  *      - LAYERED_FAULT_BIT_NAN_CORRUPTION is latched,
  *      - corrupted_frame_count is incremented,
  *      - controller state / integrators / dwell counter / latches are NOT
  *        updated and the last applied command is held (fail-safe hold),
  *      - the recovery cooldown IS re-armed: a corrupt frame is not a clean
- *        sample, so it can never count towards "500 consecutive clean ticks",
+ *        sample, so it cannot count towards the configured clean cooldown,
  *      - the output is flagged corrupted = 1.
  *    ai_regime == 4 is *not* corruption: it is an explicit AI abstention and
  *    is handled as GATE_VETO_LOW_CONFIDENCE.
@@ -227,7 +228,8 @@ void Layered_Init(LayeredState_t *state,
  *         classifier reports a normal regime again.
  *         -> latches LAYERED_FAULT_BIT_LOW_CONFIDENCE.
  *      d) GATE_HOLD_LATENCY         : heartbeat older than outer_timeout_s.
- *         The last *applied* command is held (actuator steady state).
+ *         The last *applied* command is held; this does not hold position.
+ *         Integrators/target/blend hold; dwell advances and recovery re-arms.
  *         -> latches LAYERED_FAULT_BIT_LATENCY_TIMEOUT.
  *      e) GATE_NORMAL               : AI regime accepted.
  *    All vetoes are emergency transitions and bypass the dwell timer.

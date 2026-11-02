@@ -1708,6 +1708,63 @@ static void test_ff_scale(void)
           (double)out.u);
 }
 
+/* Finite configuration / field tuning and NaN arithmetic at the clamp. */
+static void test_settings_and_clamp(void)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredState_t st;
+    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f};
+    LayeredOutput_t out;
+    float *fields[34];
+    int n = 0, i, j, rejected = 0;
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+#define FIELD(name) fields[n++] = &cfg.name
+    FIELD(dt_s); FIELD(outer_timeout_s); FIELD(max_physics_residual);
+    FIELD(residual_clear_ratio); FIELD(min_ai_confidence); FIELD(confidence_clear_ratio);
+    FIELD(state_safety_limit); FIELD(safety_trip_ratio); FIELD(safety_clear_ratio);
+    FIELD(safety_predict_s); FIELD(u_max); FIELD(u_slew_max_per_s);
+    FIELD(blend_alpha); FIELD(integ_limit); FIELD(windup_tau_s);
+#undef FIELD
+    for (i = 0; i < 4; ++i) {
+        fields[n++] = &cfg.kp[i]; fields[n++] = &cfg.kd[i];
+        fields[n++] = &cfg.ki[i]; fields[n++] = &cfg.ff_scale[i];
+    }
+    fields[n++] = &tun.gain_scale;
+    fields[n++] = &tun.damping_scale;
+    fields[n++] = &tun.safety_margin_scale;
+    for (i = 0; i < n; ++i) {
+        float saved = *fields[i];
+        for (j = 0; j < 2; ++j) {
+            float held, integral;
+            Layered_Init(&st, &cfg, &tun);
+            out = Layered_Step(&st, &cfg, &tun, &in);
+            held = out.u; integral = st.integ[0];
+            *fields[i] = j ? make_inf() : make_nan();
+            out = Layered_Step(&st, &cfg, &tun, &in);
+            rejected += out.corrupted && out.u == held && st.integ[0] == integral &&
+                (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
+            *fields[i] = saved;
+        }
+    }
+    check(rejected == 68, "settings firewall: all 34 floating fields reject NaN and Inf while holding state");
+    check(sizeof(LayeredState_t) == 88 && sizeof(LayeredConfig_t) == 132 &&
+          sizeof(FieldTuning_t) == 12, "binary contract: state/config/tuning = 88/132/12 bytes");
+    Layered_Init(&st, &cfg, &tun);
+    st.control_started = 1; st.u_applied = 1.0f; st.u_target = 1.0f;
+    cfg.kp[0] = 1.0e38f; cfg.kd[0] = -1.0e38f;
+    in.r = 100.0f; in.r_dot = 100.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.u_target == 0.0f && out.u == out.u && t_absf(out.u - 0.8f) < 1.0e-6f,
+          "NaN arithmetic: clamp selects a finite command inside the slew interval");
+    build_config(&cfg);
+    in.r = 0.1f; in.r_dot = 0.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.u_target > 0.0f && out.u_target < cfg.u_max && out.u > 0.0f,
+          "NaN recovery: normal arithmetic restores a finite positive target and command");
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -1747,6 +1804,7 @@ int main(void)
     printf("\n-- priority chain + API --\n");
     test_priority();
     test_api();
+    test_settings_and_clamp();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;
