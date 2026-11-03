@@ -4,7 +4,7 @@
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
 [![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-完整复现)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
-<!-- ZENODO_DOI_BADGE: [![DOI](https://zenodo.org/badge/DOI/ZENODO_DOI_PENDING.svg)](https://doi.org/ZENODO_DOI_PENDING) -->
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23911916.svg)](https://doi.org/10.5281/zenodo.23911916)
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent 指引](AGENTS.md)
 
