@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function P = load_domain_profile(name)
 %LOAD_DOMAIN_PROFILE Canonical physical benchmark and three interface mappings.
 if nargin < 1, name = 'industrial'; end

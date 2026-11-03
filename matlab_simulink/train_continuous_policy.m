@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function policy = train_continuous_policy(P, nSamples, nCenters, unit)
 %TRAIN_CONTINUOUS_POLICY Conditional 1 kHz action head with 10 Hz context.
 if nargin<1, P=load_domain_profile(); end

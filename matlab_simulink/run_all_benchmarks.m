@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 %RUN_ALL_BENCHMARKS V2 physical benchmark, adaptation and engineering checks.
 started=tic; here=fileparts(mfilename('fullpath')); addpath(here);
 assets_dir=fullfile(here,'..','assets');

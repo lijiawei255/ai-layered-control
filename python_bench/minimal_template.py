@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jiawei Li
+# Source: https://github.com/lijiawei255/ai-layered-control
+# License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+# Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 """Reusable 10 Hz supervisor + 1 kHz C99 loop; replace the three device slots."""
 import ctypes, os, subprocess, sys
 from pathlib import Path

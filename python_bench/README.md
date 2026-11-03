@@ -1,9 +1,11 @@
-# Python entry point — v2.0.0
+# Python entry point — v2.0.1
 
 The reusable implementation is the [C99 core](../c99_layered_core/layered_gatekeeper.h).
 [minimal_template.py](minimal_template.py) supplies a compact C binding, the slow/fast loop and
 two adaptation helpers. [run_benchmark.py](run_benchmark.py) runs the shared physical benchmark.
 Authoritative numerical results are in [README.md](../README.md) and [README_zh.md](../README_zh.md).
+MIT reuse and optional citation are described in the root [license and citation guide](../README.md#license-and-citation);
+[CITATION.cff](../CITATION.cff) contains the author and citation metadata.
 
 ## Run
 

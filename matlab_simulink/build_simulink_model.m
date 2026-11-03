@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function [mdl, status] = build_simulink_model(out_path)
 %BUILD_SIMULINK_MODEL Built-in-block illustration with explicit rate boundaries.
 % The numeric engine owns the trained RBF, Karnopp plant and nine-gate core.

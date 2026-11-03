@@ -1,4 +1,9 @@
-"""V2.0.0: white-box PID, conditioned continuous policy, and deterministic layered control."""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jiawei Li
+# Source: https://github.com/lijiawei255/ai-layered-control
+# License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+# Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
+"""V2.0.1: white-box PID, conditioned continuous policy, and deterministic layered control."""
 import ctypes
 import json
 import math
@@ -888,7 +893,7 @@ def main():
     ablation['rules'] = metrics(c, simulate(c, 'rules', clf=clf))
     tune = tuning_study(clf)
     eff = efficiency_study(clf)
-    report = dict(version='2.0.0', metrics={k: metrics(c, v) for k, v in results.items()}, ablation=ablation, tuning=tune, efficiency=eff, classifier=[clf[0].tolist(), *map(float, clf[1:])], calls=results['B2']['calls'], resources=resource_study(policy), audit=audit_study(clf,c))
+    report = dict(version='2.0.1', metrics={k: metrics(c, v) for k, v in results.items()}, ablation=ablation, tuning=tune, efficiency=eff, classifier=[clf[0].tolist(), *map(float, clf[1:])], calls=results['B2']['calls'], resources=resource_study(policy), audit=audit_study(clf,c))
     m = report['metrics']
     assert results['B2']['calls'] == 40000
     assert all((m['B3'][s]['breach'] == 0 for s in m['B3']))

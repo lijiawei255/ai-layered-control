@@ -1,6 +1,9 @@
-# AGENTS.md — ai-layered-control v2.0.0
+# AGENTS.md — ai-layered-control v2.0.1
 
-Read this file before changing the architecture. The source files define behavior;
+This guide describes the reference benchmark and suggestions for maintaining or adapting it.
+Derived projects can revise the architecture and layout for their device; the technical contracts below
+define the supplied implementation and the conditions for reproducing its results.
+For architecture changes, start here. The source files define behavior;
 [README.md](README.md) and [README_zh.md](README_zh.md) contain the authoritative benchmark results.
 The generated Simulink model is an architecture sketch; read its builder, not the binary container.
 
@@ -100,8 +103,9 @@ The benchmark's radians, torques and mechanical reference are one interface exam
 
 ### Step 2 — Commission the nominal fast loop
 
-Copy the C99 core unchanged and define the four controller banks in the device adapter.
-Preserve `LICENSE` and its MIT copyright and permission notice when copying or distributing the core.
+For direct reuse of the verified core, start with it unchanged and define the four controller banks
+in the device adapter. Adaptations can revise the core and validate the resulting device contract.
+The MIT copyright and permission notice in `LICENSE` accompanies copies or substantial portions.
 Commission the nominal model, deterministic feedforward and independent innovation probe.
 Verify command magnitude/slew bounds, corruption handling, gate priorities and recovery.
 Measure target execution time separately from host ctypes call time.
@@ -202,10 +206,20 @@ Serialize writes to the generated model. Preserve unsaved user edits in any open
 Keep the core and minimal template small; the template stays within 100–120 lines.
 Keep both auto-adaptation helpers together within 20–30 lines.
 Replace superseded mechanisms rather than retaining compatibility switches or unused branches.
-Add no source/configuration/document files, build systems, CI, dependencies, weights or datasets.
+For maintenance of this compact reference, prefer the existing source, configuration and documents;
+keep additions to tooling, dependencies, weights or datasets focused on the change.
+Derived projects can choose the file layout and tooling that suit their application.
 Keep generated binaries, caches and run logs out of version control.
 Update both languages of the README together; other documents link to their result tables.
 Figures are generated from final numerical runs, never hand-edited to change results.
 Report model storage, state RAM, code size and measured host time as separate quantities.
 Do not turn synthetic mechanism comparisons into universal claims about learned controllers.
 For the scope statement, see the closing paragraph of [README.md](README.md).
+
+### Optional provenance and citation
+
+When adapting individual files, consider keeping their short MIT/source comments for convenient
+license and origin lookup. When writing research or engineering documentation,
+[CITATION.cff](CITATION.cff) provides the author and citation metadata. Citation is welcome and optional.
+Academic, commercial and closed-source reuse is available under [MIT](LICENSE), without contacting
+the author for separate permission; the license and citation summary is in [README.md](README.md#license-and-citation).

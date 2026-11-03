@@ -1,13 +1,27 @@
-# ai-layered-control · v2.0.0
+# ai-layered-control · v2.0.1
 
-[![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-brightgreen)](https://github.com/lijiawei255/ai-layered-control/tree/main)
+[![Release v2.0.1](https://img.shields.io/badge/Release-v2.0.1-brightgreen)](https://github.com/lijiawei255/ai-layered-control/releases/tag/v2.0.1)
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
 [![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-完整复现)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
+<!-- ZENODO_DOI_BADGE: [![DOI](https://zenodo.org/badge/DOI/ZENODO_DOI_PENDING.svg)](https://doi.org/ZENODO_DOI_PENDING) -->
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent 指引](AGENTS.md)
 
 **让 AI 判断工况，让确定性控制核掌握执行权。** 一套可移植的快慢分层控制参考架构：10 Hz 定性监督、1 kHz C99 闭环，以及冻结 AI 后的现场旋钮整定。
+
+## 核心优势与人机导航
+
+本仓库是采用 MIT 许可证的开放参考设计、对比基准与 AI 适配模板，面向科研复现与工程移植。
+
+- **极小样本，免 GPU 建档。** 慢环以 **36 个标注宏观窗口**完成 CPU 标定，模型仅存储 **15 个标量／60 B（FP32）**；B2 使用 **16,000 个动作标签／20,596 B 的 FP32 模型存储**。
+- **88 B 纯 C99 确定性兜底。** 零动态内存（Zero-Heap）的 ANSI C99 控制核掌握 **1 kHz** 执行器指令，配合独立物理残差探针与九项核心保护职责。本基准复合故障的首个尖峰在同一 **1 ms 控制 tick** 内触发否决并切入闭环 R4 回退。
+- **冻结 AI，现场物理旋钮整定。** 三个旋钮仅占 **12 B**，通过约束整定适应负载与静摩擦漂移，慢环监督器保持冻结、无需重训。
+- **三端回放验证，119 行极简骨架。** Python／MATLAB 核心镜像与 C99 回放的离散输出精确一致，控制输出误差小于 **1e-4**；**159 项 C 回归全通**。**119 行模板**可直接运行，Simulink 模型展示架构分工。
+
+**人类读者：**架构分工与工程痛点见[第 1 节](#1-ai-可以慢控制权必须清楚)；可复用文件与三步移植见[第 2 节](#2-拿走什么怎样接入human--agent-quickstart)；实测对比与图表见[第 3.2 节](#32-四阶段主对比)／[第 3.3 节](#33-冻结-ai跨机台整定)。
+
+**AI 编程助手（Cursor / Claude Code / Codex）：**优先读取 [AGENTS.md](AGENTS.md)，再按设备契约替换 [minimal_template.py](python_bench/minimal_template.py) 中的 `SLOT 1..3`。
 
 ## 1. AI 可以慢，控制权必须清楚
 
@@ -89,7 +103,7 @@ flowchart TB
 | 可复用文件 | 直接拿走的能力 |
 |---|---|
 | **[1] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h)** | 零依赖 ANSI C99 控制与安全门控核：88 B 状态 / 132 B 配置 / 12 B 旋钮，可接入 MCU、PLC 或 RTOS 的周期任务 |
-| **[2] [minimal_template.py](python_bench/minimal_template.py)** | 114 行独立快慢环骨架，内置 `auto_calibrate` 与 `auto_field_tune`；替换 `SLOT 1..3` 接入自定义设备 |
+| **[2] [minimal_template.py](python_bench/minimal_template.py)** | 119 行独立快慢环骨架，内置 `auto_calibrate` 与 `auto_field_tune`；替换 `SLOT 1..3` 接入自定义设备 |
 
 复制 C99 核心时，请一并保留 [LICENSE](LICENSE) 中的 MIT 版权与许可声明。
 
@@ -153,6 +167,12 @@ B1 与 B3 在**正常控制档使用完全相同的标称前馈**。三支路共
 
 ### 3.2 四阶段主对比
 
+**直观结论导读。** B1 是固定高增益白盒基线，B2 是学习式快慢连续动作策略，B3 是本分层架构。以下结论对应主运行：
+
+- **S1/S2：跟踪精度与指令平稳性。** B3 保持与 B1 同量级的跟踪误差，同时将 TV 从 **8,217.67／8,100.68** 降至 **1,567.40／2,083.14 N·m**。
+- **S3：间歇接触力合规。** B1 峰值接触力为 **64.59 N**，约为 20 N 预算的 **3.23 倍**；B3 切入 R3 柔顺档，峰力 **19.47 N**，满足预算。B3 的 TV 为 **3,873.76 N·m**，低于 B2 的 **12,621.12 N·m**。
+- **S4：未知复合故障下零越界（图 1，30–40 s）。** 遭遇双惯量扫频模态与传感尖峰时，B1／B2 分别出现 **840／589 ticks** 安全包络越界（`|x| > 1 rad`）；B3 在首个尖峰的同一控制 tick 否决并进入闭环 R4，实现 **全程 0 越界（0 Violations）**，TV 为 **396.60 N·m**。R4 主动放弃参考跟踪以保护包络。
+
 S1 检验标称跟踪，S2 检验重载与静摩擦漂移，S3 检验间歇接触与测量噪声，S4 检验未知复合故障。
 
 总时长 40 s，每阶段 10 s；控制周期 1 ms，物理积分采用两个 0.5 ms 子步。执行器限制为 **20 N·m** 与 **2,000 N·m/s**。状态包络为 **|x| ≤ 1 rad**；S3 接触力预算为 **20 N**，通过 0.25 m 力臂换算。
@@ -177,6 +197,8 @@ RMSE 比较同一 tick 的参考与真实状态。TV 为阶段内指令变化绝
 ![四阶段对比](assets/benchmark_4stages_showdown.png)
 
 ### 3.3 冻结 AI，跨机台整定
+
+**直观结论导读：跨机台免重训适配（图 2）。** 在 **+35%／+50% 复合机台漂移**下，B3 **冻结 AI**，选择旋钮 **`(1.25, 0.5, 1)`**，使独立 S2 验证 RMSE 降低 **18.7%／16.5%**；完整任务验证零包络越界，接触峰力为 **17.93／18.65 N**，满足 20 N 预算。B1 同预算 S2 最优候选在完整任务中的峰力为 **75.51／75.49 N**，并出现 **1,397／1,031 ticks** 越界；六个 B1 候选均未通过联合约束。
 
 **换机台零重训适配。** 分类器保持冻结。以下独立 S2 验证采用 6 s、幅值 0.43 rad、种子 811 的共同轨迹，与上方 10 s S2 窗口分别统计。“+35%／+50% 复合机台漂移”指**惯量变化＋强静摩擦死区**，不是单独改变惯量；摩擦强化主导此试验场的 S2 误差。RMSE 单位为 rad，TV 单位为 N·m。
 
@@ -298,7 +320,7 @@ S4 失稳支路处于对浮点舍入敏感的非线性区：跨平台比较保�
 
 `auto_calibrate(samples, labels)` 从三段各 10 s 的建档探测中，各取十二个标注宏观窗口，共 **36 个窗口**，生成三组四维原型与置信参数。模型实际存储 **15 个标量**：十二个原型值、一个距离衰减系数和两个置信阈值。
 
-`auto_field_tune(evaluate, current)` 冻结上述模型，根据实测误差与明确的跨工况合格标志搜索物理增益。两个帮助函数合计 **20 行**，位于 [114 行极简模板](python_bench/minimal_template.py) 中。
+`auto_field_tune(evaluate, current)` 冻结上述模型，根据实测误差与明确的跨工况合格标志搜索物理增益。两个帮助函数合计 **20 行**，位于 [119 行极简模板](python_bench/minimal_template.py) 中。
 
 | 资源类别 | 大小 |
 |---|---|
@@ -338,5 +360,11 @@ matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); d
 验收运行输出五项 PASS，重建现有模型和三张 240 dpi 图片，并输出 JSON。MATLAB／C 回放覆盖 **40,000 个正常帧与 40,000 个持续邮箱故障帧**，离散输出精确一致；另有四组各 40,000 帧回放，在 5 s 注入非法旋钮，均为零 HOLD、零越界，且积分器保持有限。`.slx` 是无需工作区初始化的架构示意模型，定量结果由数值引擎生成；B2 的延迟与保持位于上下文路径，动作路径按 1 kHz 更新。[构建脚本](matlab_simulink/build_simulink_model.m) 是模型的源码。
 
 这一安全分工与 Simplex／运行时保障相关，参见 [AFRL RTA](https://github.com/act3-ace/run-time-assurance) 与 [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html)。
+
+## 许可与引用
+
+Copyright (c) 2026 Jiawei Li。本参考设计、对比基准与 AI 适配模板采用宽松的 [MIT 许可证](LICENSE)，欢迎用于高校科研、教学及企业商业化，包括闭源产品，并按需要使用和修改。复制或分发软件及其重要部分时，保留 MIT 版权与许可声明即可，无需发邮件联系作者或另行申请授权。
+
+如果本项目对你有帮助，欢迎顺手 Star，或按 [CITATION.cff](CITATION.cff) 引用；两者均为自愿。引用文件包含作者、ORCID 与发布元数据。
 
 **适用范围。** 本仓库提供参考控制契约及指定试验场的可复现数值证据。应用映射不构成硬件、临床或功能安全验证及认证；部署需要针对设备完成危险分析、安全包络定义与验证。

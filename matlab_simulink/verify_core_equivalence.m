@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function report = verify_core_equivalence(P, opts)
 %VERIFY_CORE_EQUIVALENCE Replay 40,000 identical input frames through C99.
 if nargin<1, P=load_domain_profile(); end

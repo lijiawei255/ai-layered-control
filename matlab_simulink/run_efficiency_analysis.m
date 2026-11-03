@@ -1,3 +1,8 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Jiawei Li
+% Source: https://github.com/lijiawei255/ai-layered-control
+% License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
+% Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function E = run_efficiency_analysis(P, opts)
 %RUN_EFFICIENCY_ANALYSIS Action labels and constrained cross-condition tuning.
 if nargin<1, P=load_domain_profile(); end

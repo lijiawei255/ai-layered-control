@@ -1,13 +1,27 @@
-# ai-layered-control · v2.0.0
+# ai-layered-control · v2.0.1
 
-[![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-brightgreen)](https://github.com/lijiawei255/ai-layered-control/tree/main)
+[![Release v2.0.1](https://img.shields.io/badge/Release-v2.0.1-brightgreen)](https://github.com/lijiawei255/ai-layered-control/releases/tag/v2.0.1)
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
 [![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-reproduce)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
+<!-- ZENODO_DOI_BADGE: [![DOI](https://zenodo.org/badge/DOI/ZENODO_DOI_PENDING.svg)](https://doi.org/ZENODO_DOI_PENDING) -->
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent guide](AGENTS.md)
 
 **Let AI identify the situation. Let deterministic control own the actuator.** A portable fast-slow reference architecture: 10 Hz qualitative supervision, a 1 kHz C99 feedback loop, and field tuning with the AI frozen.
+
+## Why This Architecture & Quick Navigation
+
+An MIT-licensed reference design, comparison benchmark and AI adaptation template for research and engineering reuse.
+
+- **Small-sample calibration, no GPU required.** The slow supervisor is calibrated on CPU from **36 labeled macro-windows** and stores **15 scalars / 60 B (FP32)**, versus **16,000 action labels / 20,596 B (FP32)** for B2.
+- **88 B deterministic C99 fallback.** A zero-heap ANSI C99 core owns the **1 kHz** actuator command, with an independent physics-residual probe and nine core protection duties. In this compound-fault benchmark, the first spike triggers a veto and closed-loop R4 fallback within the same **1 ms control tick**.
+- **Frozen AI, physical field tuning.** Three knobs occupy **12 B** and support constrained adaptation to load and stiction drift without retraining the supervisor.
+- **Cross-language replay and a 119-line skeleton.** Python and MATLAB core mirrors match C99 replay exactly for discrete outputs, with command differences below **1e-4**; **159 C regression checks** pass. The **119-line template** is ready to run; the Simulink model illustrates the architecture.
+
+**Human readers:** [§1](#1-ai-can-be-slow-control-authority-must-be-clear) explains the division of control authority and deployment problems; [§2](#2-what-to-reuse-human--agent-quickstart) covers reusable files and three-step porting; [§3.2](#32-four-stage-comparison) / [§3.3](#33-frozen-ai-field-tuned-hardware) present the measured comparisons and figures.
+
+**AI coding assistants (Cursor / Claude Code / Codex):** start with [AGENTS.md](AGENTS.md), then replace `SLOT 1..3` in [minimal_template.py](python_bench/minimal_template.py) using the device contract.
 
 ## 1. AI can be slow. Control authority must be clear.
 
@@ -89,7 +103,7 @@ Diagram timings are benchmark defaults. The device adapter computes `outer_age_s
 | Reusable files | What you take into your system |
 |---|---|
 | **[1] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h)** | Zero-dependency ANSI C99 control and safety gatekeeper: 88 B state / 132 B configuration / 12 B tuning; connect it to an MCU, PLC or RTOS cyclic task |
-| **[2] [minimal_template.py](python_bench/minimal_template.py)** | A standalone 114-line fast-slow skeleton with `auto_calibrate` and `auto_field_tune`; replace `SLOT 1..3` to connect your device |
+| **[2] [minimal_template.py](python_bench/minimal_template.py)** | A standalone 119-line fast-slow skeleton with `auto_calibrate` and `auto_field_tune`; replace `SLOT 1..3` to connect your device |
 
 When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
 
@@ -153,6 +167,12 @@ Learning-based fast-slow systems are an active engineering direction; [Helix 02]
 
 ### 3.2 Four-stage comparison
 
+**Key Takeaways.** B1 is the fixed high-gain white-box baseline; B2 is the learned fast-slow continuous-action policy; B3 is this layered architecture. In the main run:
+
+- **S1/S2 — tracking with lower command variation.** B3 keeps tracking error in the same order as B1 while reducing TV from **8,217.67 / 8,100.68** to **1,567.40 / 2,083.14 N·m**.
+- **S3 — compliant intermittent contact.** B1 reaches **64.59 N**, about **3.23 times** the 20 N budget; B3 switches to the compliant R3 bank and stays within budget at **19.47 N**. B3's TV is **3,873.76 N·m**, versus B2's **12,621.12 N·m**.
+- **S4 — zero envelope violations under the compound fault (Figure 1, 30–40 s).** With a swept two-inertia mode and sensor spikes, B1/B2 record **840 / 589 violation ticks** (`|x| > 1 rad`). B3 vetoes on the first spike in the same control tick and enters closed-loop R4: **0 violations**, with TV of **396.60 N·m**. R4 gives up reference tracking to protect the envelope.
+
 S1 tests nominal tracking, S2 load and stiction drift, S3 intermittent contact and measurement noise, and S4 an unseen compound fault.
 
 40 s, four 10 s stages, a 1 ms control period and two 0.5 ms physical substeps. Actuator limits are **20 N·m** and **2,000 N·m/s**. The state envelope is **|x| ≤ 1 rad**; S3's contact-force budget is **20 N**, using a 0.25 m lever arm.
@@ -177,6 +197,8 @@ RMSE compares reference and true state at the same tick. TV is the within-stage 
 ![Four-stage comparison](assets/benchmark_4stages_showdown.png)
 
 ### 3.3 Frozen AI, field-tuned hardware
+
+**Key Takeaways — adaptation without retraining (Figure 2).** Under **+35% / +50% compound unit drift**, B3 keeps the AI frozen and selects **`(1.25, 0.5, 1)`**, reducing independent S2 validation RMSE by **18.7% / 16.5%**. Full-mission validation has zero envelope violations and contact peaks of **17.93 / 18.65 N**, within the 20 N budget. B1's equal-budget S2-best candidate reaches **75.51 / 75.49 N** and **1,397 / 1,031 violation ticks** in the full mission; all six B1 candidates fail the joint constraints.
 
 **Zero-retraining unit adaptation.** The classifier stays frozen. These independent S2 validations use a 6 s trajectory of amplitude 0.43 rad, seed 811, shared by all controllers. They are separate from the 10 s S2 window above. “+35% / +50% unit drift” means **inertia change plus strong stiction**, not inertia alone; amplified friction dominates this fixture's S2 error. RMSE is in rad and TV in N·m.
 
@@ -298,7 +320,7 @@ Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share rea
 
 `auto_calibrate(samples, labels)` builds three four-dimensional prototypes and confidence parameters from **36 labeled macro-windows**, twelve from each of three 10 s commissioning probes. The model has **15 stored scalars**: twelve prototype values, a distance-decay coefficient and two confidence thresholds.
 
-`auto_field_tune(evaluate, current)` freezes that model and searches physical gains using measured error and an explicit cross-condition validity result. The two helpers occupy **20 lines** inside the [114-line template](python_bench/minimal_template.py).
+`auto_field_tune(evaluate, current)` freezes that model and searches physical gains using measured error and an explicit cross-condition validity result. The two helpers occupy **20 lines** inside the [119-line template](python_bench/minimal_template.py).
 
 | Resource category | Size |
 |---|---|
@@ -338,5 +360,11 @@ matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); d
 The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits JSON. MATLAB/C replays cover **40,000 normal and 40,000 persistent-mailbox-fault frames**, with exact discrete outputs. Four additional 40,000-frame replays inject invalid knobs at 5 s: all have zero HOLD ticks, zero violations and finite integrators. The `.slx` is a self-contained architectural sketch; numerical engines generate quantitative results. Its B2 delay/hold is on context, while the action path runs at 1 kHz. Read [the builder](matlab_simulink/build_simulink_model.m) as the model's source.
 
 The safety partition relates to Simplex / runtime assurance; see [AFRL RTA](https://github.com/act3-ace/run-time-assurance) and [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html).
+
+## License and citation
+
+Copyright (c) 2026 Jiawei Li. This reference design, benchmark and AI adaptation template is available under the permissive [MIT License](LICENSE). Use and modify it for academic research, teaching and commercial applications, including closed-source products. When copying or distributing the software or substantial portions, include the MIT copyright and permission notice. No email or separate permission from the author is needed.
+
+If this work helps, a Star or a citation using [CITATION.cff](CITATION.cff) is welcome; both are optional. The citation file contains the author, ORCID and release metadata.
 
 **Scope.** This repository supplies a reference control contract and reproducible numerical evidence for the specified fixture. Application mappings do not constitute hardware, clinical or functional-safety validation or certification; deployment requires device-specific hazard analysis, envelope definition and validation.
