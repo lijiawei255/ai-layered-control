@@ -30,6 +30,9 @@ B1 has no bank-transfer smoother; B2 has no integrator feature or external PID s
 The B3 supervisor supplies only `ai_regime` and `ai_confidence`.
 The normal regimes are R1 nominal, R2 high load and R3 compliant contact; R4 is explicit abstention.
 A classifier, rule tree or VLM may implement this interface, but it cannot write `u` or `u_ff`.
+The 1 kHz C99 core applies zero-trust checks to the 10 Hz slow interface: its input firewall, the
+local-clock lease on `outer_seq` and the independent physical veto take precedence over any
+slow-loop output.
 The reference prototype model stores twelve coordinates and three confidence parameters;
 its four feature normalizations belong to the device interface.
 

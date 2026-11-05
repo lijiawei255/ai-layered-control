@@ -148,7 +148,10 @@ restores the episode tolerance after the cooling period, and preserves the lifet
 
 A fast inference rate says when a command is computed; whether the command is admissible is decided
 by another set of conditions. A complete architecture specifies which state estimates, residuals,
-actuator limits and recovery conditions can override that command.
+actuator limits and recovery conditions can override that command. The 1 kHz deterministic core
+arbitrates the 10 Hz slow loop under zero trust: the slow loop emits only operating-regime proposals
+awaiting review, while numeric validity, frame-age authenticity (with `outer_seq` enabled), the physical-residual envelope and
+the recovery cooldown are all verified independently by the fast loop.
 
 The gatekeeper applies a fixed priority chain: state envelope first, then residual, then confidence,
 and finally native latency HOLD. The observable states are explicit — GATE_NORMAL,

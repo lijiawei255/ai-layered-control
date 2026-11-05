@@ -2,6 +2,9 @@
 
 This directory is the Python entry point of the repository: it hosts the integration template and the
 benchmark harness. Four reusable modules carry the integration, and each is complete on its own.
+The 1 kHz ANSI C99 core is the zero-trust safety arbiter of the 10 Hz slow interface: it validates
+every slow-loop decision, measures the frame lease on its own clock when `outer_seq` is enabled, and
+vetoes independently of the slow loop.
 
 ## Directory role and the four reusable modules
 
@@ -116,6 +119,8 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
 本目录是仓库的 Python 入口：集成模板与基准测试框架都放在这里。接入工作由四个可复用模块承担，
 每个模块都可以独立使用。
+1 kHz 的 ANSI C99 内核是 10 Hz 慢环接口的零信任安全仲裁：它对每一条慢环决策执行合法性
+校验，在启用 `outer_seq` 时以本地时钟计量帧龄，并独立执行物理否决。
 
 ## 目录定位与四大模块概览表
 
