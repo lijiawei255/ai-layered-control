@@ -17,11 +17,11 @@ quantitative feedback to a deterministic bank: integral states absorb persistent
 knobs remain available after deployment, and a residual probe can reject unfamiliar operation. The
 slow interface is model-agnostic. A prototype classifier, a rule supervisor or a VLM can all
 implement the same contract.
-Traditional layered control (gain scheduling or fixed rule switching) is confined by the
-complete-world assumption: it can only hard-switch among the preset known regimes (R1–R3). Facing
-unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, it has no abstention
-capability and can only emit the nearest regime's control law, which amplifies oscillation. This
-architecture draws the generational line with fast-slow dual-layer abstention: 10 Hz
+Gain scheduling or a fixed-threshold rule tree that does not explicitly configure a feature-distance
+metric and an out-of-range fallback branch still emits the nearest regime's control law when it
+encounters unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance. This
+architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that
+boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: 10 Hz
 manifold-distance low-confidence abstention retreats to R4 damping, and a 1 kHz millisecond-scale
 forced veto from an independent physical residual probe.
 
@@ -41,12 +41,18 @@ samples, but the data cost and the trial risk scale with every unit and every op
 fixed rule tree avoids labels yet cannot express regime-dependent continuous dynamics. Both routes
 stall at the same point.
 
-**Mechanism:** The 10 Hz slow loop needs only qualitative coverage: 36 labeled macro windows, 15
-scalars, 60 bytes, calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime
-prototypes and the confidence thresholds. No GPU and no action labels are involved. B2 serves as the
-comparison point that quantifies the data cost of the continuous route. The compute cost follows the
-same reduction: B2 evaluates a continuous action head over **5,149 scalars / 20,596 B** on every 1 ms
-tick, whereas this architecture only classifies discrete regimes plus a manifold-distance
+**Mechanism:** Continuous quantitative feedback and trajectory tracking are already carried by the
+four pre-commissioned deterministic controller banks and the nominal feedforward, so the 10 Hz slow
+loop only has to perform coarse discrete regime classification and manifold-distance abstention. It
+therefore needs only qualitative coverage: 36 labeled macro windows, 15 scalars, 60 bytes,
+calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime prototypes and the
+confidence thresholds. No GPU and no action labels are involved. The template's built-in 15-scalar
+nearest-centroid classifier and six-point constrained search (`auto_field_tune`) are a
+zero-third-party-dependency reference implementation; in a real machine the same interface can host
+a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another
+classification model. B2 serves as the comparison point that quantifies the data cost of the
+continuous route: it evaluates a continuous action head over **5,149 scalars / 20,596 B** on every
+1 ms tick, whereas this architecture only classifies discrete regimes plus a manifold-distance
 confidence at 10 Hz with a model of **15 scalars / 60 B** — reducing the slow-loop task from 1 kHz
 continuous regression to 10 Hz discrete classification and cutting both sample complexity and online
 inference compute.

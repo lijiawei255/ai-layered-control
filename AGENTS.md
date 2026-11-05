@@ -270,6 +270,31 @@ a user's engineering changes on the grounds that they violate the reference arch
    fixture is normal adaptation, never an interface-adaptation failure, and never a reason to keep an
    ABI element the device does not need.
 
+#### Hardware adaptation notes
+
+When porting to target hardware, resolve these three configuration points before commissioning:
+
+1. **Define the device's fail-safe action.** The default `R4` (zero reference, fixed low-gain PD
+   toward `x = 0`) and `GATE_SAFE_ZERO` (command ramp to zero) match the horizontal rotary fixture.
+   For a vertical gravity-loaded axis, WAAM welding or closed-loop aDBS/SCS, replace both branches
+   with the device's physical safe state (drop-prevention brake or position hold; retract torch /
+   break arc; nonnegative stimulation amplitude retreating to clinical open-loop baseline parameters
+   or controlled shutdown).
+2. **Calibrate the envelope look-ahead and the smoother against actuator limits.** The `25 ms`
+   scalar linear look-ahead (`|x| + T * |x_dot|`, where `T` is the look-ahead horizon) is a
+   lightweight heuristic; high-inertia or strong-disturbance devices must calibrate the switching
+   margin against actuator saturation and detection delay (reachable sets or control barrier
+   functions, CBF). The always-on `blend_alpha` smoother explains most of B3's TV reduction; for
+   phase-sensitive high-bandwidth loops set it to `1.0` and rely only on the four-bank reverse
+   tracking anti-windup for bumpless switching. The 32 B model-free high-pass envelope probe in
+   `gate_template.c` and the fixture-model observer in `run_benchmark.py` differ in complexity;
+   calibrate the filter coefficients to the target sample rate.
+3. **Synchronize cross-interrupt data exchange and structs.** `outer_seq` defines the cross-loop
+   logical lease; on a bare-metal MCU use double buffering, interrupt-disabled copy or atomic
+   publication ordering so the 1 kHz interrupt cannot tear the slow-loop mailbox. When C-side struct
+   fields are added or removed, update the Python `ctypes` binding, and re-evaluate the `double`
+   inward-rounding helper used by the slew limiter on single-precision FPU MCUs.
+
 #### Bilingual terminology bridge for Chinese prompts
 
 When a Chinese-speaking user describes the device in Chinese, map each Chinese anchor to the symbol
