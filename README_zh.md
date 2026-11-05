@@ -31,7 +31,7 @@
 
 **人类读者：** [§1](#1-ai-可以慢控制权必须清楚) 用六个现场问题讲清控制权的划分；[§2](#2-复用什么人类与-agent-快速上手) 介绍四个可复用模块与三步移植；[§3.2](#32-四阶段对比) / [§3.3](#33-冻结-ai现场整定硬件) / [§3.4](#34-模态消融与独立保护) 给出实测对比、新增的门控与弃权试验，以及配图。
 
-**AI 编程助手（Cursor / Claude Code / Codex）：** 先读 [AGENTS.md](AGENTS.md)，再替换 [minimal_template.py](python_bench/minimal_template.py) 中的 `SLOT 1..3`，并按设备契约填入十个输入字段。
+**AI 编程助手（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）：** 先读 [AGENTS.md](AGENTS.md)，再替换 [minimal_template.py](python_bench/minimal_template.py) 中的 `SLOT 1..3`，并按设备契约填入十个输入字段。
 
 ## 1. AI 可以慢，控制权必须清楚
 
@@ -177,7 +177,7 @@ flowchart TB
 
 复制 C99 内核时，请保留 [LICENSE](LICENSE) 中的 MIT 版权与许可声明。
 
-**用 AI 编程助手移植（Cursor / Claude Code / Codex）：** 让 Agent 阅读 [AGENTS.md](AGENTS.md)，依据设备契约替换[极简模板](python_bench/minimal_template.py)中的 `SLOT 1..3`，然后填入十个输入字段，并以 [gate_template.c](c99_layered_core/gate_template.c) 为基础搭建 MCU 样板。
+**用 AI 编程助手移植（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）：** 让 Agent 阅读 [AGENTS.md](AGENTS.md)，依据设备契约替换[极简模板](python_bench/minimal_template.py)中的 `SLOT 1..3`，然后填入十个输入字段，并以 [gate_template.c](c99_layered_core/gate_template.c) 为基础搭建 MCU 样板。
 
 > **一键复制给 AI 编程助手的移植指令。** 阅读 `AGENTS.md` 与 `python_bench/minimal_template.py`（119 行），用本设备的传感器 / 参考 / 执行器 I/O、已标定预测器与受约束安全试验回调替换三处 `SLOT 1..3`，保持 `auto_calibrate` 与 `auto_field_tune` 不变。
 >

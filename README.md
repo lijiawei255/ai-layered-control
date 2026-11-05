@@ -31,7 +31,7 @@ This repository is an MIT-licensed reference design, comparison benchmark and AI
 
 **Human readers:** [§1](#1-ai-can-be-slow-control-authority-must-be-clear) explains the division of control authority through six field problems; [§2](#2-what-to-reuse-human--agent-quickstart) covers the four reusable modules and three-step porting; [§3.2](#32-four-stage-comparison) / [§3.3](#33-frozen-ai-field-tuned-hardware) / [§3.4](#34-mode-ablation-and-independent-protection) present the measured comparisons, the new gating and abstention experiments, and the figures.
 
-**AI coding assistants (Cursor / Claude Code / Codex):** start with [AGENTS.md](AGENTS.md), then replace `SLOT 1..3` in [minimal_template.py](python_bench/minimal_template.py) and fill the ten input fields from the device contract.
+**AI coding assistants (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor):** start with [AGENTS.md](AGENTS.md), then replace `SLOT 1..3` in [minimal_template.py](python_bench/minimal_template.py) and fill the ten input fields from the device contract.
 
 ## 1. AI can be slow. Control authority must be clear.
 
@@ -177,7 +177,7 @@ The sticky **7-bit fault audit mask** records the root causes: latency timeout, 
 
 When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
 
-**Port with an AI coding assistant (Cursor / Claude Code / Codex):** ask the Agent to read [AGENTS.md](AGENTS.md) and replace `SLOT 1..3` in the [minimal template](python_bench/minimal_template.py) using your device contract, then fill the ten input fields and build the MCU sample from [gate_template.c](c99_layered_core/gate_template.c).
+**Port with an AI coding assistant (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor):** ask the Agent to read [AGENTS.md](AGENTS.md) and replace `SLOT 1..3` in the [minimal template](python_bench/minimal_template.py) using your device contract, then fill the ten input fields and build the MCU sample from [gate_template.c](c99_layered_core/gate_template.c).
 
 > **Copy-paste prompt for AI coding assistants.** Read `AGENTS.md` and `python_bench/minimal_template.py` (119 lines). Replace the three `SLOT 1..3` blocks with this device's sensor / reference / actuator I/O, commissioned predictor and constrained safe-trial callback; keep `auto_calibrate` and `auto_field_tune`.
 >
