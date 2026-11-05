@@ -20,14 +20,14 @@
 - **[1] [python_bench/minimal_template.py](python_bench/minimal_template.py) — 119 行。** 10 Hz 定性慢环，包含小样本建档（`auto_calibrate`：36 个标注窗口、15 个标量 / 60 B）、低把握度主动弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，一对 20 行帮助函数）以及 `SLOT 1..3` 设备接入骨架。
 - **[2] [c99_layered_core/gate_template.c](c99_layered_core/gate_template.c) — 120 行。** 1 kHz 裸机 MCU 中断接入样板，内置 **32 B 零动态内存物理残差探针**（`LayeredProbe_Step`：中值抗毛刺 + 级联高通新息包络）、用于电刺激脉冲与换向边缘伪迹的 `blanking_active` 硬件消隐窗口，以及 `outer_seq` 提交标记模式。
 - **[3] [c99_layered_core/layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h) / [.c](c99_layered_core/layered_gatekeeper.c) — 96 B 状态。** 零依赖 ANSI C99 安全仲裁与四档抗积分饱和控制微内核，面向 1 kHz 周期任务。
-- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 648 行。** 面向基于模型设计的 Level-2 C-MEX S-Function：`DWork` 存放 96 B 状态，零全局变量、零动态内存，**11 个输入**（10 路 ABI 输入加 `ack` 上升沿）与 **7 个输出**，围绕同一份冻结内核。
+- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 685 行。** 面向基于模型设计的 Level-2 C-MEX S-Function：`DWork` 存放 96 B 状态，零全局变量、零动态内存，**11 个输入**（10 路 ABI 输入加 `ack` 上升沿）与 **7 个输出**，围绕同一份冻结内核。
 
 **关键数字。**
 
 - **小样本建档，无需 GPU。** 慢环监督器在 CPU 上由 **36 个标注宏观窗口**完成标定，存储 **15 个标量 / 60 B（FP32）**；B2 则为 **16,000 个动作标签 / 20,596 B（FP32）**。
 - **96 B 确定性 C99 兜底。** 零动态内存的 ANSI C99 内核掌握 **1 kHz** 执行器指令，具备 **十个输入字段**、32 B 独立物理残差探针和九项核心保护职责。在本复合故障基准中，首个尖峰在同一个 **1 ms 控制 tick** 内触发否决并切入闭环 R4 兜底。
 - **冻结 AI，物理现场整定。** 三个旋钮占 **12 B**，通过受约束的适配应对正向过载、交叉失配、反向轻载和复合机台漂移，无需重训监督器。
-- **跨语言回放与 119 行骨架。** **239 项 C 回归检查**全部通过；Python/C 回放逐位一致（**max|du| = 0**），MATLAB/C 回放在 **5e-8** 以内，Level-2 S-Function 在 1,100 帧上复现全部七个输出，**最大差 = 0.0**。**119 行模板**开箱即可运行；Simulink 模型用于说明架构。
+- **跨语言回放与 119 行骨架。** **245 项 C 回归检查**全部通过；Python/C 回放逐位一致（**max|du| = 0**），MATLAB/C 回放在 **5e-8** 以内，Level-2 S-Function 在 1,100 帧上复现全部七个输出，**最大差 = 0.0**。**119 行模板**开箱即可运行；Simulink 模型用于说明架构。
 
 **人类读者：** [§1](#1-ai-可以慢控制权必须清楚) 用六个现场问题讲清控制权的划分；[§2](#2-复用什么人类与-agent-快速上手) 介绍四个可复用模块与三步移植；[§3.2](#32-四阶段对比) / [§3.3](#33-冻结-ai现场整定硬件) / [§3.4](#34-模态消融与独立保护) 给出实测对比、新增的门控与弃权试验，以及配图。
 
@@ -74,7 +74,7 @@ flowchart TB
         bank["R1 标称 · R2 重载/静摩擦 · R3 接触<br/>R4：固定增益、零参考、零前馈<br/>紧急旁路：blend = 1.0<br/>反向追踪抗积分饱和 + 一阶无扰切换<br/>幅值/斜率限制 + 7 位故障审计"]
         firewall --> gates --> bank
     end
-    subgraph mbd["Simulink 基于模型设计 · 648 行"]
+    subgraph mbd["Simulink 基于模型设计 · 685 行"]
         direction TB
         sfun["Level-2 C-MEX S-Function<br/>DWork 96 B 状态 · 零全局变量<br/>11 输入（10 ABI + ack）/ 7 输出"]
     end
@@ -145,7 +145,7 @@ flowchart TB
 | **[1] [minimal_template.py](python_bench/minimal_template.py)** | 119 行 | 独立的 10 Hz 监督器 + 1 kHz C 绑定：`auto_calibrate`、`auto_field_tune`、低把握度弃权与 `SLOT 1..3` |
 | **[2] [gate_template.c](c99_layered_core/gate_template.c)** | 120 行 | 1 kHz MCU 接入样板：32 B `LayeredProbe_t`、`blanking_active`、`outer_seq` 租约与 PASS 自检 |
 | **[3] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [.h](c99_layered_core/layered_gatekeeper.h)** | 96 / 140 / 12 / 40 / 28 B | 面向 MCU、PLC 或 RTOS 周期任务的零依赖 ANSI C99 控制与安全门控内核 |
-| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 648 行 | 围绕同一冻结内核的 Level-2 C-MEX S-Function：11 输入、7 输出、无可变全局变量 |
+| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 685 行 | 围绕同一冻结内核的 Level-2 C-MEX S-Function：11 输入、7 输出、无可变全局变量 |
 
 复制 C99 内核时，请保留 [LICENSE](LICENSE) 中的 MIT 版权与许可声明。
 
@@ -236,7 +236,7 @@ LayeredOutput_t output = Layered_Step(&state, &config, &field_tuning, &input);
 
 学习式快慢系统是一个活跃的工程方向；[Helix 02](https://www.figure.ai/news/helix-02) 是其中一例。设计目标是 **2027 年及以后在受限设备上的部署**。
 
-全部主表指标与所有已发布的 B3 指标——5 组 holdout 与 4 组现场整定——在显示精度上双端完全一致，其原始 binary64 归约值尾差不超过 8.6e-15。B2 的岭回归权重在 NumPy 与 MATLAB LAPACK 下存在约 1.9e-6 的双精度尾数差，在宽频灵敏度测试中可引起第 4 位小数的细微差异；B2 在种子 307 / 503 的 S4 RMSE 最后一位显示数字相差 1e-6。在被拒绝的 B1 失稳候选与反向失配反事实中，约 1e-16–1e-14 的双精度尾差会被多次刚性墙碰撞混沌放大，使两端的接触峰值出现 O(1 N) 量级的差异；被拒绝的 B1 反向失配反事实为 Python 193.12 N、MATLAB 194.02 N。这些差异不改变任何可行性判定，也不改变任何已发布的 B3 指标。
+主表及各附表的全部已发布指标在显示精度上跨 Python/C 与 MATLAB 完全一致。在主表、5 组 holdout 与 4 组现场整定合计 200 项 B3 原始归约值上，两端最大差不超过 8.6e-15。B1 与 B2 在显示精度上同样一致；其原始 binary64 累加存在双精度归约尾差，例如 B2 的 S3 TV 约为 9.1e-6 量级。在被拒绝的 B1 失稳候选与反向失配反事实中，约 1e-16–1e-14 的尾差会被多次刚性墙碰撞放大，使两端的接触峰值出现 O(1 N) 量级的差异（Python 193.12 N、MATLAB 194.02 N），不改变任何可行性判定。B2 的岭回归权重在 NumPy 与 MATLAB LAPACK 下存在约 1.9e-6 的双精度尾数差，在宽频灵敏度测试中可引起第 4 位小数的细微差异；B2 在种子 307 / 503 的 S4 RMSE 最后一位显示数字相差 1e-6。以上差异均不改变任何已发布的 B3 指标。
 
 ### 3.2 四阶段对比
 
@@ -404,7 +404,7 @@ R4 使用**零参考、固定增益与零前馈**，独立于所有现场旋钮�
 
 主运行在 S1 全程使用 R1，S2 的 96.8% 使用 R2，S3 的 94.99% 使用 R3；正常阶段没有否决。S4 在故障发生后保持 R4。自 22 s 起持续 `ai_confidence = NaN` 产生 **18,000 个损坏帧**，R4 指令继续更新，**零越界**，全程最大 **|x| = 0.5159 rad**。损坏在标志与计数器上始终可见，有效传感器让兜底闭环继续运行。
 
-五组独立噪声 / 相位运行给出 B1/B2 的 S4 越界 **777–899 / 622–753 个 tick**，B3 全部为零。出厂 B3 的 S3 接触力范围 **16.94–26.14 N**，每个相位都没有越过状态包络。10 Hz 帧率与正常档位驻留会延迟切换，因此首次碰撞可能早于 R3 选择完成（主运行 19.47 N）。在全部五组运行中，B3 相对 B1 的 S3 接触峰值比例始终处于 **B1 的 0.24–0.35 倍（最高 0.35 倍）**。合格整定表用独立噪声验证已整定的墙体相位。使用一个 / 两个 / 四个物理子步时，B3 峰值接触力为 **20.03 / 19.47 / 19.35 N**，状态越界为零。移除上下文抖动后，B2 的主 S3 峰值从 **12.52 N** 变为 **10.22 N**。接触力、状态安全与异步上下文敏感性是相互独立的结论。
+五组独立噪声 / 相位运行给出 B1/B2 的 S4 越界 **777–899 / 622–753 个 tick**，B3 全部为零。出厂 B3 的 S3 接触力范围 **16.94–26.14 N**，每个相位都没有越过状态包络。10 Hz 帧率与正常档位驻留会延迟切换，因此首次碰撞可能早于 R3 选择完成（主运行 19.47 N）。在全部五组运行中，B3 相对 B1 的 S3 接触峰值比例始终处于 **B1 的 0.24–约 0.35 倍（最高 0.355 倍）**。合格整定表用独立噪声验证已整定的墙体相位。使用一个 / 两个 / 四个物理子步时，B3 峰值接触力为 **20.03 / 19.47 / 19.35 N**，状态越界为零。移除上下文抖动后，B2 的主 S3 峰值从 **12.52 N** 变为 **10.22 N**。接触力、状态安全与异步上下文敏感性是相互独立的结论。
 
 #### 接口、多轴与超时约定
 
@@ -428,7 +428,7 @@ R4 使用**零参考、固定增益与零前馈**，独立于所有现场旋钮�
 | 原型分类器 | 15 个标量；FP32 存储 60 B |
 | C99 状态 / 配置 / 现场旋钮 / 输入 / 输出 | **96 / 140 / 12 / 40 / 28 B** |
 | `LayeredProbe_t`（1 kHz 残差探针，门控样板） | **32 B** |
-| C99 对象 text，GCC 4.9.2 x86-64 | `-Os`：6,452 B；`-O2`：7,608 B |
+| C99 对象 text，GCC 4.9.2 x86-64 | `-Os`：6,572 B；`-O2`：7,744 B |
 
 FP32 字节数只是存储换算；RBF 数值运行使用 FP64。状态 RAM、模型存储与代码体积是相互独立的量。Python 报告 RBF 与 C 调用的主机时间，包含 ctypes 开销；它们不是目标 WCET。内核只使用 `<stdint.h>`、固定规模算术，不含堆、I/O、libm 或可变全局变量。
 
@@ -450,7 +450,7 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/gate_template.exe c
 .\c99_layered_core\gate_template.exe
 ```
 
-模板要求全部十个输入字段，并在 C 源或头文件变化时重编；编译失败会直接报错。它的 PASS 检查跟踪误差、零真实状态越界与零异常门控。基准的 `--no-c` 路径是完整 Python 镜像。C 回归：**239 项通过，零失败**。MCU 模板自检在走完 HOLD → `SAFE_ZERO`、三次 OOD episode → `GATE_LATCHED_SAFE`、消隐冻结、`outer_seq` 提交和一次成功确认后以零退出。Python/C 回放：**6,000 帧**，覆盖 R1 = 901、R2 = 900、R3 = 304、R4 = 3,895 个 tick，包括 ack 重新武装以及两条触发路径上 7→5→3→1→0 的斜率成形归零；离散输出精确一致，连续指令逐位一致（**max|du| = 0**）。编译器通过 `CC` 或 `PATH` 查找。
+模板要求全部十个输入字段，并在 C 源或头文件变化时重编；编译失败会直接报错。它的 PASS 检查跟踪误差、零真实状态越界与零异常门控。基准的 `--no-c` 路径是完整 Python 镜像。C 回归：**245 项通过，零失败**。MCU 模板自检在走完 HOLD → `SAFE_ZERO`、三次 OOD episode → `GATE_LATCHED_SAFE`、消隐冻结、`outer_seq` 提交和一次成功确认后以零退出。Python/C 回放：**6,000 帧**，覆盖 R1 = 901、R2 = 900、R3 = 304、R4 = 3,895 个 tick，包括 ack 重新武装以及两条触发路径上 7→5→3→1→0 的斜率成形归零；离散输出精确一致，连续指令逐位一致（**max|du| = 0**）。编译器通过 `CC` 或 `PATH` 查找。
 
 MATLAB R2024b + Simulink，使用内置函数与模块。完整验收需要 C99 编译器；缺失即报错：
 
@@ -476,8 +476,8 @@ Copyright (c) 2026 Jiawei Li。本参考设计、对比基准与 AI 适配模板
 
 如果本工作有帮助，欢迎 Star 或使用 [CITATION.cff](CITATION.cff) 引用；两者都是可选的。引用文件包含作者、ORCID 和发布元数据。
 
-**适用范围。** 本仓库为指定试验场提供参考控制契约和可复现的数值证据。
+**适用范围。** 本仓库为指定试验场提供参考控制契约和可复现的数值证据，由个人开发者维护，是非认证的工程参考架构。
 
 应用映射是适配方向，不是硬件、临床或功能安全验证或认证。
 
-部署需要针对具体设备进行危险分析、包络定义与验证。
+部署需要针对具体设备进行危险分析、包络定义与验证。任何工业、机器人或生物医学真实设备的集成都必须保留独立于本软件的硬件安全保护，例如硬件急停（E-stop）、安全扭矩关断（STO）或硬件电荷平衡限制器。

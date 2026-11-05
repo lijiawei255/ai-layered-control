@@ -52,7 +52,7 @@
 
 **传统与纯 AI 的失效。** Python 或推理运行时带来分配、调度抖动与不可追溯状态；没有持久证据的否决回答不了事后问题。
 
-**机制。** 内核为 ANSI C99、零动态内存、静态定长状态，对象 text 在 `-Os` 下 6,452 B、`-O2` 下 7,608 B（GCC 4.9.2 TDM64，x86-64）。ABI 为 state/config/tuning/input/output 96/140/12/40/28 B，另加 32 B 探针。7 位 `fault_audit_bitmask` 记录延迟、残差流形外、低把握度、包络越界、NaN 损坏、HOLD 超时与永久锁存。累计 3 次安全／残差否决 episode 后永久锁死 GATE_LATCHED_SAFE；唯有人工调用 `Layered_AcknowledgeFaultLatch()` 才能解除锁存，在冷却期后恢复 episode 容限，并保留终身计数。
+**机制。** 内核为 ANSI C99、零动态内存、静态定长状态，对象 text 在 `-Os` 下 6,572 B、`-O2` 下 7,744 B（GCC 4.9.2 TDM64，x86-64）。ABI 为 state/config/tuning/input/output 96/140/12/40/28 B，另加 32 B 探针。7 位 `fault_audit_bitmask` 记录延迟、残差流形外、低把握度、包络越界、NaN 损坏、HOLD 超时与永久锁存。累计 3 次安全／残差否决 episode 后永久锁死 GATE_LATCHED_SAFE；唯有人工调用 `Layered_AcknowledgeFaultLatch()` 才能解除锁存，在冷却期后恢复 episode 容限，并保留终身计数。
 
 ## 带宽与权限是两个独立选择
 
@@ -74,7 +74,7 @@
 
 对照始终让基线保持满强度。B1 与 B3 共享完全相同的标称逆动力学前馈、抗积分饱和与限幅，B1 的 S2 结果仍是表中最低的原始误差。B2 动作头以 1 kHz 全速运行（40,000 次推理，快环状态零延迟），S3 接触力为全场最低的 12.52 N；但它没有显式积分器与物理门控，S2 误差偏大，S4 越界 589 tick。物理规则树与原型分类器在主表 S1/S2 结果和 19.47 N 的 S3 接触峰值上一致；它们的 S3 R3 占比相差 150 个 tick（93.49% 对 94.99%），表现为 S3/S4 RMSE 第三位小数的差异（0.075100 / 0.540437 对 0.069478 / 0.539985）。分层支路在 S4 记录 RMSE 0.539985 rad、TV 1545.01 N·m，而 B1 保持更低的 S2 原始误差、B2 保持 S3 接触力优势；这些观测共同定义了基准的解读方式。
 
-跨语言回放闭合验证链。C99 独立回归 239 项全部通过、0 失败，120 行的 `gate_template.c` 独立自检输出 PASS。Python/C `--selftest` 回放 6,000 帧（R1 = 901、R2 = 900、R3 = 304、R4 = 3,895，含 ack 重武装随机对拍与 7→5→3→1→0 斜率归零），离散输出完全一致，连续指令差 max |du| = 0，binary32 逐比特精确相等。MATLAB/C `verify_core_equivalence` 覆盖 40,000 正常帧、40,000 损坏邮箱帧，以及 4 组各 40,000 帧的运行中非法旋钮注入，max |du| = 5e-9。另有 10,000 tick 的 `outer_seq` 租约回放，覆盖原生 HOLD → `SAFE_ZERO`、序号跌回 0 的损坏路径与冷却恢复，max |du| = 4.19e-8。Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
+跨语言回放闭合验证链。C99 独立回归 245 项全部通过、0 失败，120 行的 `gate_template.c` 独立自检输出 PASS。Python/C `--selftest` 回放 6,000 帧（R1 = 901、R2 = 900、R3 = 304、R4 = 3,895，含 ack 重武装随机对拍与 7→5→3→1→0 斜率归零），离散输出完全一致，连续指令差 max |du| = 0，binary32 逐比特精确相等。MATLAB/C `verify_core_equivalence` 覆盖 40,000 正常帧、40,000 损坏邮箱帧，以及 4 组各 40,000 帧的运行中非法旋钮注入，max |du| = 5e-9。另有 10,000 tick 的 `outer_seq` 租约回放，覆盖原生 HOLD → `SAFE_ZERO`、序号跌回 0 的损坏路径与冷却恢复，max |du| = 4.19e-8。Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
 
 ## 面向受约束设备的通用接口
 

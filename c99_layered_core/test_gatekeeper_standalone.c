@@ -32,7 +32,9 @@
  *             de-energise (A1), cumulative latch + explicit acknowledgement and
  *             post-ack episode-quota re-arm (A2), local outer_seq frame lease
  *             (A3), emergency R4 blend bypass (A4), normal-path slew bound
- *             rounded inward at the 1.0f / 7.0e-8 boundary (A6)
+ *             rounded inward at the 1.0f / 7.0e-8 boundary (A6), and the
+ *             GATE_SAFE_ZERO de-energise budget rounded inward at the reachable
+ *             1.5f / 0.1f boundary (A7)
  * ---------------------------------------------------------------------------
  */
 
@@ -74,6 +76,14 @@ static void check(int ok, const char *fmt, ...)
 static float t_absf(float v)
 {
     return (v < 0.0f) ? -v : v;
+}
+
+/* Exact absolute difference of two binary32 values held in double: comparing
+ * |u(k) - u(k-1)| in binary32 would round the difference itself and could hide
+ * a sub-ULP overshoot, so the slew assertions below use this helper. */
+static double t_absd(double v)
+{
+    return (v < 0.0) ? -v : v;
 }
 
 /* Finite binary32 check without <math.h>: NaN fails v == v, and +/-Inf makes
@@ -2298,7 +2308,7 @@ static void test_hold_timeout(void)
     }
     check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f &&
           st.u_target == 0.0f &&
-          t_absf(out.u - prev_u) <= du_max + 1e-6f &&
+          t_absd((double)out.u - (double)prev_u) <= (double)du_max &&
           t_absf(out.u) < t_absf(prev_u) && integ_zero != 0 &&
           st.permanent_latched == 1u &&
           (st.fault_audit_bitmask &
@@ -2417,7 +2427,8 @@ static void test_hold_timeout(void)
     du_max = cfg.u_slew_max_per_s * cfg.dt_s;
     out = step_checked(&inv, &st, &cfg, &tun, &in);
     check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f && st.u_target == 0.0f &&
-          t_absf(out.u - prev_u) <= du_max + 1e-6f && t_absf(out.u) < t_absf(prev_u) &&
+          t_absd((double)out.u - (double)prev_u) <= (double)du_max &&
+          t_absf(out.u) < t_absf(prev_u) &&
           (st.fault_audit_bitmask & LAYERED_FAULT_BIT_HOLD_TIMEOUT) != 0u &&
           st.permanent_latched == 0u,
           "A1 hold: a latency-only timeout -> %s u=%.6f (ramped from %.6f by <= %.6f) "
@@ -3023,7 +3034,7 @@ static void test_emergency_r4_bypass(void)
           "A4 bypass: blend=%.3f and the target is the raw R4 law (diff %.9f)",
           (double)out.blend, (double)t_absf(out.u_target - expected));
     check(t_absf(out.u) <= cfg.u_max + 1.0e-6f &&
-          t_absf(out.u - prev_u) <= du_max + 1.0e-6f,
+          t_absd((double)out.u - (double)prev_u) <= (double)du_max,
           "A4 bypass: magnitude and slew limits still apply (|u|=%.6f, |du|=%.6f)",
           (double)t_absf(out.u), (double)t_absf(out.u - prev_u));
 
@@ -3154,6 +3165,100 @@ static void test_normal_slew_rounding(void)
           (double)out.u);
 }
 
+/* ========================================================================= */
+/* Phase A7: GATE_SAFE_ZERO de-energise budget rounded inward                */
+/* ========================================================================= */
+
+/* Reachable counterexample from the cold-start audit: dt = 0.001 s and
+ * u_slew_max_per_s = 100 /s give the binary32 per-tick budget
+ * 0.10000000149011612, which is larger than one ULP of the 1.5f command
+ * (1.1920928955078125e-7).  Nearest-even rounding of 1.5f - 0.1f lands on
+ * 1.3999999761581421f, an exact double difference of 0.10000002384185791 --
+ * 2.235174179e-8 over the declared bound -- so a de-energise walk that clamps
+ * to the rounded value publishes a step wider than the budget it claims to
+ * honour.  The walk must round inward exactly like the normal path and step to
+ * 1.4000000953674316f (0.09999990463256836) instead, while the sub-ULP case
+ * keeps its documented one-ULP floor. */
+static void test_safe_zero_rounding(void)
+{
+    LayeredConfig_t cfg;
+    LayeredState_t st;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    float prev_u;
+    float naive;
+    double du_max;
+    double naive_delta;
+    int i;
+
+    build_config(&cfg);
+    cfg.dt_s = 0.001f;
+    cfg.u_slew_max_per_s = 100.0f;
+    cfg.max_hold_ticks = 1u;
+    cfg.u_max = 2.0f;
+    cfg.blend_alpha = 1.0f;
+    cfg.kp[0] = 1.0f;
+    for (i = 1; i < LAYERED_NUM_REGIMES; ++i) {
+        cfg.kp[i] = 0.0f;
+    }
+    for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
+        cfg.kd[i] = 0.0f;
+        cfg.ki[i] = 0.0f;
+        cfg.ff_scale[i] = 0.0f;
+    }
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.r = 1.5f;
+
+    Layered_Init(&st, &cfg, &tun);
+    out = zero_output();
+    for (i = 0; i < 100; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    prev_u = st.u_applied;
+    check(out.gate == GATE_NORMAL && prev_u == 1.5f,
+          "A7 safe-zero rounding: the closed loop parks the command exactly at 1.5f (u=%.9f)",
+          (double)prev_u);
+
+    du_max = (double)(cfg.u_slew_max_per_s * cfg.dt_s);
+    naive = prev_u - cfg.u_slew_max_per_s * cfg.dt_s;
+    naive_delta = t_absd((double)naive - (double)prev_u);
+    check(naive_delta > du_max,
+          "A7 safe-zero rounding: the unguarded subtraction lands outside the budget "
+          "(naive step=%.17g > bound=%.17g)", naive_delta, du_max);
+
+    in.outer_age_s = 10.0f; /* heartbeat gone for good */
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 1u,
+          "A7 safe-zero rounding: the first stale tick holds the command (gate=%s, u=%.9f)",
+          Layered_GateName(out.gate), (double)out.u);
+
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO,
+          "A7 safe-zero rounding: the exhausted budget enters GATE_SAFE_ZERO (gate=%s, u=%.9f)",
+          Layered_GateName(out.gate), (double)out.u);
+    check(t_absd((double)out.u - (double)prev_u) <= du_max &&
+          t_absf(out.u) > t_absf(naive) && t_absf(out.u) < t_absf(prev_u),
+          "A7 safe-zero rounding: 1.5f -> %.9f is the inward-rounded step "
+          "(exact |du|=%.17g <= %.17g; unguarded would be %.9f)",
+          (double)out.u, t_absd((double)out.u - (double)prev_u), du_max, (double)naive);
+
+    /* The following ticks keep honouring the exact budget while the magnitude
+     * decreases monotonically. */
+    prev_u = out.u;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO &&
+          t_absd((double)out.u - (double)prev_u) <= du_max &&
+          t_absf(out.u) < t_absf(prev_u),
+          "A7 safe-zero rounding: the next de-energise tick also lands inside the budget "
+          "(u %.9f -> %.9f, exact |du|=%.17g)",
+          (double)prev_u, (double)out.u, t_absd((double)out.u - (double)prev_u));
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -3214,6 +3319,9 @@ int main(void)
 
     printf("\n-- phase A6: normal-path slew bound rounded inward --\n");
     test_normal_slew_rounding();
+
+    printf("\n-- phase A7: GATE_SAFE_ZERO de-energise budget rounded inward --\n");
+    test_safe_zero_rounding();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

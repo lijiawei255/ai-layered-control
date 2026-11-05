@@ -853,8 +853,9 @@ if do_control
     command=clamp(st.u_target,-u_max,u_max);
     % The two slew bounds are binary32; nearest-even rounding of
     % u_applied +/- du can land outside the exact budget, so a violating bound
-    % is pulled one representable value back toward u_applied.  SAFE_ZERO keeps
-    % its separate documented single-ULP floor.
+    % is pulled one representable value back toward u_applied.  GATE_SAFE_ZERO
+    % applies the same inward rounding to its de-energise step, then adds its
+    % separate documented single-ULP floor.
     hi=st.u_applied+du; lo=st.u_applied-du;
     if double(hi)-double(st.u_applied)>double(du), hi=next_toward(hi,st.u_applied); end
     if double(st.u_applied)-double(lo)>double(du), lo=next_toward(lo,st.u_applied); end
@@ -940,7 +941,15 @@ function v=ramp_toward_zero(u,du)
 % Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.  The
 % effective step is max(du, 1 binary32 ULP(|u|)); the one-ULP floor only applies
 % while the budget is positive, so a rejected zero budget can never move the
-% command.
+% command.  A budget at or above one ULP is rounded inward like the normal slew
+% path first: nearest-even rounding of u - du can land just outside the exact
+% budget (1.5f with a 0.1f budget gives a 0.100000024 step), so a bound that
+% exceeds the budget in double arithmetic is pulled one representable value back
+% toward u before the walk continues.  It still only ever moves toward zero.
 v=clamp(single(0),u-du,u+du);
-if du>single(0) && u~=single(0) && v==u, v=next_toward_zero(u); end
+if du>single(0) && u~=single(0)
+    delta=abs(double(v)-double(u));
+    if delta>double(du), v=next_toward(v,u); end
+    if v==u, v=next_toward_zero(u); end
+end
 end

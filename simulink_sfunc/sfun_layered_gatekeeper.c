@@ -36,7 +36,8 @@
  *     in7  r                  -> LayeredInput_t.r                (reference)
  *     in8  r_dot              -> LayeredInput_t.r_dot            (reference derivative)
  *     in9  u_ff               -> LayeredInput_t.u_ff             (deterministic feedforward)
- *     in10 outer_seq          -> LayeredInput_t.outer_seq        (slow-frame sequence, 0 = legacy)
+ *     in10 outer_seq          -> LayeredInput_t.outer_seq        (slow-frame sequence, 0 = legacy;
+ *                                must be a whole number in [0, 4294967295], otherwise corrupt)
  *     in11 ack                -> external fault-latch acknowledgement (see below)
  *   Outputs (all scalar, double):
  *     out1 u                   command actually applied this tick
@@ -80,11 +81,12 @@
  *     [60 110 8 2],[1.2 1.5 0.8 0.35],[60 300 2 0],[1 1 1 0],[100 3],[1 1 1]
  *
  *   The block sample time is taken from cfg_float(1) (dt_s) so the core's
- *   period and the Simulink step cannot drift apart.  mdlCheckParameters has
- *   already refused a non-finite element of any floating parameter, so this
- *   path only sees finite values: a finite but non-positive dt_s (dt_s >= 1e6
- *   also takes it) inherits the surrounding model rate, and the frozen core
- *   still classifies a non-positive or non-finite dt_s as a corrupt
+ *   period and the Simulink step cannot drift apart.  A positive dt_s must be
+ *   below 1e6 s: a longer period cannot be represented as a block sample time,
+ *   so the parameter check rejects dt_s >= 1e6 instead of letting the core run
+ *   at one period while Simulink steps at another.  A finite but non-positive
+ *   dt_s is not a timing request: the block inherits the surrounding model
+ *   rate, and the frozen core still classifies that value as a corrupt
  *   configuration through its own corruption path.
  *
  * NUMERIC CONVERSION AT THE ADAPTER BOUNDARY
@@ -115,10 +117,19 @@
  *   compiled in every build), so an invalid vector is reported when the block is
  *   configured, when the model is updated (`SimulationCommand = 'update'`) and
  *   again in `mdlStart` before the first step.
- *   The saturating uint32 conversion helper remains for the `outer_seq` input
- *   port, which is a runtime signal: a NaN or non-positive level becomes 0 (the
- *   core then falls back to the transported outer_age_s), a level above
- *   UINT32_MAX saturates and a fractional level truncates.
+ *   The `outer_seq` input port is a runtime signal and is validated, never
+ *   saturated: only a finite whole number in [0, 4294967295] is passed to the
+ *   core as that sequence number.  NaN, +/-Inf, a negative value, a fractional
+ *   value and anything above UINT32_MAX are not coerced to 0 (that would select
+ *   the legacy `outer_age_s` path and hide the malformed mailbox).  The adapter
+ *   leaves `outer_seq` at 0 and overwrites `ai_regime` with -1.0f, outside the
+ *   core's documented [1, 4] mailbox regime range, so the frozen core
+ *   classifies the whole slow mailbox as corrupt on that tick: corrupted = 1,
+ *   NAN_CORRUPTION plus LOW_CONFIDENCE in the audit mask,
+ *   GATE_VETO_LOW_CONFIDENCE and REGIME_SAFE_FALLBACK.  A legal sequence
+ *   number, including an explicit 0, keeps its kernel semantics: 0 selects the
+ *   legacy age path, and a nonzero lease that falls back to 0 is corruption
+ *   the core reports itself.
  *
  * STORAGE (no mutable global state, no malloc/free)
  *   DW_STATE  : LayeredState_t (96 B) held in a uint32-typed DWork vector,
@@ -223,7 +234,7 @@ typedef char lg_sfun_input_size_check[(sizeof(LayeredInput_t) == 40) ? 1 : -1];
 typedef char lg_sfun_output_size_check[(sizeof(LayeredOutput_t) == 28) ? 1 : -1];
 
 /* ========================================================================= */
-/* Conversion helpers: double -> float32 / uint32 without undefined behaviour */
+/* Boundary helpers: double -> float32 / uint32 without undefined behaviour   */
 /* ========================================================================= */
 
 /* float32 maximum; larger magnitudes saturate here so the frozen firewall
@@ -245,29 +256,23 @@ static float lg_sfun_to_float(real_T v)
     return (float)v;
 }
 
-/* Runtime-signal conversion only (the `outer_seq` input port).  Block
- * parameters never take this path: they are validated element by element in
- * lg_sfun_read_u32_vector, so the saturating behaviour below cannot hide a
- * bad tick budget. */
-static uint32_t lg_sfun_to_u32(real_T v)
-{
-    if (v != v) {
-        return 0u;
-    }
-    if (v <= 0.0) {
-        return 0u;
-    }
-    if (v >= 4294967295.0) {
-        return (uint32_t)4294967295u;
-    }
-    return (uint32_t)v; /* in range: truncation toward zero is defined */
-}
-
 /* Finite test without a library call: NaN fails the first comparison and
  * +/-Inf fails the second because Inf - Inf is NaN. */
 static int_T lg_sfun_is_finite(real_T v)
 {
     return (v == v) && ((v - v) == 0.0);
+}
+
+/* Runtime-signal validation only (the `outer_seq` input port).  A sequence
+ * number is accepted only when it is a finite whole number in [0, UINT32_MAX]:
+ * the range test runs before the cast, so the conversion is always defined,
+ * and the round-trip test rejects NaN, +/-Inf, negatives and fractional
+ * values.  Nothing is saturated or silently truncated; the caller turns an
+ * invalid element into mailbox corruption instead. */
+static int_T lg_sfun_seq_is_valid(real_T v)
+{
+    return lg_sfun_is_finite(v) && v >= 0.0 && v <= 4294967295.0 &&
+           (real_T)(uint32_t)v == v;
 }
 
 /* HIGH = finite and strictly positive.  A negative level is LOW, never a
@@ -437,6 +442,18 @@ static int_T lg_sfun_load_config(SimStruct *S, LayeredConfig_t *cfg)
 
     cfg->max_hold_ticks = tb[0];
     cfg->max_fault_vetoes_before_latch = tb[1];
+
+    /* The block sample time is this same dt_s, so a period at or above 1e6 s
+     * cannot be represented as a Simulink sample time: the core would run at
+     * one period while the block steps at another.  Reject it as a
+     * configuration error instead of silently substituting the inherited rate.
+     * A finite non-positive dt_s stays accepted here on purpose: the block
+     * inherits the model rate and the frozen core reports the corrupt
+     * configuration through its own corruption path. */
+    if (cfg->dt_s >= 1.0e6f) {
+        ssSetErrorStatus(S, "S-function parameter 1 (cfg_float): dt_s must be below 1.0e6 s; the block sample time cannot represent a larger period.");
+        return 0;
+    }
     return 1;
 }
 
@@ -455,9 +472,12 @@ static int_T lg_sfun_load_tuning(SimStruct *S, FieldTuning_t *tune)
     return 1;
 }
 
-/* Block sample time: the commissioned inner-loop period, cfg_float(1).  An
- * unusable value inherits the model rate; the core then rejects the invalid
- * configuration itself (corruption path) rather than this adapter guessing. */
+/* Block sample time: the commissioned inner-loop period, cfg_float(1).  The
+ * parameter check has already refused dt_s >= 1e6 and every non-finite value,
+ * so this reader only chooses between a representable positive period and the
+ * inherited model rate for a non-positive one.  A non-positive period is not a
+ * timing request: the core classifies that configuration as corrupt itself
+ * (corruption path) rather than this adapter guessing a rate. */
 static real_T lg_sfun_sample_time(SimStruct *S)
 {
     const mxArray *p = ssGetSFcnParam(S, P_CFG_FLOAT);
@@ -591,6 +611,7 @@ static void mdlOutputs(SimStruct *S, int_T tid)
     const real_T *sig;
     LayeredInput_t in;
     LayeredOutput_t out;
+    real_T seq_raw;
     int_T ack_on;
 
     (void)tid; /* single sample time: nothing rate-specific to do */
@@ -605,7 +626,23 @@ static void mdlOutputs(SimStruct *S, int_T tid)
     in.r = lg_sfun_to_float(ssGetInputPortRealSignal(S, IN_R)[0]);
     in.r_dot = lg_sfun_to_float(ssGetInputPortRealSignal(S, IN_R_DOT)[0]);
     in.u_ff = lg_sfun_to_float(ssGetInputPortRealSignal(S, IN_U_FF)[0]);
-    in.outer_seq = lg_sfun_to_u32(ssGetInputPortRealSignal(S, IN_OUTER_SEQ)[0]);
+
+    /* outer_seq is validated, never coerced.  A NaN, +/-Inf, a negative
+     * value, a fractional value or anything above UINT32_MAX is not a
+     * sequence number; mapping it to 0 would silently select the legacy
+     * outer_age_s path and hide the malformed mailbox.  Instead the adapter
+     * leaves outer_seq at the memset zero and forces -1.0f into ai_regime,
+     * which is outside the core's documented [1, 4] mailbox regime range, so
+     * the frozen core classifies the whole slow mailbox as corrupt on this
+     * tick: corrupted = 1, NAN_CORRUPTION and GATE_VETO_LOW_CONFIDENCE with
+     * REGIME_SAFE_FALLBACK.  A legal whole number, including 0, passes
+     * through unchanged and keeps its kernel semantics. */
+    seq_raw = ssGetInputPortRealSignal(S, IN_OUTER_SEQ)[0];
+    if (lg_sfun_seq_is_valid(seq_raw)) {
+        in.outer_seq = (uint32_t)seq_raw;
+    } else {
+        in.ai_regime = -1.0f;
+    }
 
     /* External acknowledgement: a finite level above zero is HIGH, every other
      * finite level (zero, negatives) is LOW, and a rising edge is applied

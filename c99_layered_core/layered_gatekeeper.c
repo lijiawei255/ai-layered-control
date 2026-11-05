@@ -179,8 +179,13 @@ static float lg_next_toward(float from, float to)
  * step is max(u_slew_max_per_s * dt, 1 binary32 ULP(|u_applied|)): a legal slew
  * budget below one ULP of the remaining command would round back to the same
  * value and the de-energise would never finish, so the one-ULP floor is the
- * documented quantisation exception to the slew bound.  It only ever moves
- * toward zero and only applies when the budget itself is positive:
+ * documented quantisation exception to the slew bound.  A budget at or above
+ * one ULP is rounded inward exactly like the normal path first: nearest-even
+ * rounding of u_applied - du_max can land just outside the exact budget (at
+ * 1.5f with a 0.1f budget the subtraction yields a 0.100000024 step), so a
+ * bound that exceeds the budget in double arithmetic is pulled one
+ * representable value back toward u_applied before the walk continues.  It only
+ * ever moves toward zero and only applies when the budget itself is positive:
  * lg_config_is_corrupt() refuses a configuration whose binary32 slew*dt product
  * underflows to 0 or overflows to infinity, so a zero budget can never move the
  * command here. */
@@ -188,8 +193,21 @@ static float lg_ramp_toward_zero(float u_applied, float du_max)
 {
     float next = lg_clampf(0.0f, u_applied - du_max, u_applied + du_max);
 
-    if (du_max > 0.0f && u_applied != 0.0f && next == u_applied) {
-        next = lg_next_toward_zero(u_applied);
+    if (du_max > 0.0f && u_applied != 0.0f) {
+        double delta = (double)next - (double)u_applied;
+
+        if (delta < 0.0) {
+            delta = -delta;
+        }
+        if (delta > (double)du_max) {
+            next = lg_next_toward(next, u_applied);
+        }
+        /* A budget below one binary32 step toward zero cannot move the
+         * command by subtraction at all; the documented one-ULP floor still
+         * de-energises in finite time. */
+        if (next == u_applied) {
+            next = lg_next_toward_zero(u_applied);
+        }
     }
     return next;
 }
@@ -945,7 +963,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
          * budget).  A bound that exceeds the budget in double arithmetic is
          * pulled one representable value back toward u_applied, so every normal
          * tick honours |u(k) - u(k-1)| <= u_slew_max_per_s * dt_s exactly.
-         * GATE_SAFE_ZERO keeps its separate documented single-ULP floor. */
+         * GATE_SAFE_ZERO applies the same inward rounding to its de-energise
+         * step, then adds its separate documented single-ULP floor. */
         u_cmd = lg_clampf(state->u_target, -u_max, u_max);
         u_hi = state->u_applied + du_max;
         u_lo = state->u_applied - du_max;

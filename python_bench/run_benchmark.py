@@ -160,14 +160,25 @@ class PythonGatekeeper:
     def _ramp_toward_zero(u_applied, du_max):
         """Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.
 
-        The effective step is max(du_max, 1 binary32 ULP(|u|)) and the one-ULP
-        floor only applies while the budget itself is positive, matching the C
-        core's quantisation contract.
+        The de-energise step is rounded inward exactly like the normal slew
+        bounds: nearest-even rounding of u_applied - du_max can land just
+        outside the exact budget (at 1.5f with a 0.1f budget the subtraction
+        yields a 0.100000024 step), so a bound that exceeds the budget in double
+        arithmetic is pulled one binary32 step back toward u_applied.  The
+        documented one-ULP floor still de-energises when even that bound cannot
+        move the command, and it only applies while the budget itself is
+        positive, matching the C core's quantisation contract.
         """
         nxt = PythonGatekeeper._clampf(0.0, _f32(u_applied - du_max),
                                        _f32(u_applied + du_max))
-        if du_max > 0.0 and u_applied != 0.0 and nxt == u_applied:
-            nxt = PythonGatekeeper._next_toward_zero(u_applied)
+        if du_max > 0.0 and u_applied != 0.0:
+            delta = float(nxt) - float(u_applied)
+            if delta < 0.0:
+                delta = -delta
+            if delta > float(du_max):
+                nxt = PythonGatekeeper._next_toward(nxt, u_applied)
+            if nxt == u_applied:
+                nxt = PythonGatekeeper._next_toward_zero(u_applied)
         return nxt
 
     @staticmethod
@@ -1454,6 +1465,29 @@ def selftest():
     assert c_stale[99:105] == p_stale[99:105] == ramp_expected, (c_stale[99:105], p_stale[99:105])
     assert c_stale == p_stale
     print('PASS: 1 kHz SAFE_ZERO ramp 7->5->3->1->0 exact on both trigger paths and both backends')
+    # F1 reachable case: a held command of 1.5 with a 0.1 binary32 budget.  The
+    # rounded bound 1.5f - 0.1f is 1.4f, a 0.100000024 step that exceeds the
+    # budget, so the de-energise must pull the bound one ULP back toward the
+    # held command and step 1.5 -> 1.4000000953674316, bit-exact on both engines.
+    inward_cfg = dict(CFG, dt_s=float(np.float32(0.001)), u_slew_max_per_s=float(np.float32(100.0)),
+                      max_hold_ticks=1, u_max=float(np.float32(2.0)), blend_alpha=1.0,
+                      kp=[1, 0, 0, 0], kd=[0.0] * 4, ki=[0.0] * 4, ff_scale=[0.0] * 4)
+    inward_tuning = dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.)
+    c = Core(inward_cfg); p = PythonGatekeeper(inward_cfg, inward_tuning)
+    live = (1., .95, .005, 0., 0., 0., 1.5, 0., 0., 0)
+    for _ in range(100):
+        a, b = c.step(*live), p.step(*live)
+        assert a == b
+    assert a[0] == b[0] == float(np.float32(1.5))
+    stale = (1., .95, 10.0, 0., 0., 0., 1.5, 0., 0., 0)
+    a, b = c.step(*stale), p.step(*stale)
+    assert a == b and a[1] == b[1] == GATE_HOLD_LATENCY
+    a, b = c.step(*stale), p.step(*stale)
+    inward_du = float(np.float32(100.0 * 0.001))
+    assert a == b and a[1] == b[1] == GATE_SAFE_ZERO
+    assert a[0] == b[0] == 1.4000000953674316, (a[0], b[0])
+    assert abs(a[0] - 1.5) <= inward_du
+    print('PASS: F1 SAFE_ZERO inward rounding 1.5 -> 1.4000000953674316 within the 0.1 budget')
     # Normal-path slew-bound regression: the two bounds are rounded inward.  With
     # a binary32 budget of 7.0e-8 between 0.5 ULP and 1 ULP of 1.0f, the rounded
     # upper bound 1.0000001192f would allow a 1.1920929e-7 step; the limiter must

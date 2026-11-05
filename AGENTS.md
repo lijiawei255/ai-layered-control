@@ -115,7 +115,7 @@ latches `HOLD_TIMEOUT` but never arms the permanent latch.
 | `c99_layered_core/layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Deterministic safety arbiter and four-bank controller |
 | `c99_layered_core/gate_template.c` | `[REUSABLE CORE / TEMPLATE]` 1 kHz MCU integration sample: 32 B residual probe, `blanking_active`, `outer_seq` commit pattern |
 | `python_bench/minimal_template.py` | `[REUSABLE CORE / TEMPLATE]` 10 Hz supervisor, C binding, `auto_calibrate`, `auto_field_tune` and `[USER-PLUGIN-SLOT] 1..3` |
-| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs, 648 lines |
+| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs, 685 lines |
 | `python_bench/run_benchmark.py` | `[BENCHMARK HARNESS - DO NOT COPY]` Physical fixture, full Python mirror, training and experiments |
 | `c99_layered_core/test_gatekeeper_standalone.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Core behavioral regression |
 | `c99_layered_core/verify_core_equivalence.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Test-only frame replay |
@@ -150,7 +150,14 @@ convert to a finite binary32 value; every tick-count element must be a finite in
 `[0, 4294967295]`; each vector must be a real 1-D double array. `single`, integer, sparse, complex,
 empty, wrong-length, matrix-shaped and 3-D variants are refused, and no value is ever saturated or
 silently zeroed. Runtime input ports keep the opposite contract: a NaN or out-of-range signal reaches
-the frozen core, which classifies it through its own corruption path.
+the frozen core, which classifies it through its own corruption path. `outer_seq` is validated at the
+adapter boundary because the ABI carries a `uint32_t`: a sample that is not a finite whole number in
+`[0, 4294967295]` is forwarded as explicit slow-mailbox corruption — the core sets `corrupted = 1`,
+latches `NAN_CORRUPTION` and runs closed-loop R4 — instead of being truncated or saturated into a legal
+sequence, while an integral zero keeps the legacy semantics. The block sample time is taken only from a
+positive `dt_s` below `1e6 s`; `mdlCheckParameters` refuses a larger period so the core period and the
+Simulink rate cannot diverge, and a finite non-positive `dt_s` inherits the model rate and is classified
+by the core as a corrupt configuration.
 
 ## 4. Porting sequence
 
@@ -298,7 +305,7 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-C regression reports 239 passes and zero failures with exit code zero, and the MCU template prints PASS.
+C regression reports 245 passes and zero failures with exit code zero, and the MCU template prints PASS.
 Replay compares gate, regime, fault bits and corruption flags exactly.
 Python/C command agreement is bit-exact (max|du| = 0 over 6,000 frames); MATLAB/C agreement is
 max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays,
@@ -318,7 +325,7 @@ Serialize writes to the generated model. Preserve unsaved user edits in any open
 ## 8. Repository discipline
 
 Keep the core and templates small: the Python template is 119 lines (within 100–120), the MCU template is
-120 lines (within 110–130), and the S-Function is 648 lines: a thin adapter that never re-implements the
+120 lines (within 110–130), and the S-Function is 685 lines: a thin adapter that never re-implements the
 control law.
 Keep both auto-adaptation helpers together within 20–30 lines.
 Replace superseded mechanisms rather than retaining compatibility switches or unused branches.
