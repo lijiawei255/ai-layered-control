@@ -137,7 +137,7 @@ With `outer_seq` nonzero, the core measures frame age on its own 1 kHz clock: a 
 fresh lease, an unchanged one ages it by one tick, and a frozen or forged `outer_age_s` cannot mask a
 stalled mailbox; a sequence falling back to zero is treated as corruption, not as a fresh frame.
 Native HOLD preserves the applied command, not a mechanical position; past `max_hold_ticks` the core
-enters `GATE_SAFE_ZERO` and ramps to zero at the commissioned slew limit.
+enters `GATE_SAFE_ZERO` and ramps to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
 R4 uses fixed gains, zero-state error and no feedforward, independent of field tuning.
 
 每通道独立持有状态、探针、旋钮与源时间戳。
@@ -148,18 +148,18 @@ R4 uses fixed gains, zero-state error and no feedforward, independent of field t
 慢环字段损坏也进入闭环 R4，保留包络与残差优先级。
 `outer_seq` 非零时，内核用本地 1 kHz 时钟测量帧龄：序号变化即打开新租约，序号不变则每 tick 老化一次，
 冻结或伪造的 `outer_age_s` 无法掩盖停滞的邮箱。原生 HOLD 保持的是执行器指令而非机械位置；
-超过 `max_hold_ticks` 后进入 `GATE_SAFE_ZERO`，按标定斜率平滑归零。
+超过 `max_hold_ticks` 后进入 `GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长严格单调归零。
 R4 固定增益、零状态参考和零前馈，不受现场增益旋钮缩放。
 
 ## Verification / 验证
 
-C99 standalone regression passes 233 checks with zero failures; `gate_template.c` prints PASS.
+C99 standalone regression passes 235 checks with zero failures; `gate_template.c` prints PASS.
 Python/C `--selftest` replays 6,000 frames with max |du| = 0 in binary32, MATLAB/C equivalence
 keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 10,000-tick
 `outer_seq` lease replay stays within max |du| = 4.5e-8, and the Level-2
 S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
 
-C99 独立回归 233 项全部通过、0 失败；`gate_template.c` 自检输出 PASS。
+C99 独立回归 235 项全部通过、0 失败；`gate_template.c` 自检输出 PASS。
 Python/C `--selftest` 回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、损坏邮箱帧
 与非法旋钮注入下均保持 max |du| = 5e-9；10,000 tick 的 `outer_seq` 租约回放 max |du| = 4.5e-8；Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
 

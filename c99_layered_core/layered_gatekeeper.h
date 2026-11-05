@@ -73,8 +73,10 @@ typedef enum {
     GATE_VETO_LOW_CONFIDENCE   = 3, /* AI self-confidence too low: ABSTAIN     */
     GATE_VETO_SAFETY_ENVELOPE  = 4, /* state at/approaching hard safety limit  */
     GATE_SAFE_ZERO             = 5, /* native HOLD ran past its budget:        */
-                                    /* command ramped to zero (slew-limited),  */
-                                    /* integrators cut                         */
+                                    /* command ramped to zero in steps of      */
+                                    /* max(slew * dt, 1 binary32 ULP) so the   */
+                                    /* de-energise always finishes; integrators*/
+                                    /* cut                                     */
     GATE_LATCHED_SAFE          = 6  /* cumulative severe faults: permanently   */
                                     /* locked in R4 until an explicit external */
                                     /* acknowledgement re-arms the AI         */
@@ -111,6 +113,10 @@ typedef struct {
 /* and state limits, magnitude, slew. Nonnegative: integral bound, anti-windup */
 /* time and prediction horizon. Ratios: 0 <= safety_clear <= safety_trip <= 1, */
 /* safety_trip > 0; residual_clear in [0,1]; 0 <= confidence_trip <= clear <= 1.*/
+/* The binary32 product u_slew_max_per_s * dt_s must stay positive and finite:  */
+/* a product that underflows to zero cannot be honoured by the SAFE_ZERO        */
+/* quantisation floor and one that overflows makes every command reachable in   */
+/* a single tick, so both are rejected as corrupt configurations.               */
 /* ------------------------------------------------------------------------- */
 typedef struct {
     float dt_s;                 /* inner-loop period, 0.001 s = 1 kHz          */
@@ -253,7 +259,8 @@ void Layered_Init(LayeredState_t *state,
  *    corrupt-frame path (invalid fast sensor, or invalid configuration with its
  *    fixed LAYERED_CORRUPT_CONFIG_MAX_HOLD_TICKS = 100 budget) escalates to
  *    GATE_SAFE_ZERO past the budget: target and integrators are cleared, the
- *    command is ramped to zero under the commissioned slew limit (immediately
+ *    command is ramped to zero under the commissioned slew limit, one binary32
+ *    ULP at a time when that budget is below one ULP of the command (immediately
  *    zeroed when the slew configuration itself is untrusted), and
  *    HOLD_TIMEOUT plus PERMANENT_LATCH latch. A stale heartbeat (section d)
  *    uses config->max_hold_ticks and latches HOLD_TIMEOUT only.
@@ -280,6 +287,17 @@ void Layered_Init(LayeredState_t *state,
  *         command ramped to zero under the commissioned slew rate, and
  *         HOLD_TIMEOUT latches (a heartbeat-only timeout never arms the
  *         permanent latch). No controller runs while the fault persists.
+ *         QUANTISATION CONTRACT: the commanded change per tick is
+ *         max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|)), and the
+ *         one-ULP floor applies only when the slew budget is positive.  A legal
+ *         budget smaller than half an ULP of the remaining command would
+ *         otherwise round back to the same binary32 value and the actuator could
+ *         stay non-zero forever, so the floor trades a bounded, one-directional
+ *         quantisation overshoot for a guaranteed finite-time de-energise.  The
+ *         core rejects any configuration whose binary32 slew*dt product
+ *         underflows to 0 or overflows to infinity, so the floor is never the
+ *         whole budget.  This is the only path where the applied command may
+ *         change by more than the configured slew budget.
  *      e) GATE_NORMAL               : AI regime accepted.
  *    A cumulative permanent latch (max_fault_vetoes_before_latch > 0) beats
  *    all of the above: once the configured number of safety/OOD veto EPISODES
@@ -348,6 +366,12 @@ void Layered_Init(LayeredState_t *state,
  *    removes the first-order phase lag from the emergency damping response.
  *    The magnitude and slew limits below still apply to every command.
  *    Finally the command is hard clamped in magnitude and slew rate.
+ *    SLEW CONTRACT: on every normal control tick |u(k) - u(k-1)| is bounded by
+ *    u_slew_max_per_s * dt_s.  The single documented exception is the
+ *    GATE_SAFE_ZERO de-energise above, whose per-tick step is
+ *    max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|)) so that a legal yet
+ *    sub-ULP budget still reaches exactly 0.0f in finite time.  It only ever
+ *    reduces |u|, never re-energises, and never applies when the budget is 0.
  */
 LayeredOutput_t Layered_Step(LayeredState_t *state,
                              const LayeredConfig_t *config,

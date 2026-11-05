@@ -116,7 +116,7 @@ jitter and untraceable state. A veto without persistent evidence cannot answer t
 question.
 
 **Mechanism.** The core is ANSI C99 with zero dynamic memory, statically sized state and object text of
-6,144 bytes at `-Os` and 7,172 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
+6,208 bytes at `-Os` and 7,252 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe. The 7-bit
 `fault_audit_bitmask` records latency, residual OOD, low confidence, envelope breach, NaN corruption,
 HOLD timeout and permanent latch. Three cumulative safety/OOD episodes latch GATE_LATCHED_SAFE
@@ -174,7 +174,7 @@ differs by 150 ticks (93.49% versus 94.99%), visible in the third decimal of the
 TV 1545.01 N·m, while B1 keeps the lower raw S2 error and B2 keeps its S3 contact advantage; these
 observations define the interpretation of the benchmark.
 
-Cross-language replay closes the verification loop. The C99 standalone regression passes 233 checks with
+Cross-language replay closes the verification loop. The C99 standalone regression passes 235 checks with
 zero failures, and the 120-line `gate_template.c` self-check prints PASS. The Python/C `--selftest`
 replays 6,000 frames (R1 = 901, R2 = 900, R3 = 304, R4 = 3,895, including acknowledgement re-arming and
 the 7→5→3→1→0 ramp-down) with identical discrete outputs and max |du| = 0, bit-exact in binary32. The

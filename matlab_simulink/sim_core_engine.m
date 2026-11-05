@@ -115,7 +115,12 @@ c=struct('t',t,'stage',stage,'r',r,'rd',rd,'rdd',rdd,'p',p, ...
 end
 
 function a=lcg(seed,n)
-a=zeros(n,1); state=uint32(seed);
+% 32-bit unsigned LCG.  The seed arrives as a double and is wrapped modulo 2^32
+% before the uint32 conversion: uint32() saturates any double above
+% intmax('uint32'), while the Python mirror (int(seed) & 0xffffffff) wraps, so an
+% offset context seed such as 4294967295+11 must wrap on both sides or the two
+% random streams start from different states.
+a=zeros(n,1); state=uint32(mod(double(seed),4294967296));
 for k=1:n
     state=uint32(bitand(uint64(1664525)*uint64(state)+uint64(1013904223),uint64(4294967295)));
     a(k)=(double(state)+.5)/4294967296;
@@ -361,6 +366,11 @@ function D=physical_probes(P)
 nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
 D.counter_bounds=counter_bounds(P.cfg);
 sequence=lcg(18,1000); D.lcg_last=sequence(end);
+% F3 boundary: a legal UINT32_MAX seed shifted by +11/+37 in the context must
+% wrap modulo 2^32 before the uint32 conversion, matching the Python mirror.
+assert(lcg(4294967295+11,1)==0.23994349723216146 && ...
+    lcg(4294967295+37,1)==0.25001986033748835, ...
+    'A UINT32_MAX context seed did not wrap modulo 2^32 at both offsets.');
 D.sensor_hz=[12 18 37 83 137]; D.sensor_detect_ms=nan(1,5);
 for j=1:5
     pr=probe_init(0);
@@ -438,6 +448,15 @@ assert(st.outer_age_ticks==uint32(0) && st.last_outer_seq==uint32(8),'A new sequ
 assert(out(3)==3 && out(4)==4 && st.conf,'A sequence falling back to zero did not request closed-loop R4.');
 assert(out(7)==1 && st.corrupted_frame_count==uint32(1) && ...
     bitand(st.fault,uint32(16))~=0,'A sequence falling back to zero was not audited as corruption.');
+% F2 boundary: the lease age is (float)ticks * dt, so 2^24+1 local ticks must
+% round the count to binary32 before the multiply and read 16777.216796875 s on
+% both engines; a double-precision product would read 16777.21875 s and trip a
+% timeout set exactly at the former value.
+q=c; q.min_dwell_ticks=dwell0; q.outer_timeout_s=single(16777.216796875);
+st=core_init(); st.last_outer_seq=uint32(7); st.outer_age_ticks=uint32(16777216);
+[st,out]=core_step(st,q,t,single([1 .95 0 0 0 0 0 0 0 7]));
+assert(out(3)==0 && out(7)==0 && st.outer_age_ticks==uint32(16777217), ...
+    'The 2^24+1 tick lease did not round the uint32 count to binary32 first.');
 % Bounded native HOLD: a stale heartbeat runs out its budget and forces a
 % de-energised zero without arming the permanent latch.
 st=core_init(); stale=single([1 1 .5 0 0 0 0 0 0]);
@@ -510,7 +529,7 @@ q=c; q.kp(1)=single(3e38); q.kd(1)=single(0); q.ki(1)=single(0);
 [~,out]=core_step(core_init(),q,single([4 1 1]),single([1 .95 .005 0 0 0 .1 0 0]));
 assert(isfinite(out(2)) && out(2)==c.u_max, ...
     'An overflowed bank product published a non-finite target.');
-q=c; q.dt_s=single(3e38); st=core_init();
+q=c; q.dt_s=single(3e38); q.u_slew_max_per_s=single(1e-30); st=core_init();
 overflow_lease=single([1 .95 0 0 0 0 .1 0 0 5]);
 st=core_step(st,q,t,overflow_lease);
 [st,out]=core_step(st,q,t,overflow_lease);
@@ -590,6 +609,14 @@ bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
     c.confidence_clear_ratio<c.min_ai_confidence || c.confidence_clear_ratio>1 || ...
     c.safety_trip_ratio<=0 || c.safety_trip_ratio>1 || c.safety_clear_ratio<0 || ...
     c.safety_clear_ratio>c.safety_trip_ratio;
+% The per-tick slew budget is the binary32 product slew * dt: one that
+% underflows to zero cannot be honoured by the SAFE_ZERO quantisation floor and
+% one that overflows makes any command reachable in a single tick, so both are
+% rejected as corrupt configurations instead of being reinterpreted.
+if c.u_slew_max_per_s>0 && c.dt_s>0
+    slew_dt=c.u_slew_max_per_s*c.dt_s;
+    bad=bad || ~(slew_dt>single(0)) || abs(slew_dt)>single(3e38);
+end
 end
 
 function [st,out]=core_step(st,c,t,in)
@@ -864,7 +891,10 @@ bits=typecast(uint32([b 0]),'single'); v=bits(1);
 end
 
 function v=ramp_toward_zero(u,du)
-% Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.
+% Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.  The
+% effective step is max(du, 1 binary32 ULP(|u|)); the one-ULP floor only applies
+% while the budget is positive, so a rejected zero budget can never move the
+% command.
 v=clamp(single(0),u-du,u+du);
-if u~=single(0) && v==u, v=next_toward_zero(u); end
+if du>single(0) && u~=single(0) && v==u, v=next_toward_zero(u); end
 end

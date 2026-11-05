@@ -1808,8 +1808,13 @@ static void test_settings_and_clamp(void)
                     out.u == held && st.integ[0] == integral &&
                     (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
             } else {
+                /* A NaN-only test (out.u == out.u) would let a +/-Inf
+                 * regression escape; every published value of the fallback
+                 * tick must be finite, not merely non-NaN. */
                 fallback += out.corrupted && out.regime == REGIME_SAFE_FALLBACK &&
-                    out.gate == GATE_VETO_LOW_CONFIDENCE && out.u == out.u &&
+                    out.gate == GATE_VETO_LOW_CONFIDENCE &&
+                    t_is_finite(out.u) && t_is_finite(out.u_target) &&
+                    t_is_finite(out.blend) &&
                     (out.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0;
             }
             *fields[i] = saved;
@@ -2057,7 +2062,10 @@ static void test_runtime_tuning_faults(void)
             in.x_dot += cfg.dt_s * (out.u - 0.2f * in.x_dot) / 0.1f;
             in.x += cfg.dt_s * in.x_dot;
             if (t_absf(in.x) > peak) peak = t_absf(in.x);
-            violations += !(in.x == in.x) || t_absf(in.x) > cfg.state_safety_limit;
+            /* A non-finite plant state is a violation in its own right: test it
+             * with t_is_finite so a +/-Inf regression cannot slip through a
+             * NaN-only comparison. */
+            violations += !t_is_finite(in.x) || t_absf(in.x) > cfg.state_safety_limit;
         }
         check(holds == 0 && safe == 2500 && violations == 0,
               "runtime tuning case %d: fault at 5 s gives 0 HOLD, 2500 R4 ticks and 0 breaches (peak=%.4f)",
@@ -2777,9 +2785,14 @@ static void test_extreme_numeric_domain(void)
           "(target=%.6f, u=%.6f)",
           (double)out.u_target, (double)out.u);
 
-    /* (b) outer_age_ticks * dt overflows: the saturated lease must still time out. */
+    /* (b) outer_age_ticks * dt overflows: the saturated lease must still time out.
+     * The slew budget is scaled down so that slew * dt stays a finite positive
+     * binary32 product, i.e. the extreme inner period remains a legal
+     * configuration and the lease path is exercised instead of the config
+     * firewall. */
     build_config(&cfg);
     cfg.dt_s = 3.0e38f;
+    cfg.u_slew_max_per_s = 1.0e-30f; /* 1e-30 * 3e38 = 3e8, finite */
     build_tuning(&tun, 1.0f, 1.0f, 1.0f);
     Layered_Init(&st, &cfg, &tun);
     in.outer_age_s = 0.0f;
@@ -2824,6 +2837,33 @@ static void test_extreme_numeric_domain(void)
     check(i == 200 && st.u_applied < 0.99999f && st.u_applied > 0.9999f,
           "A5 sub-ULP: 200 further ticks decrease the command by one ULP each (u=%.9f)",
           (double)st.u_applied);
+
+    /* (d) The binary32 slew budget slew * dt must stay positive and finite.
+     * A product that underflows to zero cannot be honoured by the quantisation
+     * floor, and one that overflows lets a single tick reach any command; both
+     * are degenerate configurations and must be refused as corrupt instead of
+     * being silently reinterpreted. */
+    in = zero_input();
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    build_config(&cfg);
+    cfg.dt_s = 1.0e-6f;
+    cfg.u_slew_max_per_s = 1.0e-40f; /* 1e-46 rounds to 0.0f in binary32 */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted != 0 && out.gate == GATE_HOLD_LATENCY,
+          "A5 slew budget: slew * dt underflowing to 0 is rejected as corrupt (%s)",
+          Layered_GateName(out.gate));
+    build_config(&cfg);
+    cfg.dt_s = 3.0e38f;
+    cfg.u_slew_max_per_s = 3.0e38f; /* the product overflows to +Inf */
+    Layered_Init(&st, &cfg, &tun);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted != 0 && out.gate == GATE_HOLD_LATENCY,
+          "A5 slew budget: slew * dt overflowing to infinity is rejected as corrupt (%s)",
+          Layered_GateName(out.gate));
 }
 
 /* A corrupt fast frame advances hold_ticks without being a latency timeout, so

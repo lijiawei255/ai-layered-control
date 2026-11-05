@@ -76,7 +76,7 @@ With `outer_seq == 0` the transported `outer_age_s` remains authoritative.
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Residual above threshold; sticky until it recedes below `residual_clear_ratio`. |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit `ai_regime = 4`; cleared only by a confident normal regime. |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | Measured or predicted state at the envelope; sticky until both fall below `safety_clear_ratio`. |
-| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: target and integrators cleared, command ramped to zero under `u_slew_max_per_s`. |
+| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: target and integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`. |
 | 6 | `GATE_LATCHED_SAFE` | `max_fault_vetoes_before_latch = 3` safety/OOD episodes lock R4 until `Layered_AcknowledgeFaultLatch()`. |
 
 Priority is envelope, residual, confidence, then native latency HOLD.
@@ -93,6 +93,13 @@ Its integral and anti-windup use the same zero-state error; `ff_scale[3]` is ign
 Invalid field knobs use internal nominal scales (1,1,1), including normal-bank tracking integrators.
 The nominal residual predictor is frozen independently of supervisor weights.
 
+Slew contract: on every normal control tick `|u(k) - u(k-1)| <= u_slew_max_per_s * dt_s`.
+`GATE_SAFE_ZERO` is the single documented exception, with a per-tick step of
+`max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`; it only ever reduces `|u|` and applies only
+while the budget is positive. A configuration whose binary32 `u_slew_max_per_s * dt_s` product
+underflows to `0.0f` or overflows to infinity is rejected as corrupt: the first cannot be honoured by
+the quantisation floor, the second makes every command reachable in one tick.
+
 The sticky 7-bit audit mask records `LATENCY_TIMEOUT`, `OOD_RESIDUAL`, `LOW_CONFIDENCE`,
 `ENVELOPE_BREACH`, `NAN_CORRUPTION`, `HOLD_TIMEOUT` and `PERMANENT_LATCH`.
 `Layered_AcknowledgeFaultLatch()` clears the three independent veto latches (safety envelope, physics
@@ -108,7 +115,7 @@ latches `HOLD_TIMEOUT` but never arms the permanent latch.
 | `c99_layered_core/layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Deterministic safety arbiter and four-bank controller |
 | `c99_layered_core/gate_template.c` | `[REUSABLE CORE / TEMPLATE]` 1 kHz MCU integration sample: 32 B residual probe, `blanking_active`, `outer_seq` commit pattern |
 | `python_bench/minimal_template.py` | `[REUSABLE CORE / TEMPLATE]` 10 Hz supervisor, C binding, `auto_calibrate`, `auto_field_tune` and `[USER-PLUGIN-SLOT] 1..3` |
-| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs |
+| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs, 645 lines |
 | `python_bench/run_benchmark.py` | `[BENCHMARK HARNESS - DO NOT COPY]` Physical fixture, full Python mirror, training and experiments |
 | `c99_layered_core/test_gatekeeper_standalone.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Core behavioral regression |
 | `c99_layered_core/verify_core_equivalence.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Test-only frame replay |
@@ -132,6 +139,18 @@ S3 measurement noise has one scale and a bounded white distribution; no periodic
 Stage labels belong only to plant generation, calibration labels and offline statistics.
 Deployment controllers and residual probes cannot read stage labels, time schedules or fault frequency.
 The broadband innovation envelope and independent spike probe must work without a fault-frequency input.
+
+The Simulink adapter is a thin bridge, and its parameter contract is part of the reusable template:
+`mdlCheckParameters` is compiled unconditionally (`#define MDL_CHECK_PARAMETERS` before `simulink.c`
+is included, never inside an `#ifdef` of itself) and `mdlInitializeSizes` calls it once the
+S-function parameter count matches. The same readers run again in `mdlStart`, so a malformed block
+parameter is rejected when the model is updated (`set_param(model,'SimulationCommand','update')`) and
+again before the first sample. Every floating parameter element must be finite as a double and must
+convert to a finite binary32 value; every tick-count element must be a finite integer in
+`[0, 4294967295]`; each vector must be a real 1-D double array. `single`, integer, sparse, complex,
+empty, wrong-length, matrix-shaped and 3-D variants are refused, and no value is ever saturated or
+silently zeroed. Runtime input ports keep the opposite contract: a NaN or out-of-range signal reaches
+the frozen core, which classifies it through its own corruption path.
 
 ## 4. Porting sequence
 
@@ -180,12 +199,46 @@ The benchmark evaluates six full 40 s missions per branch/unit (240 s of search 
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
 veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 runs and a 40 s mission
 (52 s per branch/unit). Device trajectory time and host simulation time are separate quantities.
+The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
+forward drift 0.50, cross mismatch (J +40%, b −30%) and reverse mismatch (J, b, fc, fs −25%) — and the
+accepted B3 tuples together with their search and mission metrics are identical in Python and MATLAB; only
+the rejected B1 counterfactual peaks carry the ~1e-14 double-precision sensitivity described in README
+section 3.1, which changes no feasibility verdict.
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
 Gain and damping must lie in [0.10,4.0]; safety margin in [0.10,1.0], so tuning only tightens the envelope.
 These are input-validity bounds; closed-loop suitability requires the constrained trials above.
 Record trial duration and host computation time separately; freeze AI throughout the search.
 A new physical domain requires a new signal/model/controller definition before calibration.
+
+### Step 5 — Answer unstructured reuse questions with three layers
+
+A downstream request rarely arrives in this repository's shape: a user describes an existing
+multi-axis arm, a WAAM machine, an aDBS stimulator or a PLC/PID loop and asks what can be reused and
+what has to be cut out. Do not answer by porting the benchmark wholesale. Answer along three
+decoupled layers, and keep the C ABI (96/140/12/40/28 B) and the template line counts unchanged while
+doing so.
+
+1. **Drop-in reuse (plug and play).** `c99_layered_core/layered_gatekeeper.c` and
+   `layered_gatekeeper.h`, and the Level-2 `simulink_sfunc/sfun_layered_gatekeeper.c` adapter, are
+   independent of the physical domain: no units, no plant model and no AI model live inside them. For
+   a multi-axis or multi-channel device, instantiate one `LayeredState_t` (96 B) per channel, share a
+   read-only configuration only between identical actuator classes, and call `Layered_Step()` from the
+   existing 1 kHz control task. The core serializes into the existing loop instead of replacing it.
+2. **Mechanism slicing.** If the device already owns a control law, do not replace it: lift one
+   orthogonal mechanism out of the core and keep the rest. The usual slices are the `outer_seq`
+   heartbeat lease with local 1 kHz age timing (so a stalled or forged slow frame cannot mask the
+   timeout), the `blanking_active` artefact-blanking probe, the per-bank tracking anti-windup, and the
+   three-episode permanent latch with its `Layered_AcknowledgeFaultLatch()` release state machine.
+   Each slice keeps its own contract and can be validated on its own.
+3. **The benchmark fixture is not a porting constraint.** The 1-DOF rotary motor, the unilateral
+   spring wall and the four fixed bank parameter sets inside `python_bench/run_benchmark.py` and
+   `matlab_simulink/sim_core_engine.m` exist only to reproduce this repository's own benchmark runs.
+   A downstream device maps its real physical signals through
+   [domain mapping](docs/domain_mapping_guide.md); none of those fixture choices (radians, N m, wall
+   phase, noise scale, bank gains) belongs to the reusable contract. Replacing or discarding the
+   fixture is normal adaptation, never a porting failure, and never a reason to keep an ABI element
+   the device does not need.
 
 ## 5. Multi-axis pattern and slow-loop timeout
 
@@ -206,8 +259,9 @@ age cannot mask the timeout. A sequence that falls back to zero is treated as co
 fresh frame. Native `GATE_HOLD_LATENCY` holds the last actuator command, not mechanical position.
 Do not describe a held torque, current or stimulation command as a held physical state.
 Past `max_hold_ticks` the core enters `GATE_SAFE_ZERO`: target and integrators clear, the command is
-ramped to zero under the slew limit, and `HOLD_TIMEOUT` latches. The cumulative safety/OOD latch
-(`GATE_LATCHED_SAFE`) is separate and requires the explicit acknowledgement API plus cooldown.
+ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`, and 
+`HOLD_TIMEOUT` latches. The cumulative safety/OOD latch (`GATE_LATCHED_SAFE`) is separate and
+requires the explicit acknowledgement API plus cooldown.
 Persistent fast-sensor failure requires a hardware-enforced maximum HOLD duration and safe shutdown
 (safe torque off, STO, for a drive); the C core does not supply that independent hardware function.
 
@@ -244,7 +298,7 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-C regression reports 233 passes and zero failures with exit code zero, and the MCU template prints PASS.
+C regression reports 235 passes and zero failures with exit code zero, and the MCU template prints PASS.
 Replay compares gate, regime, fault bits and corruption flags exactly.
 Python/C command agreement is bit-exact (max|du| = 0 over 6,000 frames); MATLAB/C agreement is
 max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays,
@@ -263,8 +317,9 @@ Serialize writes to the generated model. Preserve unsaved user edits in any open
 
 ## 8. Repository discipline
 
-Keep the core and templates small: the Python template stays within 100–120 lines, the MCU template
-within 110–130 lines, and the S-Function remains a thin adapter that never re-implements the control law.
+Keep the core and templates small: the Python template is 119 lines (within 100–120), the MCU template is
+120 lines (within 110–130), and the S-Function is 645 lines: a thin adapter that never re-implements the
+control law.
 Keep both auto-adaptation helpers together within 20–30 lines.
 Replace superseded mechanisms rather than retaining compatibility switches or unused branches.
 For maintenance of this compact reference, prefer the existing source, configuration and documents;

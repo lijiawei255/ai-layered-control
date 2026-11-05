@@ -130,9 +130,26 @@ title('B  Equal six-candidate search budget');
 legend('B3 factory','B3 feasible tuning','B1 factory','B1 S2-best (infeasible)','Location','northwest');
 nexttile; force=zeros(numel(E.tuning),2);
 for j=1:numel(E.tuning), force(j,:)=[E.tuning(j).mission.peak_contact(3,3),E.tuning(j).b1_best_mission.peak_contact(1,3)]; end
-bar(force); hold on; yline(20,':r','Contact budget','HandleVisibility','off'); grid on;
+hb=bar(force); hold on; yline(20,':r','Contact budget','HandleVisibility','off'); grid on;
 set(gca,'XTickLabel',labels); xlabel('Device mismatch condition');
-ylabel('S3 peak contact force [N]'); ylim([0 100]); title('C  Independent full-mission validation');
+ylabel('S3 peak contact force [N]');
+% Cover the largest counterfactual bar instead of clipping it: the rejected B1
+% candidate reaches about 194 N on the reverse-mismatch mission.  Bars above the
+% regular 0..100 N band carry their value, so a tall column can never be read as
+% a clipped one.
+ylim([0 220]);
+peak=max(force(:));
+if peak>200, ylim([0 1.1*peak]); end
+for b=1:numel(hb)
+    xe=hb(b).XEndPoints; ye=hb(b).YEndPoints;
+    for j=1:numel(xe)
+        if ye(j)>100
+            text(xe(j),ye(j)+4,sprintf('%.1f N',ye(j)),'HorizontalAlignment','center', ...
+                'VerticalAlignment','bottom','FontSize',8,'Color','k');
+        end
+    end
+end
+title('C  Independent full-mission validation');
 legend('B3 feasible tuning','B1 S2-best (infeasible)','Location','northwest');
 nexttile; bar([E.model_fp32_bytes,4*E.classifier_scalars,E.state_bytes,E.config_bytes,E.tuning_bytes]);
 set(gca,'YScale','log','XTickLabel',{'RBF FP32','Supervisor FP32','Core state','Core config','Knobs'},'XTickLabelRotation',25);

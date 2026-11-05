@@ -141,14 +141,20 @@ static float lg_next_toward_zero(float v)
     return bits.f;
 }
 
-/* Slew-limited walk of the applied command to zero.  A slew budget below one ULP
- * of the remaining command still makes progress, so the de-energise terminates
- * for every legal positive configuration instead of holding a non-zero command. */
+/* Slew-limited walk of the applied command to zero.  The effective per-tick
+ * step is max(u_slew_max_per_s * dt, 1 binary32 ULP(|u_applied|)): a legal slew
+ * budget below one ULP of the remaining command would round back to the same
+ * value and the de-energise would never finish, so the one-ULP floor is the
+ * documented quantisation exception to the slew bound.  It only ever moves
+ * toward zero and only applies when the budget itself is positive:
+ * lg_config_is_corrupt() refuses a configuration whose binary32 slew*dt product
+ * underflows to 0 or overflows to infinity, so a zero budget can never move the
+ * command here. */
 static float lg_ramp_toward_zero(float u_applied, float du_max)
 {
     float next = lg_clampf(0.0f, u_applied - du_max, u_applied + du_max);
 
-    if (u_applied != 0.0f && next == u_applied) {
+    if (du_max > 0.0f && u_applied != 0.0f && next == u_applied) {
         next = lg_next_toward_zero(u_applied);
     }
     return next;
@@ -229,6 +235,18 @@ static int lg_config_is_corrupt(const LayeredConfig_t *c)
         c->safety_trip_ratio <= 0.0f || c->safety_trip_ratio > 1.0f ||
         c->safety_clear_ratio < 0.0f || c->safety_clear_ratio > c->safety_trip_ratio) {
         return 1;
+    }
+    /* The per-tick slew budget is the binary32 product slew * dt.  A product
+     * that underflows to zero cannot be honoured by the quantisation floor of
+     * GATE_SAFE_ZERO, and one that overflows makes every command reachable in a
+     * single tick; both are degenerate configurations, not values the arbiter
+     * may silently reinterpret, so they are rejected here. */
+    if (c->u_slew_max_per_s > 0.0f && c->dt_s > 0.0f) {
+        float slew_dt = c->u_slew_max_per_s * c->dt_s;
+
+        if (!(slew_dt > 0.0f) || !lg_is_finite(slew_dt)) {
+            return 1;
+        }
     }
     return 0;
 }

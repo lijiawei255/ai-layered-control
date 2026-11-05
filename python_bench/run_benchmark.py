@@ -137,10 +137,15 @@ class PythonGatekeeper:
 
     @staticmethod
     def _ramp_toward_zero(u_applied, du_max):
-        """Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0."""
+        """Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.
+
+        The effective step is max(du_max, 1 binary32 ULP(|u|)) and the one-ULP
+        floor only applies while the budget itself is positive, matching the C
+        core's quantisation contract.
+        """
         nxt = PythonGatekeeper._clampf(0.0, _f32(u_applied - du_max),
                                        _f32(u_applied + du_max))
-        if u_applied != 0.0 and nxt == u_applied:
+        if du_max > 0.0 and u_applied != 0.0 and nxt == u_applied:
             nxt = PythonGatekeeper._next_toward_zero(u_applied)
         return nxt
 
@@ -176,7 +181,17 @@ class PythonGatekeeper:
                 and 0 <= cfg['min_ai_confidence'] <= cfg['confidence_clear_ratio'] <= 1
                 and 0 < cfg['safety_trip_ratio'] <= 1 and 0 <= cfg['safety_clear_ratio'] <= cfg['safety_trip_ratio']):
             return True
-        return any(cfg[k] < 0 for k in ('integ_limit', 'windup_tau_s', 'safety_predict_s'))
+        if any(cfg[k] < 0 for k in ('integ_limit', 'windup_tau_s', 'safety_predict_s')):
+            return True
+        # The per-tick slew budget is the binary32 product slew * dt.  One that
+        # underflows to zero cannot be honoured by the SAFE_ZERO quantisation
+        # floor and one that overflows makes any command reachable in one tick,
+        # so both are degenerate configurations the core rejects.
+        if cfg['u_slew_max_per_s'] > 0 and cfg['dt_s'] > 0:
+            slew_dt = _f32(cfg['u_slew_max_per_s'] * cfg['dt_s'])
+            if not slew_dt > 0 or not -finite <= slew_dt <= finite:
+                return True
+        return False
 
     @staticmethod
     def _pid(kp, kd, ki, ff, gain_scale, damping_scale, e, ed, integ, u_ff, u_max):
@@ -296,7 +311,10 @@ class PythonGatekeeper:
                 self.outer_age_ticks = 0
             else:
                 self.outer_age_ticks = self._inc_sat(self.outer_age_ticks)
-            outer_age_eff = _f32(float(self.outer_age_ticks) * dt_eff)
+            # C evaluates (float)ticks * dt, i.e. the uint32 count is rounded to
+            # binary32 *before* the multiply; do the same here, otherwise a lease
+            # beyond 2^24 ticks drifts by up to one tick from the core.
+            outer_age_eff = _f32(_f32(float(self.outer_age_ticks)) * dt_eff)
             # A legal but extreme inner period can overflow that product.  It
             # saturates instead of reading as invalid input, so the timeout still
             # trips when the locally timed frame is that old.
@@ -515,10 +533,16 @@ def _ref_arrays(spec, s, amp):
     m3 = ~m1 & ~m2 & (u < 2.0 * dwell + move)
     r[m3] = -amp
     m4 = ~(m1 | m2 | m3)
-    for mask, t0, sgn in ((m2, dwell, -1.0), (m4, 2.0 * dwell + move, 1.0)):
+    # The ramp offset is subtracted in the same association as the MATLAB mirror:
+    # the return ramp is ((u - 2*dwell) - move)/move, not (u - (2*dwell+move))/move.
+    # Both spellings are mathematically equal but round the quintic time ratio
+    # differently by one binary64 ULP, which the contact fixture would amplify.
+    for mask, sgn, second in ((m2, -1.0, False), (m4, 1.0, True)):
         if not np.any(mask):
             continue
-        p5, v5, a5 = _quintic((u[mask] - t0) / move)
+        tau = (((u[mask] - 2.0 * dwell) - move) if second
+               else (u[mask] - dwell)) / move
+        p5, v5, a5 = _quintic(tau)
         r[mask] = sgn * (-amp + 2.0 * amp * p5)
         rd[mask] = sgn * 2.0 * amp * v5 / move
         rdd[mask] = sgn * 2.0 * amp * a5 / (move * move)
@@ -1265,7 +1289,7 @@ def selftest():
     c = Core(q, (4., 1., 1.)); p = PythonGatekeeper(q, dict(gain_scale=4., damping_scale=1., safety_margin_scale=1.))
     a, b = c.step(1, .95, .005, 0., 0., 0., .1, 0., 0., 0), p.step(1, .95, .005, 0., 0., 0., .1, 0., 0., 0)
     assert a == b and a[6] == cfg['u_max'] == 20.0, (a, b, cfg['u_max'])
-    q = dict(cfg, dt_s=3e38)
+    q = dict(cfg, dt_s=3e38, u_slew_max_per_s=1e-30)  # 1e-30 * 3e38 = 3e8, finite
     c = Core(q); p = PythonGatekeeper(q, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
     slow = (1., .95, 0., 0., 0., 0., .1, 0., 0., 5)
     a, b = c.step(*slow), p.step(*slow)
@@ -1399,6 +1423,25 @@ def selftest():
     assert trials == [(.75,1.,.7), (1.,1.,.7), (1.25,1.,.7), (2.,1.,.7), (1.25,.5,.7), (1.25,.75,.7)]
     assert auto_field_tune(lambda _: (math.nan, False), (.9,.8,.7)) == (.9,.8,.7)
     assert auto_field_tune(lambda _: (math.inf, True), (.9,.8,.7)) == (.9,.8,.7)
+    # F2 boundary: the local lease age is (float)ticks * dt in the C core, so a
+    # lease count of 2^24+1 must round to 16777216 before the multiply.  Both
+    # engines therefore read 16777.216796875 s and stay below a timeout equal to
+    # that value; a double-precision product would read 16777.21875 s and trip.
+    lease_cfg = dict(cfg, outer_timeout_s=16777.216796875)
+    c = Core(lease_cfg)
+    p = PythonGatekeeper(lease_cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    c.state.last_outer_seq = p.last_outer_seq = 7
+    c.state.outer_age_ticks = p.outer_age_ticks = 16777216
+    a, b = c.step(1, .95, 0., 0., 0., 0., 0., 0., 0., 7), p.step(1, .95, 0., 0., 0., 0., 0., 0., 0., 7)
+    assert a == b and a[1] == GATE_NORMAL and a[5] == 0, (a, b)
+    assert c.state.outer_age_ticks == p.outer_age_ticks == 16777217
+    print('PASS: F2 lease boundary 2^24+1 ticks rounds the uint32 count to binary32 first')
+    # F3 boundary: a legal UINT32_MAX seed shifts by +11/+37 in the context, so
+    # the offset must wrap modulo 2^32 before the uint32 conversion, exactly as
+    # the MATLAB mirror does.
+    assert lcg(4294967295 + 11, 1)[0] == 0.23994349723216146
+    assert lcg(4294967295 + 37, 1)[0] == 0.25001986033748835
+    print('PASS: F3 LCG seed 4294967295 wraps modulo 2^32 at both context offsets')
     # The ctypes boundary carries binary32 only: a raw float64 residual a hair
     # above the trip threshold must round to the same frame on both backends.
     c0 = Core(cfg)

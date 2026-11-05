@@ -85,30 +85,37 @@
  *   reports the invalid configuration through its own corruption path.
  *
  * NUMERIC CONVERSION AT THE ADAPTER BOUNDARY
- *   Inputs and parameters arrive as double.  A double that cannot be
+ *   The nine fast input signals arrive as double.  A double that cannot be
  *   represented in float32 saturates to +/-FLT_MAX, which the frozen firewall
  *   already classifies as non-finite (its limit is 3.0e38), so the core's
  *   NaN/Inf corruption semantics are preserved instead of invoking undefined
  *   double->float behaviour.  NaN passes through unchanged.
  *
- *   The tick-count parameters P2 and P7 are counts, not measurements, and are
- *   validated when the adapter reads its block parameters: every element must
- *   be a finite integer in [0, 4294967295] or the parameter is rejected.
- *   A NaN, -Inf or +Inf element is a configuration error, never a silent 0 or
- *   UINT32_MAX: a silently zeroed max_fault_vetoes_before_latch would disable
- *   the permanent safety latch, and a silently zeroed max_hold_ticks would
- *   disable the HOLD -> SAFE_ZERO budget.  Fractional and out-of-range values
- *   are refused for the same reason.  An explicit legal 0 stays legal: zero
- *   vetoes is the documented way to disable the cumulative latch.  Every
- *   parameter vector must also be a real 1-D array, so a matrix with the right
- *   element count is refused instead of being read in column-major order.
- *   `mdlCheckParameters` runs the same readers, so an invalid vector is
- *   reported when the block is configured or the model is updated, and again
- *   in `mdlStart` before the first step.
- *   The uint32 conversion helper remains for the `outer_seq` input port, which
- *   is a runtime signal: a NaN or non-positive level becomes 0 (the core then
- *   falls back to the transported outer_age_s), a level above UINT32_MAX
- *   saturates and a fractional level truncates.
+ *   BLOCK PARAMETERS ARE NOT RUNTIME SIGNALS AND ARE VALIDATED, NOT SATURATED:
+ *   every element of every floating vector (P1, P3..P6, P8 -- 34 elements in
+ *   total) must be finite as a double AND must convert to a finite binary32
+ *   value.  A NaN, +Inf, -Inf or a magnitude beyond the binary32 finite range is
+ *   a configuration error reported by the parameter check, never a value
+ *   silently reinterpreted by the core firewall.  The uint32 tick counts of P2
+ *   and P7 are validated the same way: every element must be a finite integer in
+ *   [0, 4294967295].  A NaN, -Inf or +Inf element is a configuration error,
+ *   never a silent 0 or UINT32_MAX: a silently zeroed
+ *   max_fault_vetoes_before_latch would disable the permanent safety latch, and
+ *   a silently zeroed max_hold_ticks would disable the HOLD -> SAFE_ZERO budget.
+ *   Fractional and out-of-range values are refused for the same reason.  An
+ *   explicit legal 0 stays legal: zero dwell/cooldown/latch, zero controller
+ *   gains and zero feedforward are valid commissioning settings.  Every
+ *   parameter vector must also be a real 1-D double array, so a matrix with the
+ *   right element count is refused instead of being read in column-major order,
+ *   and single/integer/sparse/complex/empty variants are refused as well.
+ *   `mdlCheckParameters` runs the same readers unconditionally (the callback is
+ *   compiled in every build), so an invalid vector is reported when the block is
+ *   configured, when the model is updated (`SimulationCommand = 'update'`) and
+ *   again in `mdlStart` before the first step.
+ *   The saturating uint32 conversion helper remains for the `outer_seq` input
+ *   port, which is a runtime signal: a NaN or non-positive level becomes 0 (the
+ *   core then falls back to the transported outer_age_s), a level above
+ *   UINT32_MAX saturates and a fractional level truncates.
  *
  * STORAGE (no mutable global state, no malloc/free)
  *   DW_STATE  : LayeredState_t (96 B) held in a uint32-typed DWork vector,
@@ -217,9 +224,13 @@ typedef char lg_sfun_output_size_check[(sizeof(LayeredOutput_t) == 28) ? 1 : -1]
 /* ========================================================================= */
 
 /* float32 maximum; larger magnitudes saturate here so the frozen firewall
- * (which rejects anything outside +/-3.0e38) keeps its NaN/Inf semantics. */
+ * (which rejects anything outside +/-3.0e38) keeps its NaN/Inf semantics.
+ * Runtime input signals only: block parameters are validated, never saturated. */
 #define LG_SFUN_FLOAT_MAX 3.402823466e38
 
+/* Runtime-signal conversion (input ports only).  A block parameter never takes
+ * this path: it is validated element by element and rejected unless it is a
+ * finite value that converts to a finite binary32. */
 static float lg_sfun_to_float(real_T v)
 {
     if (v != v) {
@@ -292,8 +303,26 @@ static int_T lg_sfun_read_float_vector(SimStruct *S, int_T pidx, int_T n,
         return 0;
     }
     v = mxGetPr(p);
+    /* Configuration values are not measurements: a non-finite or
+     * binary32-unrepresentable element must be refused here instead of being
+     * handed to the core firewall as a "corrupt frame".  The double test runs
+     * before the cast (a double outside the binary32 range cannot be converted
+     * in C99), and the converted value is checked again so the invariant is
+     * "the value the core will see is finite". */
     for (i = 0; i < n; ++i) {
-        dst[i] = lg_sfun_to_float(v[i]);
+        const real_T d = v[i];
+        float fv;
+
+        if (!lg_sfun_is_finite(d) || d > LG_SFUN_FLOAT_MAX || d < -LG_SFUN_FLOAT_MAX) {
+            ssSetErrorStatus(S, msg);
+            return 0;
+        }
+        fv = (float)d;
+        if (!lg_sfun_is_finite((real_T)fv)) {
+            ssSetErrorStatus(S, msg);
+            return 0;
+        }
+        dst[i] = fv;
     }
     return 1;
 }
@@ -445,7 +474,12 @@ static real_T lg_sfun_sample_time(SimStruct *S)
 /* Simulink callbacks                                                        */
 /* ========================================================================= */
 
-#ifdef MDL_CHECK_PARAMETERS
+/* MDL_CHECK_PARAMETERS must be defined unconditionally, before simulink.c is
+ * included: the wrapper only registers the callback when the macro is defined,
+ * and no standard mex build predefines it.  Guarding this #define with its own
+ * #ifdef (as an earlier revision did) leaves the callback out of the build, so
+ * the block parameters are then validated only at start instead of also on
+ * model update. */
 #define MDL_CHECK_PARAMETERS
 static void mdlCheckParameters(SimStruct *S)
 {
@@ -453,14 +487,14 @@ static void mdlCheckParameters(SimStruct *S)
     FieldTuning_t tune;
 
     /* The same readers used at start validate the block parameters here, so a
-     * matrix-shaped vector or a non-finite/fractional tick budget is reported
-     * when the block is configured or the model is updated, not only when the
-     * simulation runs.  The readers raise the error message themselves. */
+     * matrix-shaped vector, a non-finite floating element or a
+     * non-finite/fractional/out-of-range tick budget is reported when the block
+     * is configured or the model is updated, not only when the simulation
+     * runs.  The readers raise the error message themselves. */
     if (!lg_sfun_load_config(S, &cfg) || !lg_sfun_load_tuning(S, &tune)) {
         return;
     }
 }
-#endif
 
 static void mdlInitializeSizes(SimStruct *S)
 {
@@ -471,12 +505,10 @@ static void mdlInitializeSizes(SimStruct *S)
         /* Simulink reports the parameter-count mismatch with its own dialog. */
         return;
     }
-#ifdef MDL_CHECK_PARAMETERS
     mdlCheckParameters(S);
     if (ssGetErrorStatus(S) != NULL) {
         return;
     }
-#endif
     for (i = 0; i < P_NUM_PARAMS; ++i) {
         ssSetSFcnParamTunable(S, i, 0);
     }
