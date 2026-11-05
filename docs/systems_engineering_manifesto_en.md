@@ -27,7 +27,7 @@ forced veto from an independent physical residual probe.
 
 ## Six field problems and the mechanisms that answer them
 
-### 1. Scarce samples, expensive trials
+### 1. Scarce samples and the compute cost of continuous policies
 
 **Problem:** A continuous action model needs dense labeled rollouts. In this benchmark the
 conditioned RBF action head (B2), which represents the fast-slow learned route, is trained on 16,000
@@ -44,7 +44,12 @@ stall at the same point.
 **Mechanism:** The 10 Hz slow loop needs only qualitative coverage: 36 labeled macro windows, 15
 scalars, 60 bytes, calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime
 prototypes and the confidence thresholds. No GPU and no action labels are involved. B2 serves as the
-comparison point that quantifies the data cost of the continuous route.
+comparison point that quantifies the data cost of the continuous route. The compute cost follows the
+same reduction: B2 evaluates a continuous action head over **5,149 scalars / 20,596 B** on every 1 ms
+tick, whereas this architecture only classifies discrete regimes plus a manifold-distance
+confidence at 10 Hz with a model of **15 scalars / 60 B** — reducing the slow-loop task from 1 kHz
+continuous regression to 10 Hz discrete classification and cutting both sample complexity and online
+inference compute.
 
 ### 2. Multi-condition conflict: stiction versus compliant contact
 

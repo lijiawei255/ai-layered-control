@@ -275,10 +275,11 @@ When a Chinese-speaking user describes the device in Chinese, map each Chinese a
 before answering; keep the user's Chinese wording in the reply while using the exact identifiers below.
 
 - `跨环异步通信缓冲 / 慢环通信帧` = slow-frame mailbox (`ai_regime`, `ai_confidence`, `outer_age_s`, `outer_seq`).
+- `离散定性路由与流形外主动弃权` = discrete qualitative routing & OOD abstention (`ai_regime = 4` / `GATE_VETO_LOW_CONFIDENCE`).
 - `流形外主动弃权 / 低置信度弃权` = OOD / low-confidence abstention (`ai_regime = 4` / `GATE_VETO_LOW_CONFIDENCE`).
 - `标称模型预测残差（新息）探针` = 32 B innovation probe (`LayeredProbe_t` / `physics_residual`).
 - `硬件消隐窗口` = `blanking_active`.
-- `内核级指令保持` = native command hold (`GATE_HOLD_LATENCY`).
+- `内核级 HOLD（指令保持）` = native command hold (`GATE_HOLD_LATENCY`).
 - `能量泄放归零` = slew-limited ramp-to-zero (`GATE_SAFE_ZERO`).
 - `锁存保持故障掩码` = sticky `fault_audit_bitmask`.
 - `接口适配` = interface adaptation (`SLOT 1..3` / `FieldTuning_t`).
