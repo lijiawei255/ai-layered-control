@@ -1,4 +1,4 @@
-# Systems engineering for qualitative AI and quantitative control
+# Layered Control Architecture Design Rationale and System Boundaries
 
 The central decision is who owns the actuator. The answer is a split: a slow semantic model selects
 the operating regime, and a deterministic controller owns the quantitative command, the integral
@@ -24,6 +24,16 @@ architecture follows the Simplex / runtime assurance (RTA) division of responsib
 boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: 10 Hz
 manifold-distance low-confidence abstention retreats to R4 damping, and a 1 kHz millisecond-scale
 forced veto from an independent physical residual probe.
+
+## Layered system boundaries (L0–L4)
+
+| Layer | Responsibility |
+| :--- | :--- |
+| L0 | Hardware safety channel: an independent safety PLC (ISO 13849 Cat.3/4, 1oo2D), dual-channel sensor cross-check, and hardware STO / IEC 60204-1 Stop 0. |
+| L1 | Deterministic fast inner loop: four-bank PID with full-branch reverse-tracking anti-windup plus nominal feedforward; DOB/ESO/ADRC or bounded adaptive compensation can be added in the control-law slot or via `u_ff`. |
+| L2 | Runtime safety arbitration and degradation chain: 96 B C99 Simplex state machine, 1D ZCBF signed envelope look-ahead, blanking hold, per-axis R4 → SAFE_ZERO → LATCHED_SAFE; multi-axis aggregation of `gate_state` plus a shared ack bus for Stop 1/2. |
+| L3 | Slow qualitative supervision and conformally calibrated abstention: 10 Hz discrete regime advice plus split-conformal manifold-distance confidence. |
+| L4 | Fleet lifecycle closure: frozen AI weights during operation, append-only 7-bit fault audit mask as trigger tags for OOD data capture, offline prototype supplementation and safety-case update. |
 
 ## Six field problems and the mechanisms that answer them
 
@@ -51,7 +61,7 @@ nearest-centroid classifier and six-point constrained search (`auto_field_tune`)
 zero-third-party-dependency reference implementation; in a real machine the same interface can host
 a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another
 classification model. B2 serves as the comparison point that quantifies the data cost of the
-continuous route: it evaluates a continuous action head over **5,149 scalars / 20,596 B** on every
+continuous route: it evaluates a continuous action head over **5,664 scalars / 22,656 B** on every
 1 ms tick, whereas this architecture only classifies discrete regimes plus a manifold-distance
 confidence at 10 Hz with a model of **15 scalars / 60 B** — reducing the slow-loop task from 1 kHz
 continuous regression to 10 Hz discrete classification and cutting both sample complexity and online
@@ -70,22 +80,24 @@ S3 contact reaches 64.59 N at the wall, an alpha = 0.3 output low-pass still lea
 six candidate tunings fail the contact criterion.
 
 **Mechanism:** The bottom layer holds four deterministic banks: R1 nominal, R2 high load, R3
-compliant contact and R4 safe fallback. Every bank runs tracking anti-windup back-calculated from
-the actually applied command, so a bank switch releases no stored integral energy. When a veto or
-the permanent latch selects R4, the core bypasses the blend filter and sets blend = 1.0, so the
-emergency damping acts on the first tick, without the delay of first-order bumpless transfer.
+compliant contact and R4 safe fallback. The active bank's integrator is back-calculated against the
+magnitude/slew-limited command before the blend filter, and inactive banks track the applied command,
+so a bank switch releases no stored integral energy. When a veto or the permanent latch selects R4,
+the core bypasses the blend filter and sets blend = 1.0, so the emergency damping acts on the first
+tick, without the delay of first-order bumpless transfer.
 
 ### 3. Unknown manifolds and incipient oscillation
 
-**Problem:** A new installation can operate outside the calibrated manifold; an unmodeled dead zone
-plus a 4 Hz mounting mode is one evaluated benchmark case. Once the structure oscillates, the loop
-must not keep applying a confident-looking command.
+**Problem:** A new installation can operate outside the calibrated manifold. The evaluated benchmark
+case runs at a normal amplitude with an in-box joint shift and a 5 % conformal false-positive budget;
+once the operating point leaves the calibrated manifold, the loop must not keep applying a
+confident-looking command.
 
 **Where the alternatives fail:** The fixed-threshold rule tree compared in this benchmark, or a
 fuzzy controller, encodes decision boundaries but - without an explicitly embedded
 manifold-distance or density model - carries no notion of distance from the calibrated
 distribution. The physical rule supervisor agrees with the prototype classifier on the main S1/S2
-decisions and the 19.47 N S3 contact peak, yet in the off-manifold case it cannot abstain. Abstention
+decisions and the 19.9 N S3 contact peak, yet in the off-manifold case it cannot abstain. Abstention
 first requires a measure of how far the current feature point lies from known operation, and the
 rule tree has none.
 
@@ -131,11 +143,12 @@ dimensionless residual. During a scheduled artifact, `blanking_active` freezes e
 state and holds the pre-blanking residual (`return p->residual`): a healthy periodic pulse cannot
 raise the residual, a sustained fault spanning periodic blanking keeps one OOD latch episode, and the
 residual decays along the release envelope outside the blanking window. The
-96-byte core adds three further layers: a 25 ms state safety envelope with phase-plane look-ahead,
-an independent residual veto, and a local clock lease on `outer_seq` so a frozen transported age
-cannot mask a stalled mailbox. Native HOLD is bounded: past `max_hold_ticks` (100 ticks in the
-reference) the core enters GATE_SAFE_ZERO, clears the integrators and ramps the command to zero in
-per-tick steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`. The normal path obeys
+96-byte core adds three further layers: a 25 ms signed envelope look-ahead, an independent residual
+veto, and a local clock lease on `outer_seq` so a frozen transported age cannot mask a stalled
+mailbox. A stale slow mailbox with healthy fast sensors keeps the loop closed on the fixed R4 law;
+past `max_hold_ticks` (100 ticks in the reference) the core enters GATE_SAFE_ZERO, clears the
+integrators and ramps the command to zero in per-tick steps of
+`max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`. The normal path obeys
 `|u(k) - u(k-1)| <= u_slew_max_per_s * dt_s`; the single documented exception is this one-ULP floor
 toward zero, which applies only when the legal slew budget is below one representable step, only
 reduces the command magnitude and never re-energises.
@@ -149,8 +162,7 @@ placed the actuator in a safe state.
 **Where the alternatives fail:** A Python or inference runtime brings allocation, scheduling jitter
 and untraceable state. A veto without persistent evidence cannot answer the post-incident question.
 
-**Mechanism:** The core is ANSI C99 with zero dynamic memory and statically sized state; object text
-is 6,572 bytes at `-Os` and 7,744 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
+**Mechanism:** The core is ANSI C99 with zero dynamic memory and statically sized state. Its ABI occupies
 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe. The 7-bit
 `fault_audit_bitmask` records seven event classes: latency, residual OOD, low confidence, envelope
 breach, NaN corruption, HOLD timeout and permanent latch. Three cumulative safety/OOD episodes latch
@@ -176,11 +188,12 @@ path obeys `|u(k) - u(k-1)| <= u_slew_max_per_s * dt_s`, and GATE_SAFE_ZERO's on
 zero is the single documented exception.
 
 Safe fallback is an explicit control regime, and its reference behavior, damping and feedforward
-permissions must be defined for the target device. A native HOLD holds the last actuator command,
-not a mechanical position or a physiological state; the device adapter defines the physical
-consequence. The core's R4 regulates toward a commissioned safe zero with fixed gains and no
-feedforward. When slow decisions are corrupt, that closed-loop law keeps running as long as valid
-fast measurements remain active.
+permissions must be defined for the target device. A stale slow mailbox with healthy fast sensors
+keeps the measured 1 kHz loop closed on the fixed R4 law; only an unusable fast input holds the last
+actuator command open-loop, and that held command is a command, not a mechanical position or a
+physiological state. The device adapter defines the physical consequence. The core's R4 regulates
+toward a commissioned safe zero with fixed gains and no feedforward. When slow decisions are corrupt,
+that closed-loop law keeps running as long as valid fast measurements remain active.
 
 ## Adaptation belongs to identifiable physical parameters
 
@@ -207,22 +220,21 @@ fault-frequency input. Noise, context delay and contact stiffness should have in
 The comparison keeps the baselines at full strength. B1 and B3 share the identical nominal
 inverse-dynamics feedforward, anti-windup and limits, and B1's S2 result remains the lowest raw error
 in the table. B2 runs its action head at the full 1 kHz rate (40,000 inferences, zero fast-loop
-state delay) and records the lowest S3 contact force at 12.52 N; without an explicit integrator or
-physical gate it carries larger S2 error and 589 S4 violation ticks. The rule tree and the
-prototype classifier agree on the main S1/S2 results and on the 19.47 N S3 contact peak; their S3 R3
-occupancy differs by 150 ticks (93.49% versus 94.99%), visible in the third decimal of the S3/S4
-RMSE (0.075100 / 0.540437 versus 0.069478 / 0.539985). The layered branch records S4 RMSE 0.539985
-rad with TV 1545.01 N·m, while B1 keeps the lower raw S2 error and B2 keeps its S3 contact
-advantage; these observations define the interpretation of the benchmark.
+state delay); without an explicit integrator or physical gate it carries larger S2 error, 68.57 N S3
+contact and 682 S4 violation ticks. The rule tree and the prototype classifier agree on the main
+S1/S2/S3/S4 results, including the 19.9 N S3 contact peak, but in the off-manifold case the rule tree
+cannot abstain. The layered branch records S4 RMSE 0.534138 rad with TV 1528.1 N·m and zero S4
+violations, while B1 keeps the lower raw S2 error; these observations define the interpretation of
+the benchmark.
 
-Cross-language replay closes the verification loop. The C99 standalone regression passes 245 checks
+Cross-language replay closes the verification loop. The C99 standalone regression passes 265 checks
 with zero failures, and the 120-line `gate_template.c` self-check prints PASS. The Python/C
-`--selftest` replays 6,000 frames (R1 = 901, R2 = 900, R3 = 304, R4 = 3,895, including
+`--selftest` replays 6,000 frames (R1 = 901, R2 = 900, R3 = 303, R4 = 3,896, including
 acknowledgement re-arming and the 7→5→3→1→0 ramp-down) with identical discrete outputs and
 max |du| = 0, bit-exact in binary32. The MATLAB/C `verify_core_equivalence` run covers 40,000 normal
 frames, 40,000 corrupted-mailbox frames and four 40,000-frame runs with illegal knob injection at
 max |du| = 5e-9. A 10,000-tick `outer_seq` lease replay adds native HOLD → `SAFE_ZERO`, the
-zero-sequence corruption path and cooldown recovery at max |du| = 4.19e-8. The Level-2 S-Function
+zero-sequence corruption path and cooldown recovery at max |du| = 3.6e-8 (the underlying binary32 command values are bit-identical after text round-trip). The Level-2 S-Function
 replays 1,100 frames with all seven outputs at max diff = 0.0.
 
 ## A generic interface for constrained devices

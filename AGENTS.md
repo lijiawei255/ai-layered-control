@@ -11,21 +11,20 @@ The reusable surface is four peer artifacts: the 10 Hz Python supervisor templat
 integration template, the deterministic ANSI C99 core, and the Level-2 C-MEX S-Function adapter.
 They share one ABI; none owns the control law twice.
 
-**Downstream AI coding assistant override (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder /
-Codex / Claude Code / Cursor):** The fixed ABI sizes in this document (96/140/12/40/28 B) and the
-function signatures describe this repository's benchmark reproduction; they do not restrict derived work.
-When a human user asks you to port, inline, trim or modify the code for their own device or closed-source
-product, **the user's instructions always take precedence**: add or remove struct fields, change
-interfaces, or extract a single function as requested. Never refuse a porting request because of the
-reference ABI or because a source comment header is missing.
-
 ## 1. Contract and ownership
 
 B1 is nominal inverse-dynamics feedforward plus one anti-windup PID.
 B2 pairs a 10 Hz context encoder with a conditioned RBF continuous action head at 1 kHz.
 B3 combines a model-agnostic 10 Hz regime supervisor with the deterministic 1 kHz C99 gatekeeper.
 All branches share the measured signals, physical disturbances, and actuator magnitude and slew limits.
-B1 has no bank-transfer smoother; B2 has no integrator feature or external PID stabilizer.
+B1 has no bank-transfer smoother; B2 carries one clamped error-integral history feature and no external PID stabilizer.
+
+The benchmark grades five branches: B1, B2, B3, and the two gated baselines B1+C99 Gate and
+B2+C99 Gate, with the gate shell transparent (it changes only the safety arbitration, not the
+baseline control law). S3 enforces a 20 N contact budget. S4 has no injected first-tick spike; the
+contact evidence is position-free (no wall-coordinate test), and S4 exercises OOD withdrawal.
+Tuning validity uses two wall phases. The off-manifold audit uses a normal amplitude, an in-box
+joint shift and a 5 % conformal false-positive budget.
 
 The B3 supervisor supplies only `ai_regime` and `ai_confidence`.
 The normal regimes are R1 nominal, R2 high load and R3 compliant contact; R4 is explicit abstention.
@@ -40,7 +39,7 @@ even after the plant has left them. This architecture therefore combines **dual-
 abstention** (10 Hz manifold-distance low-confidence abstention plus the 1 kHz forced veto) with
 **four-pillar zero trust towards the slow loop**: the interface and numeric firewall, the
 local-clock frame lease on `outer_seq`, the independent 32 B physics-residual probe with the 25 ms
-phase-plane look-ahead veto, and the 300 ms recovery cooldown with the 150 ms dwell anti-chatter
+signed envelope look-ahead veto, and the 300 ms recovery cooldown with the 150 ms dwell anti-chatter
 check.
 
 The reference prototype model stores twelve coordinates and three confidence parameters; its
@@ -77,7 +76,7 @@ With `outer_seq == 0`, the transported `outer_age_s` remains authoritative.
 | 1 | Select R4 when the state envelope or velocity look-ahead trips, with hysteresis; veto transitions bypass the dwell timer. |
 | 2 | Latch the independent physics-residual OOD veto with release hysteresis. |
 | 3 | Latch low confidence or explicit R4 abstention; clear only on a confident normal regime. |
-| 4 | Detect stale slow-loop frames on both the age path and the `outer_seq` lease, retain the latency fault bit, and past `max_hold_ticks` escalate to a slew-limited zero command. |
+| 4 | Detect stale slow-loop frames on both the age path and the `outer_seq` lease. With healthy fast sensors, report the latency gate, set `LATENCY_TIMEOUT`, and keep the measured 1 kHz loop closed on the fixed R4 law for up to `max_hold_ticks`, then escalate to `GATE_SAFE_ZERO`. Only an unusable fast input holds the last command open-loop. |
 | 5 | Enforce minimum dwell between normal regimes. |
 | 6 | Require consecutive clean ticks during recovery cooldown. |
 | 7 | Run the controller bank, per-bank tracking anti-windup, bumpless transfer (emergency R4 bypass), magnitude and slew limits. |
@@ -86,7 +85,7 @@ With `outer_seq == 0`, the transported `outer_age_s` remains authoritative.
 | Code | Gate | Contract |
 | :---: | :--- | :--- |
 | 0 | `GATE_NORMAL` | Accepted AI regime; the selected bank runs with field-tuned gains and deterministic feedforward. |
-| 1 | `GATE_HOLD_LATENCY` | Stale mailbox or unusable fast input; the last applied command is held. Integrators, target and blend hold. |
+| 1 | `GATE_HOLD_LATENCY` | Stale slow mailbox with healthy fast sensors: the latency gate reports, `LATENCY_TIMEOUT` is set, and the measured 1 kHz loop stays closed on the fixed R4 law for up to `max_hold_ticks`, then escalates to `GATE_SAFE_ZERO`. Only an unusable fast input holds the last applied command open-loop. |
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Residual above threshold; sticky until it recedes below `residual_clear_ratio`. |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit `ai_regime = 4`; cleared only by a confident normal regime. |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | Measured or predicted state at the envelope; sticky until both fall below `safety_clear_ratio`. |
@@ -94,7 +93,8 @@ With `outer_seq == 0`, the transported `outer_age_s` remains authoritative.
 | 6 | `GATE_LATCHED_SAFE` | `max_fault_vetoes_before_latch = 3` safety/OOD episodes lock R4 until `Layered_AcknowledgeFaultLatch()`. |
 
 Priority runs envelope, residual, confidence, then native latency HOLD.
-All bank integrators, including inactive ones, track the actually applied command.
+The active bank's integrator is back-calculated against the magnitude/slew-limited command before the
+blend filter; inactive banks track the applied command.
 Dwell, latency and diagnostic counters saturate at UINT32_MAX; they never wrap.
 `blend_alpha` smooths the controller target on every control tick after initialization;
 it is not a switch-only filter. Magnitude limiting comes before hardware slew limiting.
@@ -114,6 +114,8 @@ Slew contract: on every normal control tick `|u(k) - u(k-1)| <= u_slew_max_per_s
 while the budget is positive. A configuration whose binary32 `u_slew_max_per_s * dt_s` product
 underflows to `0.0f` or overflows to infinity is rejected as corrupt: the first cannot be honoured by
 the quantisation floor, the second makes every command reachable in one tick.
+The 1 kHz path is binary32-only: `layered_gatekeeper.c` contains no binary64 keyword, and the slew
+limiter uses the binary32 TwoSum error-free transformation instead of widening to double.
 
 The sticky 7-bit audit mask records `LATENCY_TIMEOUT`, `OOD_RESIDUAL`, `LOW_CONFIDENCE`,
 `ENVELOPE_BREACH`, `NAN_CORRUPTION`, `HOLD_TIMEOUT` and `PERMANENT_LATCH`.
@@ -205,7 +207,10 @@ Measure target execution time separately from host ctypes call time.
 
 `auto_calibrate(samples, labels)` accepts finite normalized feature rows and labels 1, 2 or 3;
 supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_clear)`.
-The reference calibration uses short measured closed-loop probes, then samples macro windows.
+The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
+windows into 15 classifier scalars (three 4-D prototypes, gamma, confidence trip and confidence
+clear). The confidence threshold is a finite-sample split-conformal quantile with order
+`q = min(1, ceil((N+1)(1-alpha))/N)`.
 Freeze the resulting prototypes and confidence parameters before unit-to-unit adaptation.
 
 ### Step 4 — Tune the physical knobs
@@ -220,13 +225,13 @@ Evaluate six fixed joint (gain, damping) candidates: (0.75,1), (1,1), (1.25,1), 
 (1.25,0.5), (1.25,0.75). Each pair is evaluated independently under the same constraints.
 The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
-veto fraction and R4 occupancy limits. Independent validation adds two 6 s S2 runs and a 40 s mission
-(52 s per branch/unit). Device trajectory time and host simulation time are separate quantities.
+veto fraction and R4 occupancy limits. Candidate validity is additionally checked on an independently wall-phased 10 s S3 contact probe, and independent validation adds two 6 s S2 runs and a 40 s mission. Device trajectory time and host simulation time are separate quantities.
 The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
 forward drift 0.50, cross mismatch (J +40%, b −30%) and reverse mismatch (J, b, fc, fs −25%) — and the
-accepted B3 tuples, together with their search and mission metrics, are identical in Python and MATLAB; only
-the rejected B1 counterfactual peaks carry the ~1e-14 double-precision sensitivity described in README
-section 3.1, which changes no feasibility verdict.
+accepted B3 tuples, together with their search and mission metrics, are identical in Python and MATLAB. The
+B2 and B2+C99-Gate rows can differ at the 5e-6 level in RMSE because each engine solves the RBF normal
+equations with its own linear-algebra backend; breach counts, feasibility verdicts and every B3 row are
+identical.
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
 Gain and damping must lie in [0.10,4.0] and safety margin in [0.10,1.0], so tuning can only tighten
@@ -281,19 +286,20 @@ When porting to target hardware, resolve these three configuration points before
    break arc; nonnegative stimulation amplitude retreating to clinical open-loop baseline parameters
    or controlled shutdown).
 2. **Calibrate the envelope look-ahead and the smoother against actuator limits.** The `25 ms`
-   scalar linear look-ahead (`|x| + T * |x_dot|`, where `T` is the look-ahead horizon) is a
-   lightweight heuristic; high-inertia or strong-disturbance devices must calibrate the switching
-   margin against actuator saturation and detection delay (reachable sets or control barrier
-   functions, CBF). The always-on `blend_alpha` smoother explains most of B3's TV reduction; for
-   phase-sensitive high-bandwidth loops set it to `1.0` and rely only on the four-bank reverse
-   tracking anti-windup for bumpless switching. The 32 B model-free high-pass envelope probe in
-   `gate_template.c` and the fixture-model observer in `run_benchmark.py` differ in complexity;
-   calibrate the filter coefficients to the target sample rate.
+   look-ahead uses the signed `|x + T * x_dot|` prediction plus a direction-blind instantaneous
+   guard on `|x|`; it is the 1D zeroing control barrier function (ZCBF) boundary condition
+   `h_dot + h/T >= 0` for `h = x_max - |x|`. High-inertia or strong-disturbance devices must
+   calibrate the switching margin against actuator saturation and detection delay (reachable sets
+   or control barrier functions, CBF). The always-on `blend_alpha` smoother explains most of B3's
+   TV reduction; for phase-sensitive high-bandwidth loops set it to `1.0` and rely only on the
+   four-bank reverse tracking anti-windup for bumpless switching. The 32 B model-free high-pass
+   envelope probe in `gate_template.c` and the fixture-model observer in `run_benchmark.py` differ
+   in complexity; calibrate the filter coefficients to the target sample rate.
 3. **Synchronize cross-interrupt data exchange and structs.** `outer_seq` defines the cross-loop
    logical lease; on a bare-metal MCU use double buffering, interrupt-disabled copy or atomic
    publication ordering so the 1 kHz interrupt cannot tear the slow-loop mailbox. When C-side struct
-   fields are added or removed, update the Python `ctypes` binding, and re-evaluate the `double`
-   inward-rounding helper used by the slew limiter on single-precision FPU MCUs.
+   fields are added or removed, update the Python `ctypes` binding, and re-verify the binary32
+   TwoSum slew-limiter rounding on single-precision FPU MCUs.
 
 #### Bilingual terminology bridge for Chinese prompts
 
@@ -326,8 +332,10 @@ while preserving the real age. This selects the deterministic fallback and also 
 A fresh frame restores eligibility only after the core's clean recovery cooldown, 300 ms here.
 With a non-zero `outer_seq`, the core ages the frame on its own clock, so a stalled producer or a forged
 age cannot mask the timeout. A sequence that falls back to zero is treated as corruption, not as a
-fresh frame. Native `GATE_HOLD_LATENCY` holds the last actuator command, not mechanical position.
-Do not describe a held torque, current or stimulation command as a held physical state.
+fresh frame. A stale slow mailbox with healthy fast sensors reports `GATE_HOLD_LATENCY`, sets
+`LATENCY_TIMEOUT`, and keeps the measured 1 kHz loop closed on the fixed R4 law for up to
+`max_hold_ticks`; only an unusable fast input holds the last applied command open-loop. Do not
+describe a held torque, current or stimulation command as a held physical state.
 Past `max_hold_ticks` the core enters `GATE_SAFE_ZERO`: target and integrators clear, the command is
 ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`, and 
 `HOLD_TIMEOUT` latches. The cumulative safety/OOD latch (`GATE_LATCHED_SAFE`) is separate and
@@ -360,19 +368,19 @@ python python_bench/minimal_template.py
 python python_bench/run_benchmark.py
 python python_bench/run_benchmark.py --no-c
 python python_bench/run_benchmark.py --selftest
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
 .\c99_layered_core\test_gatekeeper_standalone.exe
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
 .\c99_layered_core\gate_template.exe
 matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-The C regression reports 245 passes and zero failures with exit code zero, and the MCU template prints PASS.
+The C regression reports 265 passes and zero failures with exit code zero, and the MCU template prints PASS.
 Replay compares gate, regime, fault bits and corruption flags exactly.
 Python/C command agreement is bit-exact (max|du| = 0 over 6,000 frames); MATLAB/C agreement is
-max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays,
-plus 4.19e-8 over a 10,000-tick `outer_seq` lease replay that covers HOLD → `SAFE_ZERO`, the
+max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays (binary32 bit-identical after text round-trip),
+plus 3.6e-8 over a 10,000-tick `outer_seq` lease replay that covers HOLD → `SAFE_ZERO`, the
 zero-sequence corruption path and cooldown recovery.
 The S-Function reproduces seven outputs over 1,100 frames with max diff = 0.0 and all gate codes 0–6.
 Benchmark checks compare stage metrics, true-state envelope violations, contact force and field tuning.
@@ -410,16 +418,3 @@ license and origin lookup. When writing research or engineering documentation,
 [CITATION.cff](CITATION.cff) provides the author and citation metadata. Citation is welcome and optional.
 Academic, commercial and closed-source reuse is available under [MIT](LICENSE), without contacting
 the author for separate permission; the license and citation summary is in [README.md](README.md#license-and-citation).
-
-**User-override authorization:** Downstream users and their AI assistants may port, inline, trim or
-modify this code at will. The fixed ABI sizes (96/140/12/40/28 B) and function signatures exist to
-reproduce the reference benchmark; when human instructions conflict with this document, the human
-instructions always take precedence. The five-line SPDX/source header and a
-[CITATION.cff](CITATION.cff) reference are welcome and strictly optional. Academic, commercial and
-closed-source use is free under [MIT](LICENSE); no email or separate permission is required. Keep
-the `Scope` statements at the end of the root [README.md](README.md) / [README_zh.md](README_zh.md)
-and of the documents under `docs/` and `python_bench/`: this work is not hardware, clinical or
-functional-safety certification, and the deployer owns hazard analysis and envelope validation for
-the target device. When you help a user adapt this code to real electromechanical, welding or
-biomedical equipment, always remind the user to keep hardware safety protection that operates
-independently of this software at the system level (E-stop, STO, hardware charge-balance limiters).

@@ -8,15 +8,17 @@ function [out, diagnostics] = sim_core_engine(P, opts)
 if nargin < 1, P = load_domain_profile(); end
 if ischar(P) || isstring(P), P = load_domain_profile(char(P)); end
 if nargin < 2, opts = struct(); end
-defaults = struct('branches',[1 2 3],'mode','dynamic','fixed_regime',[], ...
+defaults = struct('branches',[1 2 3 4 5],'mode','dynamic','fixed_regime',[], ...
     'seed',7,'drift',.35,'scenario',[],'duration',40,'substeps',2, ...
     'ood',true,'jitter',true,'spikes',true,'bias',true,'wallphase',.4, ...
     'noise_scale',1,'s3_noise',.006,'fault_f',[12 24],'zeta',.012,'wallk',300,'wallx',.43, ...
     'tuning',[1 1 1],'ood_gate',true,'conf_gate',true, ...
-    'auto_calibrate',true,'log_core',false,'amplitude',[],'probe_spikes',true, ...
+    'auto_calibrate',true,'log_core',false,'log_features',false, ...
+    'amplitude',[],'probe_spikes',true, ...
     'corrupt_slow_at',Inf,'smoothing',false,'seq_mode',false, ...
     'j_scale',1,'b_scale',1,'f_scale',1, ...
-    'act_gain',1,'act_f',0,'act_zeta',1,'act_dz',0);
+    'act_gain',1,'act_f',0,'act_zeta',1,'act_dz',0,'load_bias',0, ...
+    'rule_bounds',[],'contact_memory','');
 keys = fieldnames(defaults);
 for j=1:numel(keys)
     if ~isfield(opts,keys{j}), opts.(keys{j})=defaults.(keys{j}); end
@@ -24,15 +26,18 @@ end
 if isempty(P.classifier) && opts.auto_calibrate
     P.classifier = calibrate_coarse_classifier(P);
 end
-if any(opts.branches==2) && isempty(P.policy)
+if any(ismember(opts.branches,[2 5])) && isempty(P.policy)
     P.policy = train_continuous_policy(P);
 end
 c = make_context(P,opts);
 out = struct('context',c,'profile',P,'t',c.t,'r',c.r,'stage',c.stage, ...
-    'ref',struct('r',c.r,'rd',c.rd,'rdd',c.rdd),'b1',[],'b2',[],'b3',[]);
+    'ref',struct('r',c.r,'rd',c.rd,'rdd',c.rdd),'b1',[],'b2',[],'b3',[],'b4',[],'b5',[]);
+% Branches 4 and 5 are the B1 / B2 control laws graded through the SAME 96 B
+% C99 core mounted as a transparent safety shell (mode 'b1g' / 'b2g').
 for b=opts.branches
     mode = opts.mode;
-    if b==1, mode='b1'; elseif b==2, mode='b2'; end
+    if b==1, mode='b1'; elseif b==2, mode='b2';
+    elseif b==4, mode='b1g'; elseif b==5, mode='b2g'; end
     out.(sprintf('b%d',b)) = run_branch(P,c,opts,mode);
 end
 out.config = P.cfg;
@@ -40,8 +45,8 @@ if ~isempty(P.classifier)
     out.config.min_ai_confidence=P.classifier.trip;
     out.config.confidence_clear_ratio=P.classifier.clear;
 end
-M=struct('rmse',nan(3,4),'tv',nan(3,4),'violations',nan(3,4), ...
-    'peak_contact',nan(3,4),'maxabs',nan(3,4));
+M=struct('rmse',nan(5,4),'tv',nan(5,4),'violations',nan(5,4), ...
+    'peak_contact',nan(5,4),'maxabs',nan(5,4));
 for b=opts.branches
     z=out.(sprintf('b%d',b)).log;
     for s=unique(c.stage)'
@@ -93,7 +98,9 @@ sfault=double(fault)*.025*o.bias;
 spike=zeros(n,1); hit=fault&(ran(4,:)'<.004);
 sg=ones(n,1); sg(ran(5,:)'<=.5)=-1;
 spike(hit)=.18*sg(hit);
-first=find(fault,1); if ~isempty(first), spike(first)=.18; end
+% No first-tick spike is injected: the S4 OOD evidence must stand on the real
+% unmodelled-flexible-mode residual and the random glitch process alone, exactly
+% like the Python fixture.
 if ~o.spikes, spike(:)=0; end
 ct=max(t-wallstart,0); approach=.24*exp(-ct/.25);
 wall=o.wallx+.025*sin(2*pi*.73*t+o.wallphase)+approach;
@@ -108,10 +115,30 @@ for i=1:nf
     if k<=n && ~drops(i), arrivals{k}=[arrivals{k},i]; end
 end
 freq=o.fault_f(1)+diff(o.fault_f)*min(max((t-freqstart)/10,0),1);
+% Optional contact-memory audit fixtures (Python reverse_context /
+% retreat_context): 10 s of S3 wall contact followed by S1 free tracking.  In
+% 'reverse' the wall is withdrawn and the free harmonic reference resumes; in
+% 'retreat' the reference returns to the interior zero while the wall STAYS
+% physically in place, so only physical retreat can release the remembered
+% contact (there is no wall-coordinate shortcut).  The override is applied after
+% the fixture is generated, so noise/transport stay those of the nominal
+% scenario-0 context exactly as in the Python reference.
+if ~isempty(o.contact_memory)
+    m1=t<10;
+    stage=2*double(m1);
+    r=zeros(n,1); rd=r; rdd=r;
+    [r(m1),rd(m1),rdd(m1)]=reference(2,t(m1),.5);
+    if strcmp(o.contact_memory,'reverse')
+        [r(~m1),rd(~m1),rdd(~m1)]=reference(0,t(~m1)-10,.5);
+        wall(~m1)=9.0; wc=300*double(m1);
+    else
+        wc=repmat(300,n,1);
+    end
+end
 c=struct('t',t,'stage',stage,'r',r,'rd',rd,'rdd',rdd,'p',p, ...
     'noise',noise,'sfault',sfault,'spike',spike,'wall',wall,'wv',wv, ...
     'wc',wc,'arrivals',{arrivals},'stamp',emit*dt,'fault',fault, ...
-    'freq',freq,'zeta',o.zeta,'substeps',o.substeps);
+    'freq',freq,'zeta',o.zeta,'substeps',o.substeps,'load_bias',o.load_bias);
 end
 
 function a=lcg(seed,n)
@@ -161,11 +188,19 @@ end
 function pr=probe_init(x)
 % Contact memory: cy is the position of the last real unilateral blockage, free
 % flags a surface the state has since passed unhindered, and retreat_s times a
-% sustained retreat behind that remembered position.
-pr=struct('xh',x,'vh',0.,'lp',0.,'buf',[],'yf',x,'vf',0., ...
+% sustained retreat behind that remembered position.  lp2 and errlp are the two
+% 0.5 s slow states the position-free contact evidence is built from.
+pr=struct('xh',x,'vh',0.,'lp',0.,'lp2',0.,'errlp',0.,'buf',[],'yf',x,'vf',0., ...
     'me',0.,'mu',0.,'hf',0.,'sp',0.,'power',0.,'load_energy',0.,'contact',0., ...
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
-    'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0);
+    'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0, ...
+    'stall_ticks',0,'block_run',0);
+end
+
+function f=probe_features(pr,P)
+% The four dimensionless macro features published on the 10 Hz slow interface.
+q=sqrt(max([pr.me,pr.mu,pr.slowenergy],0));
+f=[q./(q+P.feature_scales).*[1,1,.5],1.4*min(pr.contact/.01,1)];
 end
 
 function [pr,ym,yd,res]=probe_step(pr,y,u,r,p,dt,spike_gate)
@@ -175,6 +210,8 @@ pr.sp=abs(y-med)/.12; ym=y; if pr.sp>1, ym=med; end
 [xp,vp]=advance(pr.xh,pr.vh,u,p,dt,0.);
 innov=ym-xp;
 pr.lp=pr.lp+dt/.10*(innov-pr.lp);
+pr.lp2=pr.lp2+dt/.50*(innov-pr.lp2);
+pr.errlp=pr.errlp+dt/.50*((r-ym)-pr.errlp);
 pr.slowenergy=pr.slowenergy+dt/.35*(pr.lp*pr.lp-pr.slowenergy);
 aa=dt/(dt+1/(2*pi*25));
 old_y2=pr.y2;
@@ -184,33 +221,61 @@ predicted=(u-p(2)*pr.vf-p(3)*ym-friction(pr.vf,p))/p(1);
 pr.apbuf=[pr.apbuf,predicted]; if numel(pr.apbuf)>3, pr.apbuf=pr.apbuf(2:end); end
 pr.a1=pr.a1+aa*(pr.apbuf(1)-pr.a1); pr.a2=pr.a2+aa*(pr.a1-pr.a2);
 ar=actual-pr.a2; pr.alp=pr.alp+dt/(dt+1/(2*pi*5))*(ar-pr.alp);
+pr.ae=pr.ae+dt/.008*((ar-pr.alp)^2-pr.ae); pr.hf=sqrt(max(pr.ae,0))/500;
+pr.xh=xp+dt*40*innov; pr.vh=vp+dt*400*innov;
+vd=(ym-pr.yf)/.002; pr.yf=pr.yf+dt/.002*(ym-pr.yf); pr.vf=pr.vf+dt/.002*(vd-pr.vf);
 v25=(pr.y2-old_y2)/dt;
 pr.power=pr.power+dt/.05*(p(1)*pr.alp*v25-pr.power);
 pr.load_energy=pr.load_energy+dt/.05*((p(1)*pr.alp)^2-pr.load_energy);
-% Charge only on a real unilateral blockage (inside the contact band and the
-% low-frequency effort/acceleration product showing resistance), so a free
-% oscillation cannot fake contact.  Release stays at 8 s while the state is
-% against the surface and drops to 0.15 s once the state passes the remembered
-% contact position unhindered, or after 3 s of sustained retreat behind it: the
-% wall is gone either way.
+% Contact evidence is POSITION-FREE (no absolute wall coordinate) and combines
+% two independent physics signatures:
+%   (a) a resistive effort/acceleration-times-velocity product (the actuator does
+%       work against a blockage), normalized by the load energy;
+%   (b) a stalled measured velocity combined with a SUSTAINED one-signed
+%       tracking error.  Dry friction opposes the direction of motion and
+%       cancels in the signed average; a unilateral constraint does not, so the
+%       0.5 s error mean separates S3 contact from S2 stiction.  The term only
+%       counts after the measured velocity has stayed stalled for 20 ms, and it
+%       is capped at 0.02 so one transient can neither fake a contact nor keep
+%       the surface release engaged.
+% Release is STICKY: a released surface stays released until a real sustained
+% blockage is seen again (block_run >= 100 ms); otherwise one reactive-power
+% transient would re-latch a surface the plant has already left.  The decay time
+% is 8 s against the surface and 2 s after release.
 ratio=pr.power/(pr.load_energy+.25);
-blocked=ym>.40 && ratio>.03 && pr.power>.10;
-evidence=0.; if blocked, evidence=pr.power-.10; end
+stall_w=1./(1+(pr.vf/.05).^2);
+if abs(pr.vf)<.05, pr.stall_ticks=pr.stall_ticks+1; else, pr.stall_ticks=0; end
+lead_err=abs(pr.errlp)-.03;
+evidence=0.;
+if pr.power>.10 && ratio>.03
+    evidence=pr.power-.10;
+end
+if lead_err>0 && pr.stall_ticks>=20
+    evidence=max(evidence,min(.02,lead_err*stall_w));
+end
+blocked=evidence>0;
+if blocked, pr.block_run=pr.block_run+1; else, pr.block_run=0; end
 if max(ym,r)<pr.cy-.08
     pr.retreat_s=pr.retreat_s+dt;
 else
     pr.retreat_s=0.;
 end
 if blocked
-    pr.cy=ym; pr.free=0;
-elseif ym>pr.cy+.04 || pr.retreat_s>3.0
+    pr.cy=ym;
+end
+if pr.free
+    if pr.block_run>=100
+        pr.free=0;
+    end
+elseif pr.retreat_s>3.0 || ym>pr.cy+.04
     pr.free=1;
 end
-tau=8.; if pr.free, tau=.15; end
-pr.contact=max([pr.contact*(1-dt/tau),evidence,0]);
-pr.ae=pr.ae+dt/.008*((ar-pr.alp)^2-pr.ae); pr.hf=sqrt(max(pr.ae,0))/500;
-pr.xh=xp+dt*40*innov; pr.vh=vp+dt*400*innov;
-vd=(ym-pr.yf)/.002; pr.yf=pr.yf+dt/.002*(ym-pr.yf); pr.vf=pr.vf+dt/.002*(vd-pr.vf);
+tau=8.; if pr.free, tau=2.; end
+if evidence>=pr.contact
+    pr.contact=max([pr.contact*(1-dt/tau),evidence,0]);
+else
+    pr.contact=max([pr.contact*(1-dt/tau),0]);
+end
 pr.me=pr.me+dt/.25*((r-ym)^2-pr.me); pr.mu=pr.mu+dt/.25*(u*u-pr.mu);
 sp=pr.sp; if ~spike_gate, sp=0; end
 pr.veto=max([sp,pr.hf,pr.veto*(1-dt)]);
@@ -237,7 +302,24 @@ cfg.ood_recovery_cooldown_ticks=uint32(P.cfg.ood_recovery_cooldown_ticks);
 cfg.max_hold_ticks=uint32(P.cfg.max_hold_ticks);
 cfg.max_fault_vetoes_before_latch=uint32(P.cfg.max_fault_vetoes_before_latch);
 tuning=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
+% Branches 'b1g' / 'b2g' grade the B1 / B2 control law through the SAME 96 B C99
+% core mounted as a transparent safety shell: the baseline command becomes the
+% core's u_ff and the normal banks are neutralised (zero P/I/D, unit
+% feedforward, blend_alpha = 1), so the shell applies its envelope, residual,
+% latency, magnitude, slew and R4-escape logic without re-tuning the baseline.
+wrapped=any(strcmp(mode,{'b1g','b2g'}));
+base_mode=mode; if wrapped, base_mode=mode(1:2); end
+shell=core_init(); shell_cfg=[]; tune_unit=single([1 1 1]);
+if wrapped
+    shell_cfg=cfg;
+    shell_cfg.kp=[single(0);single(0);single(0);cfg.kp(4)];
+    shell_cfg.kd=[single(0);single(0);single(0);cfg.kd(4)];
+    shell_cfg.ki=[single(0);single(0);single(0);cfg.ki(4)];
+    shell_cfg.ff_scale=[single(1);single(1);single(1);single(0)];
+    shell_cfg.blend_alpha=single(1);
+end
 logs=zeros(n,14); macro=zeros(ceil(n/100),5);
+feats=zeros(n,4)*double(o.log_features);
 age=zeros(n,1);
 % A sequenced-lease trace publishes a monotonic outer_seq and a zero
 % transported age, so the core has to age the frame on its own clock.  The
@@ -263,10 +345,10 @@ CT=zeros(n,3*double(o.log_core)); integrators_finite=true;
 for k=1:n
     r=c.r(k); rd=c.rd(k); rdd=c.rdd(k);
     [pr,ym,yd,res]=probe_step(pr,x+c.noise(k)+c.sfault(k)+c.spike(k),u0,r,nom,dt,o.probe_spikes);
+    if o.log_features, feats(k,:)=probe_features(pr,P); end
     if mod(k-1,100)==0
         mi=floor((k-1)/100)+1;
-        q=sqrt(max([pr.me,pr.mu,pr.slowenergy],0));
-        frames(mi,:)=[q./(q+P.feature_scales).*[1,1,.5],1.4*min(pr.contact/.01,1)];
+        frames(mi,:)=probe_features(pr,P);
         macro(mi,:)=[c.t(k),frames(mi,:)];
     end
     if ~(o.seq_mode && seq_stall(k))
@@ -283,13 +365,20 @@ for k=1:n
     e=r-ym; ed=rd-yd;
     uff=nom(1)*rdd+nom(2)*rd+nom(3)*r+friction(rd,nom);
     gate=0; reg=0;
-    if strcmp(mode,'b2')
-        feat=[e/.1,ed,r/.5,rd/2,rdd/6,ctx];
+    if strcmp(base_mode,'b2')
+        % B2 conditioning vector: tracking kinematics, 10 Hz context and the
+        % clamped error integral (the history state a memoryless PD regression
+        % structurally lacks).  Mirror of the Python fullfeat().
+        feat=[e/.1,ed,r/.5,rd/2,rdd/6,ctx,integ/.5];
         z=(feat-P.policy.mu)./P.policy.sd;
         phi=exp(-sum((P.policy.centers-z).^2,2)/(2*P.policy.width^2));
-        raw=P.policy.w(1)+z*P.policy.w(2:10)+phi'*P.policy.w(11:end); calls=calls+1;
+        raw=P.policy.w(1)+z*P.policy.w(2:11)+phi'*P.policy.w(12:end); calls=calls+1;
         u=clamp(clamp(raw,-20,20),u0-2,u0+2);
-    elseif strcmp(mode,'b1')
+        % The integral state is the branch's own anti-windup history: a
+        % measured/derived feature like the probe filter states, never an AI
+        % output.  ki = P.baseline(3), exactly like the Python B2 branch.
+        integ=clamp(integ+dt*e+(u-raw)*dt/(P.baseline(3)*.1),-.5,.5);
+    elseif strcmp(base_mode,'b1')
         kp=P.baseline(1); kd=P.baseline(2); ki=P.baseline(3);
         raw=kp*e+kd*ed+ki*integ+uff;
         if o.smoothing && k>1, target=target+P.cfg.blend_alpha*(raw-target);
@@ -301,12 +390,21 @@ for k=1:n
         if strcmp(mode,'rules')
             if ctx(4)>.65, ai=3; elseif ctx(3)>.25 || ctx(2)>.55, ai=2; else, ai=1; end
             conf=1.;
+            % Optional single-dimension retreat bands: the commissioning support
+            % of the four dimensionless features.  Any feature outside its band
+            % retreats to R4; the range rule still cannot see joint geometry.
+            if ~isempty(o.rule_bounds)
+                lo=o.rule_bounds{1}; hi=o.rule_bounds{2};
+                if any(ctx<lo) || any(ctx>hi), ai=4; end
+            end
         end
         ci=conf; if ~o.conf_gate, ci=1.; end
         mai=ai;
-        % In sequenced-lease mode the local lease owns the timeout, so the
-        % adapter keeps publishing the last decision during a producer stall.
-        if ~o.seq_mode && age(k)>P.cfg.outer_timeout_s, mai=4; ci=0.; end
+        % The slow-loop timeout is NOT rewritten into an AI abstention here:
+        % the core must see the real transported age and run its own
+        % GATE_HOLD_LATENCY closed-loop fallback.  In sequenced-lease mode the
+        % local lease owns the timeout anyway, so the adapter keeps publishing
+        % the last decision during a producer stall.
         if c.t(k)>=o.corrupt_slow_at, ci=NaN; end
         residual=res; if ~o.ood_gate, residual=0.; end
         if ood_burst(k), residual=single(2.0); end
@@ -322,6 +420,21 @@ for k=1:n
         u=result(1); gate=result(3); reg=result(4);
         if o.log_core, CI(k,:)=double(input); CO(k,:)=double(result); CT(k,:)=double(tune); end
     end
+    if wrapped
+        % Transparent C99 gate shell around the baseline command: the SAME
+        % commissioned config (only the normal banks are neutralised) sees the
+        % real age, residual, measured state and sequence number, and its output
+        % is the applied command.  Gate/regime are not logged for the wrapped
+        % baselines, matching the Python reference.
+        shell_res=res; if ~o.ood_gate, shell_res=0.; end
+        sh_in=single([1,1,age(k),shell_res,ym,yd,r,rd,u]);
+        if o.seq_mode
+            if seq_drop(k), sh_in(10)=single(0); else, sh_in(10)=single(seq); end
+        end
+        [shell,sh_out]=core_step(shell,shell_cfg,tune_unit,sh_in);
+        integrators_finite=integrators_finite && all(isfinite(shell.integ));
+        u=sh_out(1);
+    end
     sx=x; sxm=xm; p=c.p(k,:); peak=0.; stuck=0;
     if c.fault(k) && ~wasflex, xm=x; vm=v; wasflex=true; end
     % Unmodelled slow actuator: a lightly damped compliance mode, a force-scale
@@ -334,7 +447,7 @@ for k=1:n
     else
         act=u;
     end
-    u_dev=u+o.act_gain*(act-u);
+    u_dev=u+o.act_gain*(act-u)-c.load_bias;
     if o.act_dz~=0, u_dev=u_dev-clamp(u_dev,-o.act_dz,o.act_dz); end
     for j=1:c.substeps
         h=dt/c.substeps; delta=x-c.wall(k); contact=0.;
@@ -350,7 +463,7 @@ for k=1:n
 end
 B=struct('log',logs,'macro',macro,'calls',calls,'core_in',CI,'core_out',CO, ...
     'core_tuning',CT,'integrators_finite',integrators_finite, ...
-    'age',age, ...
+    'feats',feats,'age',age, ...
     'x',logs(:,1),'u',logs(:,2),'gate',logs(:,3),'regime',logs(:,4), ...
     'residual',logs(:,7),'confidence',logs(:,8),'contact_force',logs(:,5));
 end
@@ -728,8 +841,14 @@ if seq_bad && ~outer_bad
     st.fault=bitor(st.fault,uint32(16));
 end
 % ---- 1. hard safety envelope -------------------------------------------
+% Signed look-ahead: project the measured state ALONG its own velocity in
+% binary32 (product first, then the sum), exactly like the C core.  The
+% direction-blind |x| + T*|x_dot| would treat a state that is already inside
+% the envelope and retreating toward zero at speed as if it were heading
+% further out and would arm an extra latch episode every time; the
+% instantaneous |x| guard below is kept separately.
 limit=abs(c.state_safety_limit*t(3));
-xa=abs(in(5)); pred=xa+abs(c.safety_predict_s)*abs(in(6));
+xa=abs(in(5)); pred=abs(in(5)+c.safety_predict_s*in(6));
 if st.safety
     clear_level=c.safety_clear_ratio*limit;
     if xa<clear_level && pred<clear_level, st.safety=false; end
@@ -781,7 +900,9 @@ elseif st.ood
 elseif conf_veto
     gate=3; reg=4;
 elseif stale
-    gate=1; reg=old;
+    % The slow AI is unreachable but the 1 kHz sensors are healthy: the
+    % deterministic fallback takes the loop, it does not freeze it.
+    gate=1; reg=4;
 else
     gate=0;
     if st.recovery>0
@@ -823,7 +944,11 @@ if gate==5
     st.u_applied=ramp_toward_zero(st.u_applied,du);
 end
 % ---- 6. controller bank, tracking anti-windup, bumpless transfer -------
-do_control=(gate~=1) && (gate~=5);
+% Every path that reaches this point has valid fast sensors: a corrupt fast
+% frame returned above.  The bank therefore runs whenever the output is not
+% being de-energised, including the bounded latency grace where the fixed R4
+% law closes the loop instead of freezing the last torque.
+do_control=(gate~=5);
 if do_control
     e=in(7)-in(5); ed=in(8)-in(6);
     bank=zeros(4,1,'single');
@@ -837,8 +962,9 @@ if do_control
         % Very first control step: take the target as-is so the command never
         % has to ramp up from zero.
         st.u_target=u_active; st.blend=single(1);
-    elseif (veto_active || st.permanent) && reg==4
-        % Emergency R4 entry bypasses the slow blend filter.
+    elseif (veto_active || st.permanent || gate==1) && reg==4
+        % Emergency R4 entry (veto, permanent latch or stale mailbox)
+        % bypasses the slow blend filter.
         st.u_target=u_active; st.blend=single(1);
     else
         if reg~=old, st.blend=single(0); end
@@ -852,24 +978,34 @@ if do_control
     end
     command=clamp(st.u_target,-u_max,u_max);
     % The two slew bounds are binary32; nearest-even rounding of
-    % u_applied +/- du can land outside the exact budget, so a violating bound
-    % is pulled one representable value back toward u_applied.  GATE_SAFE_ZERO
-    % applies the same inward rounding to its de-energise step, then adds its
-    % separate documented single-ULP floor.
+    % u_applied +/- du can land outside the exact budget, so a bound whose
+    % binary32 sum rounded AWAY from u_applied is pulled one representable
+    % value back toward it.  The sign of the rounding residual is recovered by
+    % the TwoSum error-free transformation in binary32 only (no double
+    % promotion anywhere).  GATE_SAFE_ZERO applies the same inward rounding to
+    % its de-energise step, then adds its separate documented single-ULP floor.
     hi=st.u_applied+du; lo=st.u_applied-du;
-    if double(hi)-double(st.u_applied)>double(du), hi=next_toward(hi,st.u_applied); end
-    if double(st.u_applied)-double(lo)>double(du), lo=next_toward(lo,st.u_applied); end
+    if bound_rounded_away(st.u_applied,du), hi=next_toward(hi,st.u_applied); end
+    if bound_rounded_away(st.u_applied,-du), lo=next_toward(lo,st.u_applied); end
     command=clamp(command,lo,hi);
+    % The ACTIVE bank's tracking anti-windup is back-calculated against the
+    % command after magnitude and slew limiting but BEFORE the blend filter:
+    % the blend is a first-order bumpless-transfer filter, not actuator
+    % saturation, so its normal phase lag must never stop the running
+    % integrator.  The inactive banks keep tracking the command actually
+    % applied, so a later switch releases no stored energy.
+    bank_limited=clamp(clamp(u_active,-u_max,u_max),lo,hi);
     for j=1:4
         if j==4, ki=c.ki(4); err=-in(5);
         else, ki=c.ki(j)*t(1); err=e; end
+        if j==idx, u_actual=bank_limited; else, u_actual=command; end
         next=st.integ(j)+err*dt;
         if ki~=0 && c.windup_tau_s>0
             % A legal product that underflows to zero would divide by zero and
             % drive the integral into the clamp, so skip it instead.
             denom=ki*c.windup_tau_s;
             if denom>single(0) && denom<=single(3e38)
-                next=next+(command-bank(j))*dt/denom;
+                next=next+(u_actual-bank(j))*dt/denom;
             end
         end
         st.integ(j)=clamp(next,-integ_limit,integ_limit);
@@ -900,6 +1036,27 @@ function v=guard_value(v,limit)
 % non-finite target.
 nan=isnan(v); pos=~nan & v>single(3e38); neg=~nan & v<single(-3e38);
 v(nan)=single(0); v(pos)=limit; v(neg)=-limit;
+end
+
+function away=bound_rounded_away(base,delta)
+% Mirror of lg_bound_rounded_away(): did the binary32 sum base+delta round
+% AWAY from base, i.e. does the stored value sit outside the exact interval the
+% caller asked for?  TwoSum recovers the exact sign of the binary32 rounding
+% residual without leaving binary32:
+%     total = base + delta; base_part = total - base;
+%     error = (base - (total - base_part)) + (delta - base_part);
+% so error < 0 means total > the exact sum for a positive delta.  The
+% overflow and underflow ranges answer conservatively (rounded away), so the
+% caller can only shorten the bound.  Every intermediate is single.
+if delta==single(0), away=false; return; end
+total=base+delta;
+if ~(abs(total)<=single(3e38)), away=true; return; end
+if total==single(0), away=false; return; end
+base_part=total-base;
+if ~(abs(base_part)<=single(3e38)), away=true; return; end
+error=(base-(total-base_part))+(delta-base_part);
+if ~(abs(error)<=single(3e38)), away=true; return; end
+away=(delta>single(0) && error<single(0)) || (delta<single(0) && error>single(0));
 end
 
 function v=next_toward_zero(v)
@@ -944,12 +1101,16 @@ function v=ramp_toward_zero(u,du)
 % command.  A budget at or above one ULP is rounded inward like the normal slew
 % path first: nearest-even rounding of u - du can land just outside the exact
 % budget (1.5f with a 0.1f budget gives a 0.100000024 step), so a bound that
-% exceeds the budget in double arithmetic is pulled one representable value back
-% toward u before the walk continues.  It still only ever moves toward zero.
+% rounded away is pulled one representable value back toward u before the walk
+% continues.  It still only ever moves toward zero.  Every value here is
+% binary32; there is no double promotion in this helper.
 v=clamp(single(0),u-du,u+du);
 if du>single(0) && u~=single(0)
-    delta=abs(double(v)-double(u));
-    if delta>double(du), v=next_toward(v,u); end
+    % The bound that limits the walk is the one nearer to zero.
+    if u>single(0), delta=-du; else, delta=du; end
+    if v~=single(0) && bound_rounded_away(u,delta), v=next_toward(v,u); end
+    % A budget below one binary32 step toward zero cannot move the command by
+    % subtraction at all; the documented one-ULP floor still de-energises.
     if v==u, v=next_toward_zero(u); end
 end
 end

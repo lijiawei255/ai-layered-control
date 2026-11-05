@@ -25,16 +25,21 @@ for j=1:3, prototypes(j,:)=mean(samples(labels==j,:),1); end
 d=zeros(size(samples,1),3);
 for j=1:3, d(:,j)=sqrt(sum((samples-prototypes(j,:)).^2,2)); end
 d=sort(d,2);
-gamma=1/max(linear_quantile(d(:,1),.95),1e-6);
+% Finite-sample split-conformal order used by the Python supervisor:
+%   level(a) = min(1, ceil((n+1)*a)/n)
+% so np.quantile(x, level(a)) reads an order statistic that a finite
+% calibration set can actually support.  linear_quantile() keeps numpy's linear
+% interpolation, so both engines read the same value.
+n=size(samples,1);
+level=@(a) min(1,ceil((n+1)*a)/n);
+gamma=1/max(linear_quantile(d(:,1),level(.95)),1e-6);
 score=(d(:,2)-d(:,1))./(d(:,2)+d(:,1)+1e-9).*exp(-gamma*d(:,1));
-% The Python supervisor returns twice the helper's 0.15x quantile trip; the
-% clear level is 1.25x the trip.  The caps only bound pathological small-sample
-% scores and stay inactive for the calibrated benchmark values; the Python
-% calibration applies the same two caps to the same uncapped pair.
-trip=2.0*0.15*linear_quantile(score,.01);
+% The Python supervisor's auto_calibrate() returns the raw 0.15x quantile trip
+% and 1.25x trip clear, with no extra scale factor and no caps; the MATLAB
+% mirror must publish exactly the same pair so both engines veto on the same
+% confidence level.
+trip=0.15*linear_quantile(score,level(.01));
 clear=1.25*trip;
-trip=min(trip,0.25);
-clear=min(clear,0.35);
 classifier=struct('prototypes',prototypes,'gamma',gamma,'trip',trip,'clear',clear);
 end
 

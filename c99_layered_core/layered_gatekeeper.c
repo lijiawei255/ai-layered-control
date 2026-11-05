@@ -21,15 +21,21 @@
  *
  * One step, in this order:
  *   0. split firewall             bad fast/config holds; bad mailbox/tuning runs R4
- *   1. safety envelope veto       sticky, latches ENVELOPE_BREACH
+ *   1. safety envelope veto       sticky signed look-ahead, latches ENVELOPE_BREACH
  *   2. OOD residual veto          sticky, latches OOD_RESIDUAL
  *   3. confidence / abstention    sticky latch, latches LOW_CONFIDENCE
  *   3b. local frame lease         outer_seq ages the slow frame on the L1 clock
  *   3c. cumulative fault latch    safety/OOD episode count -> permanent R4
- *   4. heartbeat watchdog         bounded hold, then mandatory safe zero
+ *   4. heartbeat watchdog         bounded closed-loop R4 grace, then safe zero
  *   5. dwell timer + post-fault recovery cooldown for the normal AI regime
  *   6. controller bank (+ deterministic feedforward u_ff), tracking
- *      anti-windup, emergency R4 blend bypass, hard clamps
+ *      anti-windup against the limited command, emergency R4 blend bypass,
+ *      hard clamps
+ *
+ * The entire 1 kHz path is binary32: no binary64 type, no extended precision,
+ * no libm.  That keeps the promise that a single-precision-FPU MCU
+ * (Cortex-M4F/M33) never pulls in the __aeabi_d* software-emulation library
+ * through this file.
  * ---------------------------------------------------------------------------
  */
 
@@ -175,6 +181,59 @@ static float lg_next_toward(float from, float to)
     return bits.f;
 }
 
+/* Did the binary32 sum `base + delta` round AWAY from `base`, i.e. does the
+ * stored value sit outside the exact interval the caller asked for?
+ *
+ * The radius `delta` is one signed slew bound.  The exact sum base + delta is
+ * a real number; the core stores its nearest binary32 neighbour s.  When s is
+ * above the exact sum for a positive delta (or below it for a negative delta)
+ * the bound admits a step wider than the commissioned budget and must be
+ * pulled one representable value inward.
+ *
+ * The sign of the rounding residual is recovered without leaving binary32 by
+ * the classical TwoSum error-free transformation:
+ *
+ *     s  = base + delta
+ *     bv = s - base
+ *     e  = (base - (s - bv)) + (delta - bv)
+ *     exact sum = s + e
+ *
+ * so e < 0 means s > exact.  TwoSum is exact whenever no overflow or
+ * underflow occurs in its intermediate operations; any non-finite
+ * intermediate, and the underflow range, are reported as "rounded away" so
+ * the caller shortens the bound.  Shortening a bound can only reduce the
+ * step, so the conservative answer is always contract-safe. */
+static int lg_bound_rounded_away(float base, float delta)
+{
+    float sum = base + delta;
+    float base_part;
+    float error;
+
+    if (delta == 0.0f) {
+        return 0;
+    }
+    if (!lg_is_finite(sum)) {
+        /* The exact sum lies outside the binary32 range: the finite bound in
+         * the direction of `delta` is FLT_MAX and is pulled in by the caller. */
+        return 1;
+    }
+    if (sum == 0.0f) {
+        /* A zero rounded sum means the exact sum underflowed or is exactly
+         * zero; the bound is then at most half a subnormal ULP away from the
+         * exact value, so no inward step is warranted. */
+        return 0;
+    }
+    base_part = sum - base;
+    if (!lg_is_finite(base_part)) {
+        return 1;
+    }
+    error = (base - (sum - base_part)) + (delta - base_part);
+    if (!lg_is_finite(error)) {
+        return 1;
+    }
+    return (delta > 0.0f) ? (error < 0.0f) : (error > 0.0f);
+}
+
 /* Slew-limited walk of the applied command to zero.  The effective per-tick
  * step is max(u_slew_max_per_s * dt, 1 binary32 ULP(|u_applied|)): a legal slew
  * budget below one ULP of the remaining command would round back to the same
@@ -183,23 +242,20 @@ static float lg_next_toward(float from, float to)
  * one ULP is rounded inward exactly like the normal path first: nearest-even
  * rounding of u_applied - du_max can land just outside the exact budget (at
  * 1.5f with a 0.1f budget the subtraction yields a 0.100000024 step), so a
- * bound that exceeds the budget in double arithmetic is pulled one
- * representable value back toward u_applied before the walk continues.  It only
- * ever moves toward zero and only applies when the budget itself is positive:
- * lg_config_is_corrupt() refuses a configuration whose binary32 slew*dt product
- * underflows to 0 or overflows to infinity, so a zero budget can never move the
- * command here. */
+ * bound that rounded away is pulled one representable value back toward
+ * u_applied before the walk continues.  It only ever moves toward zero and only
+ * applies when the budget itself is positive: lg_config_is_corrupt() refuses a
+ * configuration whose binary32 slew*dt product underflows to 0 or overflows to
+ * infinity, so a zero budget can never move the command here. */
 static float lg_ramp_toward_zero(float u_applied, float du_max)
 {
     float next = lg_clampf(0.0f, u_applied - du_max, u_applied + du_max);
 
     if (du_max > 0.0f && u_applied != 0.0f) {
-        double delta = (double)next - (double)u_applied;
+        /* The bound that limits the walk is the one nearer to zero. */
+        float delta = (u_applied > 0.0f) ? -du_max : du_max;
 
-        if (delta < 0.0) {
-            delta = -delta;
-        }
-        if (delta > (double)du_max) {
+        if (next != 0.0f && lg_bound_rounded_away(u_applied, delta)) {
             next = lg_next_toward(next, u_applied);
         }
         /* A budget below one binary32 step toward zero cannot move the
@@ -516,7 +572,6 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     float windup_tau;
     float limit_eff;
     float x_abs;
-    float xdot_abs;
     float predicted_abs;
     float residual_abs;
     float e;
@@ -526,6 +581,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     float u_pid2;
     float u_pid3;
     float u_active;
+    float u_bank_limited;
     float u_cmd;
     float u_lo;
     float u_hi;
@@ -714,10 +770,16 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     }
 
     /* ---------------- 1. hard safety envelope -------------------------- */
+    /* The look-ahead projects the MEASURED state along its own velocity:
+     * predicted = |x + T*x_dot|.  Taking |x| + T*|x_dot| instead would treat a
+     * state that is already inside the envelope and retreating toward zero at
+     * speed as if it were heading further out, rejecting the safest possible
+     * recovery motion and arming an extra latch episode every time.  The
+     * instantaneous guard is kept separately: a state whose |x| is already at
+     * the trip ratio is unsafe regardless of the sign of its velocity. */
     limit_eff = lg_absf(config->state_safety_limit * tuning->safety_margin_scale);
     x_abs = lg_absf(input->x);
-    xdot_abs = lg_absf(input->x_dot);
-    predicted_abs = x_abs + lg_absf(config->safety_predict_s) * xdot_abs;
+    predicted_abs = lg_absf(input->x + config->safety_predict_s * input->x_dot);
 
     if (state->safety_latched) {
         float clear_level = config->safety_clear_ratio * limit_eff;
@@ -791,7 +853,14 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     /* Sequenced mailboxes are timed by the local lease (0b); legacy ones by
      * the transported age.  Both are held to exactly one rule here.  An age
      * that the core cannot interpret (non-finite transport, outside the
-     * firewall domain) is not a timeout: it is already handled as corruption. */
+     * firewall domain) is not a timeout: it is already handled as corruption.
+     *
+     * The fast sensors are proven valid at this point (the corrupt-frame path
+     * returned above), so a stale slow frame does NOT lose feedback.  Losing
+     * feedback is the only reason to hold a torque open-loop; here the fixed
+     * R4 bank closes the loop on the measured state instead.  The audit bit
+     * and the latency gate still report the timeout, and the grace window is
+     * still bounded by max_hold_ticks. */
     latency_hold = (age_usable != 0) &&
                    (outer_age_eff > config->outer_timeout_s);
     if (latency_hold) {
@@ -818,8 +887,10 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         gate = GATE_VETO_LOW_CONFIDENCE;
         regime = REGIME_SAFE_FALLBACK;
     } else if (latency_hold) {
+        /* The slow AI is unreachable but the 1 kHz sensors are healthy: the
+         * deterministic fallback takes the loop, it does not freeze it. */
         gate = GATE_HOLD_LATENCY;
-        regime = state->regime; /* keep the last valid bank */
+        regime = REGIME_SAFE_FALLBACK;
     } else {
         gate = GATE_NORMAL;
 
@@ -893,7 +964,11 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     }
 
     /* ---------------- 6. controller bank -------------------------------- */
-    do_control = (gate != GATE_HOLD_LATENCY) && (gate != GATE_SAFE_ZERO);
+    /* Every path that reaches this point has valid fast sensors: a corrupt
+     * fast frame returned above.  The bank therefore runs whenever the output
+     * is not being de-energised, including the bounded latency grace, where
+     * the fixed R4 law closes the loop instead of freezing the last torque. */
+    do_control = (gate != GATE_SAFE_ZERO);
 
     if (do_control) {
         e = input->r - input->x;
@@ -939,7 +1014,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
              * to ramp up from zero. */
             state->u_target = u_active;
             state->blend = 1.0f;
-        } else if ((veto_active != 0 || state->permanent_latched != 0) &&
+        } else if ((veto_active != 0 || state->permanent_latched != 0 ||
+                    gate == GATE_HOLD_LATENCY) &&
                    regime == REGIME_SAFE_FALLBACK) {
             state->u_target = u_active;
             state->blend = 1.0f;
@@ -960,35 +1036,53 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
          * bounds are rounded to binary32; nearest-even rounding of
          * u_applied +/- du_max can land outside the exact budget (1.0f +
          * 7.0e-8f rounds up to 1.0000001192f, a full 1.19e-7 step for a 7.0e-8
-         * budget).  A bound that exceeds the budget in double arithmetic is
-         * pulled one representable value back toward u_applied, so every normal
-         * tick honours |u(k) - u(k-1)| <= u_slew_max_per_s * dt_s exactly.
-         * GATE_SAFE_ZERO applies the same inward rounding to its de-energise
-         * step, then adds its separate documented single-ULP floor. */
+         * budget).  A bound that rounded away is pulled one representable value
+         * back toward u_applied, so every normal tick honours
+         * |u(k) - u(k-1)| <= u_slew_max_per_s * dt_s exactly, in binary32
+         * arithmetic only.  GATE_SAFE_ZERO applies the same inward rounding to
+         * its de-energise step, then adds its separate documented single-ULP
+         * floor. */
         u_cmd = lg_clampf(state->u_target, -u_max, u_max);
         u_hi = state->u_applied + du_max;
         u_lo = state->u_applied - du_max;
-        if ((double)u_hi - (double)state->u_applied > (double)du_max) {
+        if (lg_bound_rounded_away(state->u_applied, du_max)) {
             u_hi = lg_next_toward(u_hi, state->u_applied);
         }
-        if ((double)state->u_applied - (double)u_lo > (double)du_max) {
+        if (lg_bound_rounded_away(state->u_applied, -du_max)) {
             u_lo = lg_next_toward(u_lo, state->u_applied);
         }
         u_cmd = lg_clampf(u_cmd, u_lo, u_hi);
 
+        /* The ACTIVE bank's tracking anti-windup is back-calculated against
+         * the command after magnitude and slew limiting but BEFORE the blend
+         * filter.  The blend is a first-order bumpless-transfer filter, not an
+         * actuator saturation; letting its normal phase lag stop the active
+         * integrator would silently detune every bank during tracking.  The
+         * inactive banks keep tracking the command actually applied, so a
+         * later switch releases no stored energy. */
+        u_bank_limited = lg_clampf(lg_clampf(u_active, -u_max, u_max), u_lo, u_hi);
+
         /* Tracking anti-windup for every controller of the bank. */
         lg_integrate(&state->integ[0],
                      config->ki[0] * tuning->gain_scale,
-                     e, dt_eff, u_pid0, u_cmd, windup_tau, integ_limit);
+                     e, dt_eff, u_pid0,
+                     (bank == 0) ? u_bank_limited : u_cmd,
+                     windup_tau, integ_limit);
         lg_integrate(&state->integ[1],
                      config->ki[1] * tuning->gain_scale,
-                     e, dt_eff, u_pid1, u_cmd, windup_tau, integ_limit);
+                     e, dt_eff, u_pid1,
+                     (bank == 1) ? u_bank_limited : u_cmd,
+                     windup_tau, integ_limit);
         lg_integrate(&state->integ[2],
                      config->ki[2] * tuning->gain_scale,
-                     e, dt_eff, u_pid2, u_cmd, windup_tau, integ_limit);
+                     e, dt_eff, u_pid2,
+                     (bank == 2) ? u_bank_limited : u_cmd,
+                     windup_tau, integ_limit);
         lg_integrate(&state->integ[3],
                      config->ki[3],
-                     -input->x, dt_eff, u_pid3, u_cmd, windup_tau, integ_limit);
+                     -input->x, dt_eff, u_pid3,
+                     (bank == 3) ? u_bank_limited : u_cmd,
+                     windup_tau, integ_limit);
 
         state->u_applied = u_cmd;
         state->control_started = 1;

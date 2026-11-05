@@ -55,7 +55,7 @@ device-side gating masking is needed.
 | Code | Gate | Meaning |
 | :---: | :--- | :--- |
 | 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs（接受决策层工况，运行所选控制组） |
-| 1 | `GATE_HOLD_LATENCY` | Stale frame or unusable fast input; last command held（帧过期或快环输入不可用，保持上一条指令） |
+| 1 | `GATE_HOLD_LATENCY` | Stale slow mailbox with healthy fast sensors（帧过期但快环传感器有效：报告延迟门并继续闭环 R4）；only an unusable fast input holds the last command open-loop（仅快环输入不可用时开环保持上一条指令） |
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4（物理预测残差超出分布，弃权并切入 R4） |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4（置信度低于阈值或显式工况 4，弃权并切入 R4） |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | State envelope or look-ahead exceeded; R4（状态包络或前视检查越界，切入 R4） |
@@ -85,6 +85,18 @@ so emergency damping is not delayed by transfer smoothing.
 冷却结束后才允许再次接受正常工况。一旦否决生效或永久锁存，控制器直接切入 R4 并旁路 blend
 滤波（blend = 1.0），紧急阻尼不会被无扰切换的平滑过程拖延。
 
+The two runtime-assurance layers a derived device must re-calibrate against its own reachable sets
+are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
+guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the split-conformal
+abstention threshold (`q = min(1, ceil((N+1)(1-alpha))/N)` in `auto_calibrate`). Both are
+device-specific: the envelope depends on the actuator's reachable set and detection delay, and the
+conformal threshold depends on the commissioning archive.
+
+派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
+加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与分裂共形弃权阈值
+（`auto_calibrate` 中的 `q = min(1, ceil((N+1)(1-alpha))/N)`）。两者都与设备相关：包络取决于执行器
+可达集与检测延迟，共形阈值取决于标定档案。
+
 ## Three parallel examples / 三类并列实例
 
 | Application | Slow semantic decision | Fast quantitative responsibility |
@@ -108,7 +120,8 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 1. Define the signals, units, nominal model, controller bank and explicit fallback.
 2. Collect labeled macro-feature windows for `auto_calibrate(samples, labels)`.
-3. Freeze prototypes, distance-decay coefficient and confidence thresholds.
+3. Freeze prototypes, distance-decay coefficient and the split-conformal confidence trip/clear levels
+   (order `q = min(1, ceil((N+1)(1-alpha))/N)`).
 4. Run `auto_field_tune(evaluate, current)` with a device-side safe trial callback.
 
 The callback returns measured cost and constraint validity. Invalid candidates are rejected;
@@ -134,6 +147,16 @@ A new physical domain starts with a new interface and commissioning archive.
 同一接口内更换机台可以沿用已冻结的语义档案；进入全新物理领域则要重新建立接口与
 标定档案。
 
+When commissioning, verify the two degradation semantics explicitly: a stale slow mailbox with
+healthy fast sensors keeps the measured 1 kHz loop closed on the fixed R4 law (it does not hold the
+last command), and only an unusable fast input holds the last command open-loop. The 1 kHz slew path
+is binary32-only: the slew limiter uses the binary32 TwoSum error-free transformation, and the core
+contains no binary64 keyword.
+
+标定时要显式验证两条降级语义：慢环通信帧过期但快环传感器健康时，实测 1 kHz 回路保持在固定 R4 律上
+闭环运行（不保持上一条指令）；只有快环输入不可用时才开环保持上一条指令。1 kHz 斜率路径为纯 binary32：
+斜率限幅器使用 binary32 TwoSum 无误差变换，内核不含任何 binary64 关键字。
+
 ## Multi-axis and timeout / 多轴与超时
 
 Each channel owns its state, probe, tuning and source timestamp.
@@ -149,8 +172,9 @@ Malformed slow fields also select closed-loop R4, preserving envelope/residual p
 With `outer_seq` nonzero, the core measures frame age on its own 1 kHz clock: a new sequence opens a
 fresh lease, an unchanged one ages it by one tick, and a frozen or forged `outer_age_s` cannot mask a
 stalled mailbox; a sequence falling back to zero is treated as corruption, not as a fresh frame.
-Native HOLD preserves the applied command, not a mechanical position; past `max_hold_ticks` the core
-enters `GATE_SAFE_ZERO` and ramps to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
+A stale slow mailbox with healthy fast sensors reports `GATE_HOLD_LATENCY` and keeps the measured 1 kHz
+loop closed on the fixed R4 law; only an unusable fast input holds the last applied command open-loop.
+Past `max_hold_ticks` the core enters `GATE_SAFE_ZERO` and ramps to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
 R4 uses fixed gains, zero-state error and no feedforward, independent of field tuning.
 
 每个通道各自持有状态、探针、整定参数与源时间戳。只有单位和控制定义完全相同的通道才允许
@@ -161,21 +185,22 @@ R4 uses fixed gains, zero-state error and no feedforward, independent of field t
 慢环字段畸形同样切入闭环 R4，包络与残差的优先级不受影响。`outer_seq` 非零时，内核用自己的
 1 kHz 时钟测量帧龄：新序号开启一份新租约，序号不变则每拍老化一次；冻结或伪造的
 `outer_age_s` 无法掩盖慢环通信停滞，而序号回落到 0 会被视为数据损坏，而不是新帧。
-内核级 HOLD（指令保持）保持的是已下发的执行器指令，不是某个机械位置；超过 `max_hold_ticks` 后内核进入
-`GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令
+慢环帧过期但快环传感器有效时，内核报告 `GATE_HOLD_LATENCY` 并继续按固定 R4 律闭环；只有快环输入不可用才开环保持上一条指令。
+超过 `max_hold_ticks` 后内核进入 `GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令
 严格单调地归零。R4 使用固定增益、零状态误差、零前馈，与现场整定无关。
 
 ## Verification / 验证
 
-C99 standalone regression passes 245 checks with zero failures; `gate_template.c` prints PASS.
+C99 standalone regression passes 265 checks with zero failures; `gate_template.c` prints PASS.
 Python/C `--selftest` replays 6,000 frames with max |du| = 0 in binary32, MATLAB/C equivalence
 keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 10,000-tick
-`outer_seq` lease replay stays within max |du| = 4.19e-8, and the Level-2
+`outer_seq` lease replay stays within max |du| = 3.6e-8 (the underlying binary32 values are
+bit-identical after text round-trip), and the Level-2
 S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
 
-C99 独立回归 245 项全部通过、零失败，`gate_template.c` 自检打印 PASS。Python/C `--selftest`
+C99 独立回归 265 项全部通过、零失败，`gate_template.c` 自检打印 PASS。Python/C `--selftest`
 回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、慢环通信损坏帧与非法旋钮
-注入下均保持 max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；
+注入下均保持 max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 3.6e-8（文本往返后 binary32 值逐位一致）；
 Level-2 S-Function 回放 1,100 帧，全部 7 路输出 max diff = 0.0。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).

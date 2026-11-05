@@ -27,15 +27,24 @@
  *        v
  *   THIS MODULE (1 kHz, deterministic, 96 B state + 140 B config + 12 B tuning)
  *        - fast-input firewall; bad slow mailboxes/tuning request closed-loop R4
- *        - heartbeat watchdog: survives 10 Hz jitter / dropped frames
+ *        - heartbeat watchdog: survives 10 Hz jitter / dropped frames; a stale
+ *          mailbox keeps the measured loop closed on the fixed R4 bank instead
+ *          of freezing the last torque
  *        - physics-residual + confidence veto: explicit ABSTENTION
- *        - predictive state-envelope veto: selects fixed-gain R4
+ *        - predictive state-envelope veto: signed |x + T*x_dot| look-ahead plus
+ *          the direction-blind instantaneous guard
  *        - anti-chatter minimum dwell time on normal regime transitions
  *        - post-fault recovery cooldown before AI is re-armed
  *        - controller bank with per-controller anti-windup and bumpless
  *          transfer
  *        - magnitude + slew-rate clamping on the actuator command
  *        - sticky fault_audit_bitmask (root cause of the last incidents)
+ *
+ * The whole 1 kHz path is binary32 arithmetic: no binary64, no extended
+ * precision and no libm.  The slew limiter recovers the sign of its own
+ * rounding residual through the TwoSum error-free transformation instead of
+ * promoting to a wider type, so a single-precision FPU never calls into the
+ * __aeabi_d* software library.
  *
  * Purely a reference implementation for the benchmark in ../matlab_simulink/:
  * it is hardware independent and unit tested by test_gatekeeper_standalone.c.
@@ -69,6 +78,10 @@ typedef enum {
 typedef enum {
     GATE_NORMAL                = 0, /* AI regime accepted, bank-controller on  */
     GATE_HOLD_LATENCY          = 1, /* stale heartbeat or unusable fast input  */
+                                    /* With valid fast sensors the fixed R4    */
+                                    /* bank keeps the loop closed during the   */
+                                    /* bounded grace; only a lost fast sensor  */
+                                    /* holds the last command open-loop        */
     GATE_VETO_OOD_RESIDUAL     = 2, /* physics innovation too large: ABSTAIN    */
     GATE_VETO_LOW_CONFIDENCE   = 3, /* AI self-confidence too low: ABSTAIN     */
     GATE_VETO_SAFETY_ENVELOPE  = 4, /* state at/approaching hard safety limit  */
@@ -133,7 +146,7 @@ typedef struct {
     float state_safety_limit;   /* absolute hard limit on |x|                  */
     float safety_trip_ratio;    /* trip when |x| > ratio*limit (e.g. 0.90)     */
     float safety_clear_ratio;   /* clear when |x| < ratio*limit (e.g. 0.75)    */
-    float safety_predict_s;     /* look-ahead horizon used with |x_dot|        */
+    float safety_predict_s;     /* look-ahead horizon: trip on |x + T*x_dot|   */
 
     float u_max;                /* hard actuator magnitude limit               */
     float u_slew_max_per_s;     /* hard actuator slew-rate limit               */
@@ -257,18 +270,24 @@ void Layered_Init(LayeredState_t *state,
  *    is handled as GATE_VETO_LOW_CONFIDENCE.
  *    A native HOLD counts consecutive held ticks in state->hold_ticks. The
  *    corrupt-frame path (invalid fast sensor, or invalid configuration with its
- *    fixed LAYERED_CORRUPT_CONFIG_MAX_HOLD_TICKS = 100 budget) escalates to
- *    GATE_SAFE_ZERO past the budget: target and integrators are cleared, the
+ *    fixed LAYERED_CORRUPT_CONFIG_MAX_HOLD_TICKS = 100 budget) has no trustworthy
+ *    feedback and therefore holds the last command open-loop; past the budget it
+ *    escalates to GATE_SAFE_ZERO: target and integrators are cleared, the
  *    command is ramped to zero under the commissioned slew limit, one binary32
  *    ULP at a time when that budget is below one ULP of the command (immediately
  *    zeroed when the slew configuration itself is untrusted), and
- *    HOLD_TIMEOUT plus PERMANENT_LATCH latch. A stale heartbeat (section d)
- *    uses config->max_hold_ticks and latches HOLD_TIMEOUT only.
+ *    HOLD_TIMEOUT plus PERMANENT_LATCH latch. A stale heartbeat with healthy
+ *    fast sensors (section d) uses config->max_hold_ticks, keeps the measured
+ *    loop closed on the fixed R4 bank, and latches HOLD_TIMEOUT only.
  *
  * 1. DECISION PRIORITY (highest first, evaluated every clean step):
  *      a) GATE_VETO_SAFETY_ENVELOPE : |x| > safety_trip_ratio*limit_eff, or
- *         |x| + safety_predict_s*|x_dot| > limit_eff.  Sticky: it clears only
- *         when BOTH |x| and the prediction are below safety_clear_ratio*limit.
+ *         |x + safety_predict_s*x_dot| > limit_eff.  The prediction projects
+ *         the measured state ALONG its own velocity, so a state that is inside
+ *         the band and retreating toward zero is not an envelope approach; the
+ *         instantaneous guard keeps its direction-blind contract.  Sticky: it
+ *         clears only when BOTH |x| and the signed prediction are below
+ *         safety_clear_ratio*limit.
  *         -> latches LAYERED_FAULT_BIT_ENVELOPE_BREACH.
  *      b) GATE_VETO_OOD_RESIDUAL    : residual above threshold. Sticky until
  *         it recedes below residual_clear_ratio*threshold.
@@ -279,8 +298,14 @@ void Layered_Init(LayeredState_t *state,
  *         classifier reports a normal regime again.
  *         -> latches LAYERED_FAULT_BIT_LOW_CONFIDENCE.
  *      d) GATE_HOLD_LATENCY         : heartbeat older than outer_timeout_s.
- *         The last *applied* command is held; this does not hold position.
- *         Integrators/target/blend hold; dwell advances and recovery re-arms.
+ *         With healthy fast sensors the fixed R4 bank keeps the loop closed on
+ *         the measured state: freezing a torque while valid feedback exists is
+ *         not a safe response to a lost 10 Hz producer.  The gate and the
+ *         LATENCY_TIMEOUT audit bit still report the timeout, the blend filter
+ *         is bypassed so the damping law carries no first-order lag, and the
+ *         grace is bounded by max_hold_ticks.  An unusable FAST sensor is the
+ *         only case with no feedback at all; that path (section 0) holds the
+ *         last applied command open-loop.  Neither case holds position.
  *         -> latches LAYERED_FAULT_BIT_LATENCY_TIMEOUT.
  *         After max_hold_ticks consecutive HOLD ticks the decision escalates
  *         to GATE_SAFE_ZERO: u_target = 0, all integrators cleared, the
@@ -353,21 +378,30 @@ void Layered_Init(LayeredState_t *state,
  *    per-bank commissioned gain on that same white-box term; it is not an AI
  *    output and does not change the feedforward's deterministic origin.
  *    EVERY controller in the bank owns an integrator and EVERY integrator is
- *    continuously back-calculated toward the ACTUAL clamped actuator output
+ *    continuously back-calculated toward the command that was really applied
  *    (tracking anti-windup with windup_tau_s), so an inactive controller can
  *    never accumulate hidden windup and a later switch releases no energy.
+ *    The ACTIVE bank's integrator is back-calculated toward the command after
+ *    the magnitude and slew limits but BEFORE the blend filter: a first-order
+ *    transfer lag is not actuator saturation and must not silently detune the
+ *    running bank.  The inactive banks keep tracking the final applied command
+ *    so a later switch is bumpless.
  *    On the first clean control step the pre-clamp target snaps to the active
  *    bank output and blend = 1, so the command does not ramp up from zero.
  *    On later steps it follows u_pid[i] through a first-order filter with
  *    coefficient blend_alpha, and a bank switch restarts blend at 0.
- *    EMERGENCY BYPASS: while a veto is active (or the permanent latch is set)
- *    and the active regime is REGIME_SAFE_FALLBACK, the blend filter is
- *    bypassed: the target is the R4 bank output directly and blend = 1.  This
- *    removes the first-order phase lag from the emergency damping response.
- *    The magnitude and slew limits below still apply to every command.
+ *    EMERGENCY BYPASS: while a veto is active (or the permanent latch is set or
+ *    the slow mailbox is stale) and the active regime is REGIME_SAFE_FALLBACK,
+ *    the blend filter is bypassed: the target is the R4 bank output directly
+ *    and blend = 1.  This removes the first-order phase lag from every
+ *    emergency damping response.  The magnitude and slew limits below still
+ *    apply to every command.
  *    Finally the command is hard clamped in magnitude and slew rate.
  *    SLEW CONTRACT: on every normal control tick |u(k) - u(k-1)| is bounded by
- *    u_slew_max_per_s * dt_s.  The single documented exception is the
+ *    u_slew_max_per_s * dt_s.  Both bound computations and the limiter itself
+ *    stay in binary32: TwoSum recovers the exact sign of the rounding residual
+ *    so a bound that nearest-even rounding placed outside the budget is pulled
+ *    one representable value inward.  The single documented exception is the
  *    GATE_SAFE_ZERO de-energise above, whose per-tick step is
  *    max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|)) so that a legal yet
  *    sub-ULP budget still reaches exactly 0.0f in finite time.  It only ever

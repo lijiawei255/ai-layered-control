@@ -5,16 +5,21 @@
 % Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function policy = train_continuous_policy(P, nSamples, nCenters, unit)
 %TRAIN_CONTINUOUS_POLICY Conditional 1 kHz action head with 10 Hz context.
+% Mirrors the Python train_policy(): TEN input features -- the nine existing
+% kinematic/context features plus the clamped error-integral history state in
+% column 10, normalised by the 0.5 integrator limit -- and the same 10*nSamples
+% 32-bit LCG draws (the previous memoryless PD target structurally could not
+% represent integral action).
 if nargin<1, P=load_domain_profile(); end
 if nargin<2, nSamples=16000; end
 if nargin<3, nCenters=512; end
 if nargin<4, unit=0; end
-state=uint32(933); values=zeros(9*nSamples,1);
+state=uint32(933); values=zeros(10*nSamples,1);
 for j=1:numel(values)
     state=uint32(bitand(uint64(1664525)*uint64(state)+uint64(1013904223),uint64(4294967295)));
     values(j)=(double(state)+.5)/4294967296;
 end
-X=reshape(values,9,nSamples)'*2-1;
+X=reshape(values,10,nSamples)'*2-1;
 index=(0:nSamples-1)'; near=mod(index,4)~=0;
 for kind=0:1
     q=near & mod(index,2)==kind;
@@ -25,10 +30,15 @@ for kind=0:1
 end
 X(:,6:9)=(X(:,6:9)+1)/2; X(:,9)=X(:,9)*1.4;
 X(near,6:8)=X(near,6:8).*[.03,.10,.06]; X(near,9)=0;
+% Column 10 is the clamped error-integral history state, normalised by the 0.5
+% integrator limit so the training support covers the full [-integ_limit,
+% +integ_limit] range; its value stays in [-1,1] straight from the LCG.
 h=min(max((X(:,9)-.65)/.35,0),1);
 kp=60*(1-h)+8*h; kd=1.2*(1-h)+.8*h; p=P.nominal;
 ff=p.J*(1+unit)*6*X(:,5)+p.b*2*X(:,4)+p.k*.5*X(:,3)+p.fc*sign(X(:,4));
-Y=kp.*(.1*X(:,1))+kd.*X(:,2)+ff;
+% The training target carries the B1 baseline integral gain (BASE[3] = 300 on
+% the Python side, P.baseline(3) here) times the normalised integral feature.
+Y=kp.*(.1*X(:,1))+kd.*X(:,2)+P.baseline(3)*.5*X(:,10)+ff;
 if unit~=0
     Y=Y+(1.2*(1+4.5*unit)-p.fc)*sign(2*X(:,4)-X(:,2));
 end

@@ -46,6 +46,12 @@ Generated libraries and the Python preview figure remain ignored build artifacts
 own PASS criteria are zero state-envelope violations, zero abnormal gate/R4/corruption ticks and
 RMSE below 0.02 state units; the frozen classifier also serves field tuning.
 
+## Graded branches and the current fixture
+
+The harness grades five branches on one 40 s, four-stage fixture (S1 nominal, S2 +35 % load/stiction, S3 unilateral contact, S4 unmodelled flexible mode): B1 (fixed-parameter white-box), B2 (10 Hz context + 1 kHz conditioned RBF action head whose policy input carries 10 features, including one clamped error-integral history feature normalized by the integrator limit), B3 (10 Hz qualitative routing + 1 kHz C99 gate), and the two fairness controls B1+C99 Gate / B2+C99 Gate, where the identical 96 B gate is mounted transparently on top of B1/B2 (zero normal-bank gains, unit feedforward, `blend_alpha = 1`, identical envelope/residual/latency/hold/R4/slew parameters). The comparison therefore separates the universal runtime-assurance shell from the slow qualitative layer.
+
+The contact probe is position-free: it combines a resistive effort/velocity product with a 20 ms stalled-velocity one-signed tracking-error term, charges an 8 s surface memory against the contact, and releases it with a 2 s decay after the plant retreats (re-latching only after 100 ms of genuine re-blockage). The selftest includes a wall-position generalisation check at wall positions 0.30 / 0.43 / 0.55 rad with the reference amplitude shifted by the same 0.07 rad and every controller/probe parameter unchanged, plus a closed-loop `GATE_HOLD_LATENCY` parity test. S4 no longer injects a first-tick spike; the OOD veto rests on the real unmodelled-flexible-mode residual and the random glitch process. The frozen-AI tuning study validates each candidate on two wall phases and grades B1 through the same C99 gate. The off-manifold audit runs at a normal amplitude with an in-box joint shift and a 5 % conformal false-positive budget.
+
 ## Adapt three slots and the core API
 
 The three slots in the template mark the device-specific code:
@@ -103,12 +109,11 @@ state, independently of gate activity.
 
 ## Verification summary
 
-The C99 standalone regression passes 245 checks with zero failures; Python/C `--selftest` replays
+The C99 standalone regression passes 265 checks with zero failures; Python/C `--selftest` replays
 6,000 frames bit-exact in binary32 with max |du| = 0; MATLAB/C equivalence replays 40,000 normal and
 40,000 corrupted-mailbox frames plus illegal-knob runs at max |du| = 5e-9, and a 10,000-tick
-`outer_seq` lease replay stays within max |du| = 4.19e-8; the Level-2 S-Function replays 1,100
-frames with all seven outputs at max diff = 0.0; the compiled object text measures 6,572 B at `-Os`
-and 7,744 B at `-O2`.
+`outer_seq` lease replay stays within max |du| = 3.6e-8 (binary32 values bit-identical after text round-trip); the Level-2 S-Function replays 1,100
+frames with all seven outputs at max diff = 0.0.
 
 For interface adaptation order, multi-axis ownership and timeout behavior, see [AGENTS.md](../AGENTS.md) and
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md). Full numerical evidence is maintained in
@@ -139,6 +144,12 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 [README_zh.md](../README_zh.md)；MIT 复用与可选引用说明见根目录的
 [license and citation guide](../README.md#license-and-citation)，作者与引用元数据在
 [CITATION.cff](../CITATION.cff) 中。
+
+## 分级分支与当前测试台架
+
+测试框架在一条 40 s、四阶段测试台架（S1 标称、S2 +35 % 带载/静摩擦、S3 单边接触、S4 未建模柔性模态）上评估五个分支：B1（定参白盒）、B2（10 Hz 上下文 + 1 kHz 条件 RBF 动作头，其策略输入含 10 个特征，包括一个按积分器限幅归一化的钳位误差积分历史特征）、B3（10 Hz 定性路由 + 1 kHz C99 门控），以及两个公平性对照 B1+C99 Gate / B2+C99 Gate——同一 96 B 门控透明地叠加在 B1/B2 之上（零正常档增益、单位前馈、`blend_alpha = 1`，包络/残差/延迟/保持/R4/斜率参数完全一致）。因此该对比把通用运行时保障外壳与慢环定性层分开。
+
+接触探针与位置无关：它把阻性力矩/速度乘积与 20 ms 停转速度单符号跟踪误差项结合，对接触建立 8 s 表面记忆，并在设备退离后以 2 s 衰减释放（仅在 100 ms 真实再阻塞后重新锁存）。自检包含墙体位置泛化检查（墙体位置 0.30 / 0.43 / 0.55 rad，参考幅值同移 0.07 rad，所有控制器/探针参数不变），以及闭环 `GATE_HOLD_LATENCY` 对拍测试。S4 不再注入首拍尖峰；OOD 否决依赖真实的未建模柔性模态残差与随机毛刺过程。冻结 AI 整定研究在两个墙体相位上验证每个候选，并用同一 C99 门控给 B1 打分。流形外审计以正常幅值运行，叠加盒内关节偏移与 5 % 共形误报预算。
 
 ## 运行命令
 
@@ -196,7 +207,7 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 
 帧龄从源时间戳起每拍推进。`outer_seq` 非零时，内核用自己的 1 kHz 时钟测龄：新序号开启新租约，
 序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖慢环通信停滞；取 0 退回传统帧龄模式。
-内核级 HOLD（指令保持）保持已下发的执行器指令，以 `max_hold_ticks` 为界；超过后内核进入 `GATE_SAFE_ZERO`，
+慢环帧过期但快环传感器有效时，内核报告 `GATE_HOLD_LATENCY` 并继续按固定 R4 律闭环；只有快环输入不可用才开环保持上一条指令。超过 `max_hold_ticks` 后内核进入 `GATE_SAFE_ZERO`，
 按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令归零——单 ULP 保底步长
 只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成能量泄放归零。
 超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环通信帧字段畸形或现场旋钮非法时，
@@ -207,11 +218,10 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 
 ## 基准验证摘要
 
-C99 独立回归 245 项全部通过、零失败；Python/C `--selftest` 回放 6,000 帧，binary32 下
+C99 独立回归 265 项全部通过、零失败；Python/C `--selftest` 回放 6,000 帧，binary32 下
 max |du| = 0 位级一致；MATLAB/C 等价性回放 40,000 帧正常帧与 40,000 帧慢环通信损坏帧，并叠加非法
-旋钮注入，max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；Level-2
-S-Function 回放 1,100 帧，7 路输出 max diff = 0.0；编译目标代码体积 `-Os` 下 6,572 B、
-`-O2` 下 7,744 B。
+旋钮注入，max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 3.6e-8（文本往返后 binary32 值逐位一致）；Level-2
+S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
 
 接口适配顺序、多轴归属与超时行为见 [AGENTS.md](../AGENTS.md) 与
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md)。完整数值证据维护在根目录

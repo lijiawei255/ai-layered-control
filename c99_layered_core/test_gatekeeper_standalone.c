@@ -8,8 +8,9 @@
  * ---------------------------------------------------------------------------
  * Deterministic standalone regression test for layered_gatekeeper.c.
  *
- *   gcc -std=c99 -pedantic -Wall -Wextra -Werror -O2 -o test_gatekeeper_standalone.exe
- *       layered_gatekeeper.c test_gatekeeper_standalone.c
+ *   gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -Werror -O2
+ *       -o test_gatekeeper_standalone.exe layered_gatekeeper.c
+ *       test_gatekeeper_standalone.c
  *   ./test_gatekeeper_standalone.exe        exit code 0 = every check passed
  *
  * Determinism: no rand(), no clock(), no <math.h>.  The reference sine is
@@ -19,7 +20,7 @@
  * Coverage
  *   stage 1   nominal plant, slow reference   -> GATE_NORMAL / REGIME_NOMINAL
  *   stage 2   +35 % load drift                -> REGIME_HIGH_LOAD_DAMPED
- *   stage 3   jittered/dropped heartbeat      -> GATE_HOLD_LATENCY + hold
+ *   stage 3   jittered/dropped heartbeat      -> GATE_HOLD_LATENCY + closed-loop R4
  *   stage 4   OOD residual + envelope breach  -> veto < 10 ticks + hysteresis
  *   stage 5   FieldTuning_t: the three knobs really move the command
  *   stage 6   anti-chatter dwell, recovery cooldown, sticky fault audit bits
@@ -31,10 +32,11 @@
  *   phase A   bounded HOLD -> slew-limited GATE_SAFE_ZERO incl. corrupt-config
  *             de-energise (A1), cumulative latch + explicit acknowledgement and
  *             post-ack episode-quota re-arm (A2), local outer_seq frame lease
- *             (A3), emergency R4 blend bypass (A4), normal-path slew bound
- *             rounded inward at the 1.0f / 7.0e-8 boundary (A6), and the
- *             GATE_SAFE_ZERO de-energise budget rounded inward at the reachable
- *             1.5f / 0.1f boundary (A7)
+ *             (A3), emergency R4 blend bypass (A4), signed envelope look-ahead
+ *             (A8), closed-loop R4 during the latency grace (A9), normal-path
+ *             slew bound rounded inward at the 1.0f / 7.0e-8 boundary (A6), and
+ *             the GATE_SAFE_ZERO de-energise budget rounded inward at the
+ *             reachable 1.5f / 0.1f boundary (A7)
  * ---------------------------------------------------------------------------
  */
 
@@ -429,11 +431,12 @@ static void test_mission(void)
 
     int hold_steps = 0;
     int hold_episodes = 0;
-    int hold_violations = 0;
+    int hold_regime_bad = 0;
+    int hold_motion = 0;
     int hold_recoveries = 0;
     int hold_bad_recovery = 0;
     int prev_hold = 0;
-    float u_last_nonhold = 0.0f;
+    float hold_prev_u = 0.0f;
 
     int first_ood = -1;
     int first_safety = -1;
@@ -552,8 +555,14 @@ static void test_mission(void)
                 if (!prev_hold) {
                     hold_episodes++;
                 }
-                if (out.u != u_last_nonhold) {
-                    hold_violations++;
+                /* The slow mailbox is stale but the fast sensors are healthy:
+                 * the deterministic fallback must close the loop, not freeze
+                 * the last torque. */
+                if (out.regime != REGIME_SAFE_FALLBACK) {
+                    hold_regime_bad++;
+                }
+                if (out.u != hold_prev_u) {
+                    hold_motion++;
                 }
             } else {
                 if (prev_hold) {
@@ -562,9 +571,9 @@ static void test_mission(void)
                         hold_bad_recovery++;
                     }
                 }
-                u_last_nonhold = out.u;
             }
             prev_hold = (out.gate == GATE_HOLD_LATENCY) ? 1 : 0;
+            hold_prev_u = out.u;
         }
 
         /* ---------------- stage 4 ---------------- */
@@ -590,8 +599,7 @@ static void test_mission(void)
                     first_safety = k;
                     safety_after_ood = (first_ood >= 0) ? 1 : 0;
                     x_at_first_safety = in.x;
-                    pred_at_first_safety = t_absf(in.x) +
-                                           cfg.safety_predict_s * t_absf(in.x_dot);
+                    pred_at_first_safety = t_absf(in.x + cfg.safety_predict_s * in.x_dot);
                 }
             } else if (first_safety >= 0 && safety_cleared_step < 0) {
                 safety_cleared_step = k;
@@ -640,9 +648,10 @@ static void test_mission(void)
     check(hold_episodes == (int)st.latency_hold_count,
           "stage 3: latency_hold_count (%u) matches the %d episodes seen by the harness",
           (unsigned)st.latency_hold_count, hold_episodes);
-    check(hold_violations == 0,
-          "stage 3: the held command is bit-identical to the last non-hold command on all %d held ticks",
-          hold_steps);
+    check(hold_regime_bad == 0 && hold_motion > 0,
+          "stage 3: every one of the %d held ticks runs REGIME_SAFE_FALLBACK in closed loop "
+          "(command changes on %d ticks, i.e. it is not a frozen torque)",
+          hold_steps, hold_motion);
     check(hold_bad_recovery == 0 && hold_recoveries == hold_episodes,
           "stage 3: every hold episode returns to GATE_NORMAL on the first fresh heartbeat (%d/%d)",
           hold_recoveries, hold_episodes);
@@ -1323,7 +1332,7 @@ static void test_priority(void)
     priority_case("conf + stale", 1.0f, 0.20f, 0.50f, 0.10f, 0.10f,
                   GATE_VETO_LOW_CONFIDENCE, REGIME_SAFE_FALLBACK);
     priority_case("stale only", 1.0f, 0.95f, 0.50f, 0.10f, 0.10f,
-                  GATE_HOLD_LATENCY, REGIME_NOMINAL);
+                  GATE_HOLD_LATENCY, REGIME_SAFE_FALLBACK);
     priority_case("healthy", 1.0f, 0.95f, 0.005f, 0.10f, 0.10f,
                   GATE_NORMAL, REGIME_NOMINAL);
     priority_case("explicit AI abstention (regime 4)", 4.0f, 0.99f, 0.005f, 0.10f, 0.10f,
@@ -2250,6 +2259,7 @@ static void test_hold_timeout(void)
     inv_t inv;
     int i;
     int hold_bad = 0;
+    int hold_motion = 0;
     int integ_zero = 1;
     int zero_bad = 0;
     int zero_step = -1;
@@ -2404,10 +2414,15 @@ static void test_hold_timeout(void)
           "(corrupted=%d, gate=%s, hold_ticks=%u)",
           out.corrupted, Layered_GateName(out.gate), (unsigned)st.hold_ticks);
 
-    /* A1c: a stale slow mailbox alone must de-energise WITHOUT the permanent
-     * latch and without breaking the commissioned slew limit. */
+    /* A1c: a stale slow mailbox with healthy fast sensors must keep the 1 kHz
+     * loop closed on the fixed R4 law for the whole grace window, report
+     * GATE_HOLD_LATENCY, and only then de-energise WITHOUT the permanent latch
+     * and without breaking the commissioned slew limit.  Freezing the last
+     * torque while valid feedback exists is exactly the defect this contract
+     * removes. */
     Layered_Init(&st, &cfg, &tun);
     in.x = 0.20f;
+    in.x_dot = 0.0f;
     inv_reset(&inv);
     for (i = 0; i < 200; ++i) {
         out = step_checked(&inv, &st, &cfg, &tun, &in);
@@ -2415,23 +2430,33 @@ static void test_hold_timeout(void)
     prev_u = out.u; /* the command that must be walked down, not stepped down */
     in.outer_age_s = 10.0f; /* heartbeat gone for good */
     hold_bad = 0;
-    for (i = 0; i < (int)cfg.max_hold_ticks; ++i) {
-        out = step_checked(&inv, &st, &cfg, &tun, &in);
-        if (out.gate != GATE_HOLD_LATENCY) {
-            hold_bad++;
+    hold_motion = 0;
+    {
+        float previous = prev_u;
+        for (i = 0; i < (int)cfg.max_hold_ticks; ++i) {
+            out = step_checked(&inv, &st, &cfg, &tun, &in);
+            if (out.gate != GATE_HOLD_LATENCY || out.regime != REGIME_SAFE_FALLBACK) {
+                hold_bad++;
+            }
+            if (out.u != previous) {
+                hold_motion++;
+            }
+            previous = out.u;
         }
+        prev_u = previous;
     }
-    check(hold_bad == 0 && st.hold_ticks == cfg.max_hold_ticks,
-          "A1 hold: the first %u stale-heartbeat ticks stay in GATE_HOLD_LATENCY (hold_ticks=%u)",
-          (unsigned)cfg.max_hold_ticks, (unsigned)st.hold_ticks);
+    check(hold_bad == 0 && st.hold_ticks == cfg.max_hold_ticks && hold_motion > 0,
+          "A1 hold: all %u stale-heartbeat grace ticks stay in GATE_HOLD_LATENCY / "
+          "REGIME_SAFE_FALLBACK and the command keeps moving (%d changes, hold_ticks=%u)",
+          (unsigned)cfg.max_hold_ticks, hold_motion, (unsigned)st.hold_ticks);
     du_max = cfg.u_slew_max_per_s * cfg.dt_s;
     out = step_checked(&inv, &st, &cfg, &tun, &in);
     check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f && st.u_target == 0.0f &&
           t_absd((double)out.u - (double)prev_u) <= (double)du_max &&
-          t_absf(out.u) < t_absf(prev_u) &&
+          t_absf(out.u) <= t_absf(prev_u) &&
           (st.fault_audit_bitmask & LAYERED_FAULT_BIT_HOLD_TIMEOUT) != 0u &&
           st.permanent_latched == 0u,
-          "A1 hold: a latency-only timeout -> %s u=%.6f (ramped from %.6f by <= %.6f) "
+          "A1 hold: a latency-only timeout -> %s u=%.6f (walked from %.6f by <= %.6f) "
           "permanent=%u hold_ticks=%u",
           Layered_GateName(out.gate), (double)out.u, (double)prev_u, (double)du_max,
           (unsigned)st.permanent_latched, (unsigned)st.hold_ticks);
@@ -3231,11 +3256,41 @@ static void test_safe_zero_rounding(void)
           "A7 safe-zero rounding: the unguarded subtraction lands outside the budget "
           "(naive step=%.17g > bound=%.17g)", naive_delta, du_max);
 
+    /* Trigger path A: a stale slow mailbox runs the fallback bank in closed
+     * loop.  Its first step is limited by the same inward-rounded slew bound,
+     * so the posted command is 1.4000000953674316f (a 0.0999999046 step that
+     * stays inside the 0.1000000015 budget) rather than the unguarded
+     * 1.3999999761581421f (a 0.1000000238 step). */
     in.outer_age_s = 10.0f; /* heartbeat gone for good */
     out = Layered_Step(&st, &cfg, &tun, &in);
-    check(out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 1u,
-          "A7 safe-zero rounding: the first stale tick holds the command (gate=%s, u=%.9f)",
-          Layered_GateName(out.gate), (double)out.u);
+    check(out.gate == GATE_HOLD_LATENCY && out.regime == REGIME_SAFE_FALLBACK &&
+          t_absd((double)out.u - 1.4000000953674316) == 0.0 &&
+          t_absd((double)out.u - (double)prev_u) <= du_max,
+          "A7 safe-zero rounding: the first latency-grace tick steps 1.5f -> %.9f "
+          "(exact |du|=%.17g <= %.17g, R4 closed loop)",
+          (double)out.u, t_absd((double)out.u - (double)prev_u), du_max);
+
+    /* Trigger path B: with no valid fast feedback the core holds the last
+     * command open-loop, so the exhausted budget then starts the documented
+     * GATE_SAFE_ZERO de-energise walk from exactly 1.5f. */
+    Layered_Init(&st, &cfg, &tun);
+    in = zero_input();
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.r = 1.5f;
+    for (i = 0; i < 100; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    prev_u = st.u_applied;
+    check(out.gate == GATE_NORMAL && prev_u == 1.5f,
+          "A7 safe-zero rounding: the closed loop parks the command exactly at 1.5f (u=%.9f)",
+          (double)prev_u);
+    in.x = make_nan(); /* fast sensor lost: no trustworthy feedback */
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 1u && out.u == prev_u,
+          "A7 safe-zero rounding: a corrupt fast sensor holds the command open-loop "
+          "(gate=%s, u=%.9f)", Layered_GateName(out.gate), (double)out.u);
 
     out = Layered_Step(&st, &cfg, &tun, &in);
     check(out.gate == GATE_SAFE_ZERO,
@@ -3257,6 +3312,263 @@ static void test_safe_zero_rounding(void)
           "A7 safe-zero rounding: the next de-energise tick also lands inside the budget "
           "(u %.9f -> %.9f, exact |du|=%.17g)",
           (double)prev_u, (double)out.u, t_absd((double)out.u - (double)prev_u));
+}
+
+/* ========================================================================= */
+/* Phase A8: signed envelope look-ahead                                      */
+/* ========================================================================= */
+
+/* The predictive envelope term projects the measured state ALONG its own
+ * velocity: |x + T*x_dot|.  The old direction-blind |x| + T*|x_dot| treated a
+ * state that was already inside the band and retreating toward zero as if it
+ * were still approaching the boundary, which vetoed the safest possible
+ * recovery motion and charged a permanent-latch episode for it.  An outward
+ * sprint must still trip ahead of the instantaneous guard, and the
+ * instantaneous guard itself stays deliberately direction-blind. */
+static void test_envelope_lookahead(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    float blind_prediction;
+
+    build_config(&cfg); /* limit 1.0, trip ratio 0.90, look-ahead 0.06 s */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+
+    /* (a) Outward sprint from inside the instantaneous band: x = 0.88 < 0.90,
+     * but the projected position 0.88 + 0.06*2.5 = 1.03 crosses the limit, so
+     * the signed look-ahead must trip on the first tick. */
+    Layered_Init(&st, &cfg, &tun);
+    in = zero_input();
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.x = 0.88f;
+    in.x_dot = 2.5f;
+    in.r = 0.88f;
+    in.r_dot = 0.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_VETO_SAFETY_ENVELOPE && st.safety_veto_count == 1u &&
+          st.latch_episode_count == 1u,
+          "A8 look-ahead: an outward sprint at |x|=0.880 trips the signed prediction "
+          "|x+T*v|=1.030 before the instantaneous guard (gate=%s, episodes=%u)",
+          Layered_GateName(out.gate), (unsigned)st.latch_episode_count);
+
+    /* (b) The same velocity magnitude pointing back toward zero: the projected
+     * position 0.88 - 0.15 = 0.73 is inside every limit, so no veto and no
+     * episode may be charged.  The direction-blind expression still reads
+     * 1.030 and would have vetoed. */
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.88f;
+    in.x_dot = -2.5f;
+    blind_prediction = t_absf(in.x) + cfg.safety_predict_s * t_absf(in.x_dot);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(blind_prediction > cfg.state_safety_limit &&
+          out.gate == GATE_NORMAL && st.safety_veto_count == 0u &&
+          st.latch_episode_count == 0u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_ENVELOPE_BREACH) == 0u,
+          "A8 look-ahead: the same 2.5 rad/s retreat toward zero is not an envelope approach "
+          "(signed |x+T*v|=0.730 vs direction-blind %.3f; gate=%s)",
+          (double)blind_prediction, Layered_GateName(out.gate));
+
+    /* (c) Cold-start report reproduction: x = 0.97, x_dot = -1.14 with the
+     * instantaneous trip ratio at 0.99.  The direction-blind prediction is
+     * 0.97 + 0.06*1.14 = 1.038 and vetoes; the signed prediction is 0.9016 and
+     * must not charge an episode for a recovery motion. */
+    cfg.safety_trip_ratio = 0.99f;
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.97f;
+    in.x_dot = -1.14f;
+    in.r = 0.97f;
+    blind_prediction = t_absf(in.x) + cfg.safety_predict_s * t_absf(in.x_dot);
+    for (i = 0; i < 50; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(blind_prediction > cfg.state_safety_limit &&
+          out.gate == GATE_NORMAL && st.safety_veto_count == 0u &&
+          st.latch_episode_count == 0u,
+          "A8 look-ahead: the reported x=0.970 / x_dot=-1.14 retreat charges no envelope episode "
+          "(signed |x+T*v|=0.902 vs direction-blind %.3f, gate=%s)",
+          (double)blind_prediction, Layered_GateName(out.gate));
+
+    /* (d) The instantaneous guard keeps its direction-blind contract: a state
+     * whose |x| is already above the trip ratio is vetoed while retreating. */
+    build_config(&cfg);
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.95f;
+    in.x_dot = -1.14f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_VETO_SAFETY_ENVELOPE && st.safety_veto_count == 1u,
+          "A8 look-ahead: the instantaneous |x| > 0.90*limit guard still vetoes an "
+          "above-band state regardless of velocity direction");
+
+    /* (e) A genuine outward trip followed by an inward retreat must charge
+     * exactly one episode: the sticky latch survives while |x| is above the
+     * band, clears once both the measurement and the signed prediction fall
+     * below the clear ratio, and the retreat never adds a new rising edge. */
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.88f;
+    in.x_dot = 2.5f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_VETO_SAFETY_ENVELOPE, "A8 look-ahead: episode setup trips");
+    in.x = 0.95f;
+    in.x_dot = -1.14f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_VETO_SAFETY_ENVELOPE && st.latch_episode_count == 1u,
+          "A8 look-ahead: a retreating state that is still above the band keeps the latch");
+    in.x = 0.70f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(st.safety_latched == 0u,
+          "A8 look-ahead: the sticky latch clears once |x| and the signed prediction are "
+          "below the clear ratio");
+    in.x = 0.88f;
+    in.x_dot = -2.5f;
+    for (i = 0; i < 20; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && st.safety_veto_count == 1u &&
+          st.latch_episode_count == 1u,
+          "A8 look-ahead: the inward retreat charges no second episode (episodes=%u)",
+          (unsigned)st.latch_episode_count);
+}
+
+/* ========================================================================= */
+/* Phase A9: closed-loop R4 during the bounded latency grace                 */
+/* ========================================================================= */
+
+/* A stale 10 Hz mailbox with healthy 1 kHz sensors must not freeze the last
+ * torque.  The core keeps GATE_HOLD_LATENCY as the reported decision (and
+ * latches LATENCY_TIMEOUT) but runs the fixed R4 bank on the measured state
+ * for up to max_hold_ticks, then de-energises through GATE_SAFE_ZERO.  Only a
+ * lost fast sensor -- no feedback at all -- holds the command open-loop. */
+static void test_latency_closed_loop(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    float integ_before;
+    float expected;
+    float du_max;
+    float previous;
+    int i;
+    int motion = 0;
+
+    build_config(&cfg); /* max_hold_ticks 100, kp3=0.50, kd3=0.02, ki3=0.05 */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    in = zero_input();
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.x = 0.20f;
+    in.x_dot = 0.02f;
+    in.r = 0.40f;
+    for (i = 0; i < 200; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && out.regime == REGIME_NOMINAL,
+          "A9 latency: the healthy prelude runs the AI bank");
+
+    /* Stall the mailbox.  The reported gate stays GATE_HOLD_LATENCY, but the
+     * regime is R4 and the blend filter is bypassed so the damping law reaches
+     * the actuator without a first-order lag. */
+    in.outer_age_s = 10.0f;
+    integ_before = st.integ[3];
+    previous = st.u_applied;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    expected = cfg.kp[3] * (-in.x) + cfg.kd[3] * (-in.x_dot) +
+               cfg.ki[3] * integ_before;
+    check(out.gate == GATE_HOLD_LATENCY && out.regime == REGIME_SAFE_FALLBACK &&
+          out.corrupted == 0 && st.hold_ticks == 1u &&
+          st.latency_hold_count == 1u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_LATENCY_TIMEOUT) != 0u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) == 0u,
+          "A9 latency: a stale mailbox reports GATE_HOLD_LATENCY / R4 with the latency audit "
+          "bit and no corruption (hold_ticks=%u)", (unsigned)st.hold_ticks);
+    check(out.blend == 1.0f && t_absf(out.u_target - expected) <= 1.0e-6f,
+          "A9 latency: the grace tick publishes the raw R4 law (blend=%.3f, target=%.6f, "
+          "raw=%.6f)", (double)out.blend, (double)out.u_target, (double)expected);
+
+    /* The grace keeps the loop closed for the whole budget: command motion,
+     * live R4 integrator, slew compliance. */
+    du_max = cfg.u_slew_max_per_s * cfg.dt_s;
+    previous = out.u;
+    {
+        int grace_bad = 0;
+        int slew_bad = 0;
+        float integ_prev = st.integ[3];
+
+        for (i = 1; i < (int)cfg.max_hold_ticks; ++i) {
+            integ_prev = st.integ[3];
+            out = Layered_Step(&st, &cfg, &tun, &in);
+            if (out.gate != GATE_HOLD_LATENCY || out.regime != REGIME_SAFE_FALLBACK) {
+                grace_bad++;
+            }
+            if (t_absf(out.u - previous) > du_max) {
+                slew_bad++;
+            }
+            if (out.u != previous) {
+                motion++;
+            }
+            previous = out.u;
+        }
+        check(grace_bad == 0 && slew_bad == 0 && motion > 0,
+              "A9 latency: all %d grace ticks stay GATE_HOLD_LATENCY / R4, honour the slew "
+              "bound and keep the command moving (%d changes)",
+              (int)cfg.max_hold_ticks, motion);
+        expected = cfg.kp[3] * (-in.x) + cfg.kd[3] * (-in.x_dot) + cfg.ki[3] * integ_prev;
+    }
+    check(st.hold_ticks == cfg.max_hold_ticks && st.integ[3] != integ_before &&
+          t_absf(out.u_target - expected) <= 1.0e-6f,
+          "A9 latency: the R4 integrator stays live through the grace and the published "
+          "target tracks the live R4 law (integ=%.6f)", (double)st.integ[3]);
+
+    /* One tick past the budget: mandatory slew-limited de-energise. */
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f &&
+          st.permanent_latched == 0u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_HOLD_TIMEOUT) != 0u,
+          "A9 latency: past max_hold_ticks the core enters GATE_SAFE_ZERO without the "
+          "permanent latch");
+    for (i = 0; i < 8 && out.u != 0.0f; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        check(out.gate == GATE_SAFE_ZERO, "A9 latency: the de-energise walk stays in SAFE_ZERO");
+    }
+    check(out.u == 0.0f, "A9 latency: the de-energise walk reaches exactly zero");
+
+    /* A fresh mailbox restores the AI only after the clean cooldown, and the
+     * contrast: a corrupt fast sensor still holds the command open-loop. */
+    in.outer_age_s = 0.005f;
+    in.x = 0.20f;
+    in.x_dot = 0.02f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && out.regime == REGIME_SAFE_FALLBACK &&
+          st.hold_ticks == 0u,
+          "A9 latency: a fresh mailbox returns to GATE_NORMAL / recovery R4");
+    for (i = 0; i < (int)cfg.ood_recovery_cooldown_ticks; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && out.regime == REGIME_NOMINAL,
+          "A9 latency: the AI bank is re-armed after the clean cooldown");
+
+    Layered_Init(&st, &cfg, &tun);
+    for (i = 0; i < 50; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    previous = st.u_applied;
+    in.x = make_nan();
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted == 1 && out.gate == GATE_HOLD_LATENCY &&
+          out.regime == REGIME_NOMINAL && out.u == previous,
+          "A9 latency: a corrupt fast sensor has no feedback, so the command is held open-loop "
+          "and the last valid bank is reported");
 }
 
 int main(void)
@@ -3322,6 +3634,12 @@ int main(void)
 
     printf("\n-- phase A7: GATE_SAFE_ZERO de-energise budget rounded inward --\n");
     test_safe_zero_rounding();
+
+    printf("\n-- phase A8: signed envelope look-ahead --\n");
+    test_envelope_lookahead();
+
+    printf("\n-- phase A9: closed-loop R4 during the bounded latency grace --\n");
+    test_latency_closed_loop();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

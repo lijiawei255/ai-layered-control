@@ -56,10 +56,10 @@ def auto_calibrate(samples, labels):
     samples, labels = np.asarray(samples), np.asarray(labels)
     prototypes = np.array([samples[labels == k].mean(axis=0) for k in (1, 2, 3)])
     distances = np.sort(np.linalg.norm(samples[:, None, :] - prototypes, axis=2), axis=1)
-    first, second = distances[:, 0], distances[:, 1]
-    gamma = 1 / max(float(np.quantile(first, .95)), 1e-6)
+    first, second = distances[:, 0], distances[:, 1]; n = len(samples)
+    level = lambda a: min(1.0, np.ceil((n + 1) * a) / n); gamma = 1 / max(float(np.quantile(first, level(.95))), 1e-6)
     confidence = (second - first) / (second + first + 1e-9) * np.exp(-gamma * first)
-    threshold = .15 * float(np.quantile(confidence, .01))
+    threshold = .15 * float(np.quantile(confidence, level(.01)))
     return prototypes, gamma, threshold, 1.25 * threshold
 def auto_field_tune(evaluate, current=(1, 1, 1)):
     """Six bounded trials; device-side validity includes every operating regime."""
@@ -94,7 +94,7 @@ def rollout(cfg, tuning=(1, 1, 1), model=None, damping=.4):
             samples.append(features); stamp = t; seq += 1
             if model is not None: regime, confidence = classify(features, model)
         age = t - stamp
-        ai, conf = (4, 0.) if age > cfg["outer_timeout_s"] else (regime, confidence)
+        ai, conf = regime, confidence  # the 1 kHz core owns the slow-loop timeout
         out = core.step(ai, conf, age, residual, q, velocity, r, rd, rdd + .4*rd, seq); u = out[0]
         error_sum += (r-q)**2; violations += int(abs(q) > cfg["state_safety_limit"]); faults += int(out[1] != 0 or out[2] == 4 or out[5])
         prediction = q + dt * (velocity + dt * (u - .4*velocity))
