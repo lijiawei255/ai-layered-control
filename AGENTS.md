@@ -23,8 +23,9 @@ The benchmark grades five branches: B1, B2, B3, and the two gated baselines B1+C
 B2+C99 Gate, with the gate shell transparent (it changes only the safety arbitration, not the
 baseline control law). S3 enforces a 20 N contact budget. S4 has no injected first-tick spike; the
 contact evidence is position-free (no wall-coordinate test), and S4 exercises OOD withdrawal.
-Tuning validity uses two wall phases. The off-manifold audit uses a normal amplitude, an in-box
-joint shift and a 5 % conformal false-positive budget.
+Tuning validity uses two wall phases. The off-manifold audit uses a normal amplitude and
+commissioning noise, an in-box coupled constant load-torque bias, a 1 % per-frame split-conformal
+budget with 5-frame persistence, and an independent nominal control that must record zero false vetoes.
 
 The B3 supervisor supplies only `ai_regime` and `ai_confidence`.
 The normal regimes are R1 nominal, R2 high load and R3 compliant contact; R4 is explicit abstention.

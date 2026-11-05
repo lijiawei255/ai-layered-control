@@ -54,7 +54,7 @@ device-side gating masking is needed.
 
 | Code | Gate | Meaning |
 | :---: | :--- | :--- |
-| 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs（接受决策层工况，运行所选控制组） |
+| 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs（接受决策层工况，运行所选控制档位） |
 | 1 | `GATE_HOLD_LATENCY` | Stale slow mailbox with healthy fast sensors（帧过期但快环传感器有效：报告延迟门并继续闭环 R4）；only an unusable fast input holds the last command open-loop（仅快环输入不可用时开环保持上一条指令） |
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4（物理预测残差超出分布，弃权并切入 R4） |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4（置信度低于阈值或显式工况 4，弃权并切入 R4） |
@@ -87,15 +87,15 @@ so emergency damping is not delayed by transfer smoothing.
 
 The two runtime-assurance layers a derived device must re-calibrate against its own reachable sets
 are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
-guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the split-conformal
+guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the split-conformal calibration
 abstention threshold (`q = min(1, ceil((N+1)(1-alpha))/N)` in `auto_calibrate`). Both are
 device-specific: the envelope depends on the actuator's reachable set and detection delay, and the
 conformal threshold depends on the commissioning archive.
 
 派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
-加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与分裂共形弃权阈值
+加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与分裂共形校准弃权阈值
 （`auto_calibrate` 中的 `q = min(1, ceil((N+1)(1-alpha))/N)`）。两者都与设备相关：包络取决于执行器
-可达集与检测延迟，共形阈值取决于标定档案。
+可达集与检测延迟，共形校准阈值取决于标定档案。
 
 ## Three parallel examples / 三类并列实例
 
@@ -120,7 +120,7 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 1. Define the signals, units, nominal model, controller bank and explicit fallback.
 2. Collect labeled macro-feature windows for `auto_calibrate(samples, labels)`.
-3. Freeze prototypes, distance-decay coefficient and the split-conformal confidence trip/clear levels
+3. Freeze prototypes, distance-decay coefficient and the split-conformal calibration confidence trip/clear levels
    (order `q = min(1, ceil((N+1)(1-alpha))/N)`).
 4. Run `auto_field_tune(evaluate, current)` with a device-side safe trial callback.
 
@@ -181,7 +181,7 @@ R4 uses fixed gains, zero-state error and no feedforward, independent of field t
 共享只读配置。耦合约束的评估与各轴回退的协调由适配层负责，核心 C API 保持单轴形态。
 
 帧过期时，保留真实帧龄并显式发送 R4 弃权：确定性回退继续运行，延迟故障也依然可观测。
-新帧到达后，要经过恢复冷却期（参考实现为 350 ms 超时加 300 ms 冷却）才恢复正常决策。
+新帧到达后，要经过恢复冷却期（本参考架构为 350 ms 超时加 300 ms 冷却）才恢复正常决策。
 慢环字段畸形同样切入闭环 R4，包络与残差的优先级不受影响。`outer_seq` 非零时，内核用自己的
 1 kHz 时钟测量帧龄：新序号开启一份新租约，序号不变则每拍老化一次；冻结或伪造的
 `outer_age_s` 无法掩盖慢环通信停滞，而序号回落到 0 会被视为数据损坏，而不是新帧。

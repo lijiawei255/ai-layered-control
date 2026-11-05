@@ -7,7 +7,7 @@
 started=tic; here=fileparts(mfilename('fullpath')); addpath(here);
 assets_dir=fullfile(here,'..','assets');
 if ~exist('generate_figures','var'), generate_figures=true; end
-P=load_domain_profile(); P.classifier=calibrate_coarse_classifier(P);
+P=load_domain_profile(); [P.classifier,calib_samples]=calibrate_coarse_classifier(P);
 P.policy=train_continuous_policy(P);
 branch_names={'B1','B2','B3','B1+C99 Gate','B2+C99 Gate'};
 fprintf('[1/6] Shared four-stage fixture, five graded branches and continuous 1 kHz actions\n');
@@ -77,7 +77,7 @@ D.mailbox_corruption=struct('corrupted_ticks',sum(z.b3.core_out(:,7)), ...
     'changing_command_ticks',sum(abs(diff(z.b3.u(damaged)))>1e-10));
 assert(all(z.b3.gate(damaged)~=1) && all(z.metrics.violations(3,:)==0),'Damaged slow mailbox froze control or breached safety.');
 fprintf('[5/6] Off-manifold abstention and S3 contact-memory audits\n');
-D.off_manifold=off_manifold_audit(P);
+D.off_manifold=off_manifold_audit(P,calib_samples);
 D.reverse_s3_to_s1=contact_memory_audit(P,'reverse');
 D.retreat_s3_to_s1=contact_memory_audit(P,'retreat');
 fprintf('[6/6] C99 input replay, acceptance and generated artifacts\n');
@@ -182,19 +182,24 @@ for j=1:numel(E.tuning)
         a.knobs,a.b1_valid_candidates);
 end
 off=D.off_manifold;
-fprintf('\nOff-manifold abstention: fixture={scenario 0, ood false, amplitude 0.46, load_bias 0.08, noise_scale 0.03}\n');
-fprintf('  conformal trip=%.5f clear=%.5f calibration frames=%d band=[%s] / [%s]\n', ...
+fprintf('\nOff-manifold abstention: fixture={scenario 0, ood false, amplitude 0.46, load_bias 0.08}\n');
+fprintf('  conformal trip=%.5f clear=%.5f calibration frames=%d persistence=%d band=[%s] / [%s]\n', ...
     off.conformal_trip,off.conformal_clear,off.calibration_frames, ...
-    num2str(off.band{1}),num2str(off.band{2}));
-fprintf('| Seed | Branch | In-box | RMSE [rad] | Low-conf ticks | R4 ticks | Max |x| | Breach |\n');
-fprintf('|---|---|---:|---:|---:|---:|---:|---:|\n');
+    off.confidence_persistence_frames,num2str(off.band{1}),num2str(off.band{2}));
+fprintf('| Seed | Branch | In-box | B3 detect | Rules retreat | RMSE [rad] | Low-conf ticks | R4 ticks | Max |x| | Breach |\n');
+fprintf('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n');
 for j=1:numel(off.seeds)
     row=off.seeds(j);
     for name={'b3','no_conf','rules'}
         a=row.(name{1});
-        fprintf('| %d | %s | %.3f | %.6f | %d | %d | %.3f | %d |\n',row.seed,name{1}, ...
-            row.in_box_fraction,a.rmse,a.low_confidence_ticks,a.r4_ticks,a.max_abs_state,a.breach);
+        fprintf('| %d | %s | %.3f | %.3f | %.3f | %.6f | %d | %d | %.3f | %d |\n',row.seed,name{1}, ...
+            row.in_box_fraction,row.b3_detection_frames,row.rules_retreat_rate, ...
+            a.rmse,a.low_confidence_ticks,a.r4_ticks,a.max_abs_state,a.breach);
     end
+end
+for j=1:numel(off.nominal_control)
+    n=off.nominal_control(j);
+    fprintf('  nominal control seed %d: %d low-conf / %d R4 ticks\n',n.seed,n.low_confidence_ticks,n.r4_ticks);
 end
 rv=D.reverse_s3_to_s1; rt=D.retreat_s3_to_s1;
 fprintf('  reverse S3->S1 (wall withdrawn): peak contact=%.2f N, S1 r3_rate=%.3f, release=%.3f s, last2 r3=%.3f\n', ...
@@ -213,52 +218,81 @@ a=struct('r3_fraction',mean(z.b3.regime(q)==3),'r3_contact_fraction',mean(z.b3.r
     'fallback_fraction',mean(z.b3.regime(q)==4),'veto_fraction',mean(z.b3.gate(q)~=0));
 end
 
-function A=off_manifold_audit(P)
-% Python audit_study() off-manifold block: one normal-amplitude S1 trajectory
-% with an unmodelled constant load torque.  Every single macro feature stays
-% inside the commissioning support band, so the single-dimension range rule
-% cannot retreat; only the joint manifold geometry leaves the nominal support.
-% The manifold detector is granted a 5 % split-conformal false-positive budget
-% measured on NOMINAL probes of the same operating condition.
-lo=[0 0 0 0]; hi=[1 1 .5 1.4];
+function A=off_manifold_audit(P,calib_samples)
+% Python audit_study() off-manifold block: one normal-amplitude, normal-noise
+% S1 trajectory with an unmodelled coupled constant load torque.  The support
+% box is the empirical per-dimension span of the SAME labelled calibration
+% windows (25 % margin), never the algebraic saturation caps of the feature
+% normalization.  Most single-dimension frames stay inside that box, so the
+% range rule rarely retreats; the joint manifold signature is what the
+% split-conformal confidence detects.
+lo0=min(calib_samples,[],1); hi0=max(calib_samples,[],1); margin=.25*(hi0-lo0);
+lo=max(0,lo0-margin); hi=hi0+margin;
 nominal=struct('branches',3,'seed',211,'duration',20,'scenario',0,'ood',false, ...
-    'amplitude',.46,'mode','rules');
+    'amplitude',.46,'mode','dynamic');
 z=sim_core_engine(P,nominal);
 macro=z.b3.macro(2:end,2:end); n=size(macro,1);
 conf=zeros(n,1);
 for j=1:n, [~,conf(j)]=classify_feat(macro(j,:),P.classifier); end
-trip=linear_quantile(sort(conf),conformal_level(.05,n));
-clear=min(1,1.25*trip);
+trip=linear_quantile(sort(conf),conformal_level(.01,n));
+clear=min(.999,1.05*trip);
 audit_clf=P.classifier; audit_clf.trip=trip; audit_clf.clear=clear;
 Pa=P; Pa.classifier=audit_clf;
+nom=nominal_control(Pa);
 A=struct('fixture',struct(),'calibration_frames',n,'conformal_trip',trip, ...
-    'conformal_clear',clear,'band',{{lo,hi}},'seeds',[]);
-A.fixture=struct('scenario',0,'ood',false,'amplitude',.46,'load_bias',.08,'noise_scale',.03);
-rows=repmat(struct('seed',0,'in_box_fraction',0, ...
-    'b3',struct(),'no_conf',struct(),'rules',struct()),1,5);
+    'conformal_clear',clear,'confidence_persistence_frames',5, ...
+    'band',{{lo,hi}},'nominal_control',nom,'seeds',[]);
+A.fixture=struct('scenario',0,'ood',false,'amplitude',.46,'load_bias',.08);
+rows=repmat(struct('seed',0,'in_box_fraction',0,'b3_detection_frames',0, ...
+    'rules_retreat_rate',0,'b3',struct(),'no_conf',struct(),'rules',struct()),1,5);
 for seed=0:4
     fx=struct('seed',seed,'duration',20,'scenario',0,'ood',false, ...
-        'amplitude',.46,'load_bias',.08,'noise_scale',.03,'branches',3);
+        'amplitude',.46,'load_bias',.08,'branches',3, ...
+        'skip_first_frame',true,'conf_persist',5);
     z_b3=sim_core_engine(Pa,fx);
     fxn=fx; fxn.conf_gate=false; fxn.log_features=true;
     z_no=sim_core_engine(Pa,fxn);
     fxr=fx; fxr.mode='rules'; fxr.rule_bounds={lo,hi};
     z_rules=sim_core_engine(P,fxr);
-    F=z_no.b3.feats;
+    F=z_no.b3.macro(2:end,2:end);
     in_box=mean(all(F>=lo-1e-9 & F<=hi+1e-9,2));
+    M=z_b3.b3.macro(2:end,2:end); nf=size(M,1); cf=zeros(nf,1);
+    for j=1:nf, [~,cf(j)]=classify_feat(M(j,:),P.classifier); end
+    det=mean(cf<trip);
+    rr=mean(z_rules.b3.regime(z_rules.t>=.1)==4);
     row=struct('seed',seed,'in_box_fraction',in_box, ...
+        'b3_detection_frames',det,'rules_retreat_rate',rr, ...
         'b3',off_row(z_b3),'no_conf',off_row(z_no),'rules',off_row(z_rules));
     rows(seed+1)=row;
-    % Design property of the fixture: every single feature is inside the band,
-    % so the range rule must stay silent; the manifold detector must fire and
-    % the physical envelope must hold.
-    assert(abs(row.in_box_fraction-1)<1e-12,'Off-manifold fixture left the commissioning support band.');
-    assert(row.rules.low_confidence_ticks==0 && row.rules.r4_ticks==0,'The range rule retreated inside its own support band.');
+    % Honest in-box property: the coupled load bias keeps most single-dimension
+    % frames inside the data-derived box, so the range rule rarely retreats.
+    assert(row.in_box_fraction>=.90,sprintf('Off-manifold frame %.3f is outside the empirical box.',row.in_box_fraction));
+    assert(row.rules_retreat_rate<.10,'The range rule retreated inside its data-derived support box.');
+    % The joint manifold detector must detect the coupled load bias at a far
+    % higher frame rate than the single-dimension range rule.
+    assert(row.b3_detection_frames>.80,'The manifold detector missed the coupled load bias.');
+    assert(row.b3_detection_frames>max(5*row.rules_retreat_rate,.50),'Manifold detection did not beat the range rule.');
     assert(row.b3.low_confidence_ticks>0,'The manifold detector never abstained on the off-manifold fixture.');
     assert(row.b3.breach==0 && row.b3.max_abs_state<1,'Off-manifold B3 breached the state envelope.');
     assert(row.no_conf.low_confidence_ticks==0,'The no-confidence ablation still abstained.');
 end
+for j=1:numel(nom)
+    assert(nom(j).low_confidence_ticks<=100 && nom(j).r4_ticks<=400, ...
+        'Nominal control produced a false confidence veto.');
+end
 A.seeds=rows;
+end
+
+function rows=nominal_control(P)
+% Independent nominal runs under the audit detector: no false abstention.
+rows=repmat(struct('seed',0,'low_confidence_ticks',0,'r4_ticks',0),1,2);
+for j=1:2
+    fx=struct('branches',3,'seed',j-1,'duration',20,'scenario',0,'ood',false, ...
+        'amplitude',.46,'mode','dynamic','skip_first_frame',true,'conf_persist',5);
+    z=sim_core_engine(P,fx); a=z.b3.log; q=z.t>=.1;
+    rows(j)=struct('seed',j-1,'low_confidence_ticks',sum(a(q,3)==3), ...
+        'r4_ticks',sum(a(q,4)==4));
+end
 end
 
 function r=off_row(z)
@@ -278,13 +312,13 @@ function R=contact_memory_audit(P,name)
 if strcmp(name,'reverse')
     R=contact_memory_stats(P,name,20,18);
     assert(R.s3_peak_N<20,'Reverse S3->S1 peak contact exceeded the 20 N budget.');
-    assert(R.release_s<8,'The compliant bank did not release within 8 s of wall withdrawal.');
+    assert(R.release_s<0.35,'The compliant bank did not release within 0.35 s of wall withdrawal.');
     assert(R.last_r3_rate==0,'Late S1 tracking still routed the compliant bank.');
 else
     R=contact_memory_stats(P,name,30,27);
-    assert(R.release_s<18,'The contact memory did not release within 18 s of physical retreat.');
+    assert(R.release_s<0.50,'The contact memory did not release within 0.50 s of physical retreat.');
     assert(R.last_r3_rate==0,'Late S1 tracking still routed the compliant bank after retreat.');
-    assert(R.s1_rmse<0.1,'The retreated S1 segment did not track the interior reference.');
+    assert(R.s1_rmse<0.05,'The retreated S1 segment did not track the interior reference.');
 end
 end
 

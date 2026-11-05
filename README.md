@@ -19,20 +19,11 @@ This repository is an MIT-licensed reference design, comparison benchmark and AI
 
 **Production-grade reusable deterministic core and cross-loop contract** ([`c99_layered_core/`](c99_layered_core/layered_gatekeeper.h), [`simulink_sfunc/`](simulink_sfunc/sfun_layered_gatekeeper.c)): a 1 kHz pure-single-precision ANSI C99 arbitration state machine with four-bank full-branch reverse-tracking anti-windup, an `outer_seq` local-clock lease, a rising-edge latch and a blanking probe. This is the part a device keeps: it owns the actuator command, the fallback chain and the physical tuning knobs, with no heap, no OS call, no libm and no mutable global state.
 
-**Deliberately zero-dependency minimal reference supervisor and synthetic validation sandbox** ([`python_bench/`](python_bench/minimal_template.py)): a 15-scalar nearest-prototype classifier with split-conformal calibration, six-point constrained field tuning and a 1-DOF synthetic fixture. It exists to show how far the slow loop can be simplified once high-bandwidth continuous control is pushed to the deterministic core; a real device may replace it with a rule tree, SafeOpt or a domain model behind the same 10-field contract.
-
-### File map
-
-| Deliverable | Size | Role |
-| :--- | :--- | :--- |
-| [minimal_template.py](python_bench/minimal_template.py) | 119 lines | 10 Hz supervisor template: `auto_calibrate`, `auto_field_tune`, low-confidence abstention, `SLOT 1..3` |
-| [gate_template.c](c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU integration sample: 32 B probe, `blanking_active`, `outer_seq` lease |
-| [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [.h](c99_layered_core/layered_gatekeeper.h) | 96 / 140 / 12 / 40 / 28 B | Zero-dependency ANSI C99 control and safety gatekeeper |
-| [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) | 685 lines | Level-2 C-MEX S-Function around the same frozen core |
+**Architectural Minimalism: the 10 Hz supervisor is all that remains once the fast loop owns stabilization** ([`python_bench/`](python_bench/minimal_template.py)): a 15-scalar nearest-prototype router, split-conformal abstention and a 12 B physical knob tuple. Pushing continuous stabilization into the 1 kHz deterministic core does not weaken the slow layer — it collapses it to its irreducible architectural form: decide the regime, calibrate when to abstain, and leave the millisecond authority to the kernel. The same 10-field contract can host a rule tree, SafeOpt or a domain model on a real device.
 
 ### Key Engineering Metrics
 
-- **Discrete qualitative routing and active OOD abstention (minimal sample and compute cost):** The slow-loop AI outputs only **discrete regime IDs (1..3)** and distance-based **low-confidence abstention (4)** at **10 Hz**, rather than fitting a high-dimensional continuous action surface. Because continuous quantitative feedback and trajectory tracking are carried by the four pre-commissioned deterministic controller banks and the nominal feedforward, the 10 Hz slow loop only has to perform coarse discrete regime classification and manifold-distance abstention; on a CPU it therefore needs only **36 labeled macro-windows** to complete the archive while storing and evaluating only **15 scalars / 60 B (FP32)**, with zero GPU requirement for calibration or runtime inference. The template's built-in 15-scalar nearest-prototype classifier and six-point constrained search (`auto_field_tune`) are a zero-third-party-dependency reference implementation; in a real machine the same interface can host a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another classification model. Baseline B2 (a 1 kHz continuous-action neural network trained on 16,000 samples) needs **16,000 action labels**, **5,664 scalars / 22,656 B (FP32)** and full **1 kHz** continuous inference compute.
+- **Discrete qualitative routing and active OOD abstention (minimal sample and compute cost):** The slow-loop AI outputs only **discrete regime IDs (1..3)** and distance-based **low-confidence abstention (4)** at **10 Hz**, rather than fitting a high-dimensional continuous action surface. Because continuous quantitative feedback and trajectory tracking are carried by the four pre-commissioned deterministic controller banks and the nominal feedforward, the 10 Hz slow loop only has to perform coarse discrete regime classification and manifold-distance abstention; on a CPU it therefore needs only **36 labeled macro-windows** to complete the archive while storing and evaluating only **15 scalars / 60 B (FP32)**, with zero GPU requirement for calibration or runtime inference. The template's built-in 15-scalar nearest-prototype classifier and six-point constrained search (`auto_field_tune`) are a minimal zero-dependency implementation; in a real machine the same interface can host a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another classification model. Baseline B2 (a 1 kHz continuous-action neural network trained on 16,000 samples) needs **16,000 action labels**, **5,664 scalars / 22,656 B (FP32)** and full **1 kHz** continuous inference compute.
 - **96 B zero-trust C99 kernel and transient-hardened protection:** A zero-heap ANSI C99 core owns the **1 kHz** actuator command with **ten input fields**, four-pillar zero-trust protection against the slow loop (split input firewall, `outer_seq` local-clock lease, a 32 B independent physics-residual probe with the 25 ms phase-plane envelope look-ahead, and the 300 ms recovery cooldown with the 150 ms dwell anti-chatter), nine core protection duties and transient-response protection (`blanking_active` hardware-blanking freeze, four-bank reverse tracking anti-windup, and emergency R4 bypass with `blend = 1.0`). In this compound-fault benchmark, the unmodelled flexible-mode residual triggers a veto and closed-loop R4 (the conservative safe-fallback bank) within the same **1 ms control tick**.
 - **Frozen AI topology, 12 B constrained physical field tuning:** Three physical knobs occupy **12 B** and support constrained adaptation to forward overload, cross mismatch, reverse light load and compound unit drift across six jointly constrained trials without retraining the frozen 60 B supervisor or requiring field GPU compute.
 - **Cross-language bit-exact verification:** **265 C regression checks** pass; Python/C replay is bit-exact (**max|du| = 0**), MATLAB/C replay is within **5e-9**, and the Level-2 S-Function reproduces all seven outputs over 1,100 frames with **max diff = 0.0**. The templates are ready to run and can be freely tailored to field codebases; the Simulink model illustrates the architecture.
@@ -43,63 +34,20 @@ This repository is an MIT-licensed reference design, comparison benchmark and AI
 
 ## 1. AI can be slow. Control authority must be clear.
 
-Bringing AI into industrial arms, CNC / additive manufacturing (WAAM), or closed-loop neuromodulation (Parkinson's aDBS, spinal cord stimulation / SCS) makes prediction accuracy only half the problem; the other half is control authority — who owns the actuator command every millisecond. A slow model that understands context plus a fast neural action head does improve responsiveness. But as long as the learned policy still owns continuous commands, the six field problems below keep recurring. They cannot be masked by blind tuning; each one must be resolved in low-level control authority and safety mechanisms. The measured results cited below come from four 10 s test stages: S1 nominal tracking, S2 load and stiction drift, S3 intermittent contact and measurement noise, S4 an unseen compound fault. The design horizon here is 2027+ deployment across constrained devices.
+Industrial arms, CNC / additive manufacturing (WAAM) and closed-loop neuromodulation make prediction accuracy only half the problem; the other half is control authority — who owns the actuator command every millisecond. As long as a learned policy owns continuous commands, six field problems recur. This architecture resolves each one in the deterministic fast loop, not by tuning the model; the measured evidence is in §3 over four 10 s stages (S1 nominal, S2 load/stiction, S3 contact/noise, S4 unseen compound fault).
 
-Gain scheduling or a fixed-threshold rule tree that does not explicitly configure a feature-distance metric and an out-of-range fallback branch still emits the nearest regime's control law when it encounters unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance. This architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: 10 Hz manifold-distance low-confidence abstention that identifies an unknown manifold and retreats to R4 damping, and a 1 kHz millisecond-scale forced-veto abstention driven by an independent physical residual probe.
+- **Scarce samples / continuous-policy compute.** B2 needs 16,000 action labels, 5,664 scalars / 22,656 B and 1 kHz inference, yet still posts **680 S4 violation ticks** without the gate; this architecture keeps the 10 Hz layer at discrete regime advice (`1..3`) + split-conformal abstention (`4`) over **36 windows / 15 scalars / 60 B**, and leaves continuous feedback and feedforward to four deterministic banks.
+- **Rigid vs compliant contact.** One gain set cannot both reject load and hold **20 N**; B1 reaches **64.59 N** in S3. Four banks (R1–R4), R3 compliant contact, per-bank reverse-tracking anti-windup and the emergency R4 bypass `blend = 1.0` resolve the conflict deterministically.
+- **Unknown manifolds.** The nearest fixed rule keeps firing while the plant oscillates; it carries no distance to the calibrated data. A distance-based confidence with split-conformal trip/clear turns an in-box coupled load bias into a deterministic low-confidence veto and R4 damping.
+- **Unit / batch drift.** Per-unit retraining needs data and field compute that do not exist. A frozen manifold topology plus a **12 B** `FieldTuning_t` covers forward, cross and reverse mismatch through six constrained trials.
+- **Slow-loop blind spot, transients, link loss.** The 10 Hz loop is blind for up to 100 ms, pulses and commutation edges corrupt innovation, and a fieldbus can stall. A 32 B 1 kHz probe, `blanking_active` freeze-and-hold, the `outer_seq` local-clock lease and a bounded HOLD -> `GATE_SAFE_ZERO` close the gap.
+- **Bare-metal limits, accountability.** Fixed RAM, no allocator; incidents need causal evidence. The 96 B zero-heap C99 core keeps a 7-bit sticky audit mask and latches `GATE_LATCHED_SAFE` after three severe episodes until explicit acknowledgement.
 
-1. **Scarce samples and the compute cost of continuous policies**
-
-   **Field problem:** A learned continuous-action policy that directly issues 1 kHz commands must cover its trajectory neighbourhood and state-velocity grid through dense sampling during training and evaluate a continuous mapping every millisecond at runtime. In this benchmark, baseline B2 (a 1 kHz continuous-action neural network trained on 16,000 samples) is trained on **16,000 nominal simulated action labels**, stores **5,664 scalars / 22,656 B (FP32)** and evaluates its continuous head on every 1 ms tick; Figure 2 Panel A shows that nominal tracking improves only gradually across 64–16,000 labels, and without the 1 kHz deterministic gate B2 still posts **682 S4 violation ticks**.
-
-   **Architecture mechanism:** The slow loop does not regress a continuous policy; it performs coarse **discrete regime classification (`1..3`)** plus continuous manifold-distance **abstention (`4`)**. Continuous quantitative feedback and trajectory tracking are already carried by the four pre-commissioned deterministic controller banks and the nominal feedforward, so the slow loop only has to cover coarse discrete operating conditions and manifold-distance abstention; on a CPU, **36 labeled macro-windows / 15 scalars / 60 B** are enough to complete `auto_calibrate` and freeze a prototype archive, cutting the calibration sample count by about 2.6 orders of magnitude and 10 Hz runtime inference compute by more than three orders of magnitude. The template's built-in 15-scalar nearest-prototype classifier and six-point constrained search (`auto_field_tune`) are a zero-third-party-dependency reference implementation; in a real machine the same interface can host a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another classification model.
-
-   The runtime-assurance split is calibrated, not hand-tuned. The slow-loop manifold-distance abstention threshold is set by finite-sample split-conformal calibration with order q = min(1, ceil((N+1)(1−α))/N). The fast-loop signed motion look-ahead |x + T·x_dot| ≤ x_max is, for the 1-D box constraint h(x) = x_max − |x| ≥ 0, the first-order zeroing control barrier function (1D ZCBF) boundary condition h_dot + h/T ≥ 0.
-
-   > **Note:** The 16,000 samples are a simulation-based experimental setting, not measured machine time or wear; the count makes the engineering cost of relying on dense exploratory sampling and retraining concrete.
-
-2. **Rigid and compliant conditions conflict**
-
-   **Field problem:** A single fixed-parameter white-box loop must trade disturbance rejection against contact compliance. Baseline B1 (fixed-parameter high-gain PID + inverse-dynamics feedforward) breaks stiction well with its high gain, yet drives S3 contact to **64.59 N** against a 20 N budget.
-
-   **Architecture mechanism:** The fast loop owns a four-bank deterministic library — R1 nominal, R2 high load, R3 compliant contact, R4 conservative safe fallback — with per-bank reverse tracking anti-windup on every tick and an **emergency R4 bypass (`blend = 1.0`)** that removes the first-order smoothing lag from the braking response.
-
-3. **Unknown manifolds and sub-healthy oscillation**
-
-   **Field problem:** A fixed-threshold rule tree and a fuzzy controller have no notion of distance from the data that produced them; they keep issuing the nearest rule while the plant oscillates.
-
-   **Architecture mechanism:** The prototype classifier carries a distance-based **confidence**. When the operating point leaves the calibrated manifold and enters the **`OFF_MANIFOLD`** regime, it abstains with low confidence into R4 damping — the unmodelled non-zero payload offset (load bias 0.08 N·m) used in §3.4. Gain scheduling and fixed rule switching carry no measure of how far the current operating point lies from the known manifold, so they can only hard-select the nearest calibrated regime; this architecture turns that distance into an observable, adjudicable deterministic abstention event.
-
-   > **Note:** The fixed-threshold rule tree compared in this benchmark embeds no explicit manifold-distance or density model.
-
-4. **Cross-machine, batch and unit drift without retraining compute**
-
-   **Field problem:** Joint inertia, damping, friction and contact stiffness move between units, and a field site has no GPU for retraining.
-
-   **Architecture mechanism:** The architecture keeps the **frozen AI manifold topology** orthogonal to a **12 B physical knob tuple** (`FieldTuning_t`); `auto_field_tune` runs six bounded, constrained trials and calibrates forward overload (+35% / +50%), cross mismatch (J +40%, b −30%) and reverse light load (−25%) without touching the classifier.
-
-5. **Slow-loop blind spot, transient artifacts and communication loss**
-
-   **Field problem:** A 10 Hz supervisor is blind for up to 100 ms; stimulation pulses and commutation edges corrupt innovation; a fieldbus can stall.
-
-   **Architecture mechanism:** A 1 kHz, 32 B blanking probe absorbs the artifacts first: during a stimulation pulse or motor commutation, the hardware blanking signal (`blanking_active`) freezes the 1 kHz probe state and holds the pre-blanking residual value — it neither mistakes a normal periodic pulse for a physical anomaly, nor lets periodic blanking interrupt an active OOD latch or let a pre-blanking residual tail lock the system (outside the blanking window the residual decays naturally along the release envelope). The **96 B core** adds a 25 ms phase-plane envelope look-ahead, an independent residual veto, an `outer_seq` local-clock lease, and a bounded HOLD that escalates to **`GATE_SAFE_ZERO`** with a slew-limited energy release whose per-tick step is `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
-
-6. **Silicon limits and incident accountability**
-
-   **Field problem:** An MCU or PLC control task has fixed RAM and no allocator; industrial and medical incidents require causal evidence.
-
-   **Architecture mechanism:** The core is zero-heap ANSI C99; **three cumulative severe-fault episodes** permanently latch **`GATE_LATCHED_SAFE`** with a **7-bit black-box mask** (`fault_audit_bitmask`). Only an explicit `Layered_AcknowledgeFaultLatch()` call, followed by the recovery cooldown, re-arms the AI.
+The split is calibrated, not hand-tuned: the slow-loop threshold is finite-sample split-conformal with order q = min(1, ceil((N+1)(1−α))/N), and the 25 ms signed look-ahead is the 1D ZCBF boundary condition `h_dot + h/T >= 0` for `h = x_max − |x|`. The 16,000 labels are a simulation setting that prices dense sampling, not measured machine time.
 
 **Inference bandwidth is not execution authority:** Computing an action a thousand times per second (1 kHz inference bandwidth) does not make a learned policy safe to own the actuator: its output is still an action proposal without physical guarantees. Execution authority means standing at the actuator every millisecond, maintaining the feedback invariants, tracking anti-windup, hard magnitude/slew limits and independent veto fallback. This repository provides exactly such a device-side software gateway for AI control permissions: the slow loop answers only "which regime?" (`1..3`) or "abstain" (`4`); an independent probe derives veto evidence from time-aligned nominal-model innovation and measurement spikes; an **ANSI C99 core with only 96 bytes of state and zero dynamic allocation** owns the 1 kHz command, closed-loop fallback and physical tuning knobs. The supervisor can change while the execution contract stays fixed. This gateway enforces **four zero-trust defence lines towards the slow-loop AI**: an **interface and numeric zero trust** — the slow loop cannot touch the actuator command `u` or the deterministic feedforward `u_ff` and may submit only regime proposals `1..4`, while the split input firewall sets `corrupted = 1` on any `NaN/±Inf`, out-of-range regime or sequence anomaly in a slow-loop field and forces closed-loop R4; a **time zero trust** — the transported frame age `outer_age_s` is never taken on faith, and with `outer_seq` enabled the 1 kHz core measures the frame lease on its own clock, so a stalled or forged age cannot mask a communication stall; a **physics zero trust** — even a full-confidence (`1.0`) slow-loop output is vetoed in the current 1 ms tick and replaced by R4 whenever the 32 B independent physical-residual probe or the 25 ms phase-plane envelope look-ahead crosses its threshold; and a **recovery zero trust** — after a fault clears or a manual `Layered_AcknowledgeFaultLatch` release, the AI cannot regain authority on the next tick and must pass the 300 ms clean recovery cooldown and the 150 ms dwell anti-chatter check.
 
-**L0–L4 industrial safety-control stack positioning and extension interfaces:**
-
-| Level | Positioning and extension interface |
-| :--- | :--- |
-| L0 hardware safety channel (architectural floor) | Independent safety PLC (ISO 13849 Cat.3/4, 1oo2D), dual-channel sensor cross-check, hardware Safe Torque Off (STO / IEC 60204-1 Stop 0). |
-| L1 deterministic fast inner loop (pluggable quantitative core) | Four-bank PID with full-branch reverse-tracking anti-windup plus nominal feedforward; a disturbance observer (DOB/ESO/ADRC) or bounded adaptive compensation may be added in the control-law slot or injected via `u_ff`. |
-| L2 runtime safety arbitration and degradation chain (one of the core convergence layers of this repo) | 96 B C99 Simplex state machine, 1D ZCBF signed envelope look-ahead, blanking hold and the per-axis R4 → SAFE_ZERO → LATCHED_SAFE chain; multi-axis machinery aggregates each axis `gate_state` and a shared `ack` bus for coordinated stop (IEC 60204-1 Stop 1/2). |
-| L3 slow qualitative supervision and conformally calibrated abstention (the other core convergence layer) | The 10 Hz loop only emits discrete regime advice and a manifold-distance confidence calibrated by finite-sample split conformal prediction. |
-| L4 fleet lifecycle closure (upper extension hook) | AI weights frozen during single-machine operation to preserve determinism; the append-only 7-bit fault audit mask acts as trigger tags for an upper-level system to capture out-of-distribution data slices, supplement new-regime prototypes offline and update the safety case. |
+**L0–L4 industrial safety-control stack positioning:** This repository converges on **L2 — 1 kHz deterministic safety arbitration** — and **L3 — 10 Hz split-conformal qualitative routing**. The single canonical L0–L4 table, including why L2 must be deterministic code under ISO/IEC TR 5469 rather than a second black-box model, lives in the [Systems Engineering Manifesto](docs/systems_engineering_manifesto_en.md#layered-system-boundaries-l0l4).
 
 ```mermaid
 flowchart TB
@@ -295,7 +243,7 @@ Configuration points when porting to target hardware:
 The three control laws are baseline B1 (fixed-parameter high-gain PID + inverse-dynamics feedforward), baseline B2 (a 1 kHz continuous-action neural network trained on 16,000 samples, now with one clamped error-integral feature), and this architecture B3 (10 Hz qualitative routing + 1 kHz C99 safety gating). The two `+C99 Gate` rows are not new control laws: they mount the identical 96 B gate on top of B1 and B2 so the comparison separates what the runtime-assurance shell buys from what the slow qualitative layer buys.
 
 
-**Full-strength baselines:** B1 and B3 receive the **same nominal feedforward in normal operation** and share the same anti-windup, magnitude and slew limits; B1's high gain posts the lowest raw S2 RMSE in the main table (**0.017125 rad**), while the fixed-parameter waterbed effect still drives S3 contact to **64.59 N** (63.47 N with the identical `alpha = 0.3` low-pass). B2 runs its action head at the full 1 kHz — **40,000 action evaluations in 40 s**, zero fast-loop state delay — and posts the highest S3 contact force (**68.57 N**); without an explicit integrator or physical gate it carries larger S2 error and **682 S4 violation ticks**. The physical rule tree reads the same measured features as the prototype classifier and matches its S1/S2 decisions and 19.9 N S3 contact peak. The synthetic fixture is designed to trigger and verify all seven gate states and the anti-windup bank-switching process in one controlled environment. The comparison baselines B1 and B2 carry no C99 safety gate (B2 fits a nominal PD action map without an integrator); they show the response when fast-loop independent gating, compliant bank switching or the integrator is absent. Mounted transparently on the same 1 kHz C99 gate (zero normal-bank gains, unit feedforward, `blend_alpha = 1`; identical envelope/residual/latency/hold/R4/slew parameters), B1 and B2 reach zero S4 violation ticks without re-tuning the graded baseline. The S4 OOD veto rests on the real unmodelled-flexible-mode residual plus the random glitch process; the broadband-residual detection delay is reported in the §3.4 collapsible note.
+**Full-strength baselines:** B1 and B3 receive the **same nominal feedforward in normal operation** and share the same anti-windup, magnitude and slew limits; B1's high gain posts the lowest raw S2 RMSE in the main table (**0.017125 rad**), while the fixed-parameter waterbed effect still drives S3 contact to **64.59 N** (63.47 N with the identical `alpha = 0.3` low-pass). B2 runs its action head at the full 1 kHz — **40,000 action evaluations in 40 s**, zero fast-loop state delay — and posts the highest S3 contact force (**65.61 N**); without an explicit integrator or physical gate it carries larger S2 error and **680 S4 violation ticks**. The physical rule tree reads the same measured features as the prototype classifier and matches its S1/S2 decisions and 19.9 N S3 contact peak. The 1-DOF rotary fixture is designed to trigger and verify all seven gate states and the anti-windup bank-switching process in one controlled environment. The comparison baselines B1 and B2 carry no C99 safety gate (B2 fits a nominal PD action map without an integrator); they show the response when fast-loop independent gating, compliant bank switching or the integrator is absent. Mounted transparently on the same 1 kHz C99 gate (zero normal-bank gains, unit feedforward, `blend_alpha = 1`; identical envelope/residual/latency/hold/R4/slew parameters), B1 and B2 reach zero S4 violation ticks without re-tuning the graded baseline. The S4 OOD veto rests on the real unmodelled-flexible-mode residual plus the random glitch process; the broadband-residual detection delay is reported in the §3.4 collapsible note.
 
 All branches share actuator magnitude and slew limits, sensor processing, noise, reference, plant and fault realization. B1 has no `blend_alpha` smoother. Latency applies only to B2's context; its policy now carries one clamped error-integral history feature and no external PD stabilizer. B3's first-order command smoothing operates on every tick.
 
@@ -306,8 +254,8 @@ All published metrics in the main table (§3.2), field-tuning table (§3.3) and 
 **Key Takeaways:** B1 is the fixed high-gain white-box baseline; B2 is the learned fast-slow continuous-action policy; B3 is this layered architecture. In the main run:
 
 - **S1/S2 — tracking with lower command variation:** B3 keeps tracking error in the same order as B1 while reducing TV from **8,217.67 / 8,100.68** to **1,565.97 / 2,081.44 N·m**.
-- **S3 — compliant unilateral contact:** B1 reaches **64.59 N**, about **3.23 times** the 20 N budget; B3 switches to the compliant R3 bank and stays within budget at **19.9 N**. B3's TV is **3,870.03 N·m**, versus B2's **12,959.24 N·m**.
-- **S4 — zero envelope violations under the unmodelled flexible mode (Figure 1, 30–40 s):** B1/B2 record **834 / 682 violation ticks** (`|x| > 1 rad`). B3 vetoes on the unmodelled-flexible-mode residual and enters closed-loop R4: **0 violations**, with TV of **1,528.1 N·m**. R4 gives up reference tracking to protect the envelope.
+- **S3 — compliant unilateral contact:** B1 reaches **64.59 N**, about **3.23 times** the 20 N budget; B3 switches to the compliant R3 bank and stays within budget at **19.9 N**. B3's TV is **3,870.03 N·m**, versus B2's **13,837.56 N·m**.
+- **S4 — zero envelope violations under the unmodelled flexible mode (Figure 1, 30–40 s):** B1/B2 record **834 / 680 violation ticks** (`|x| > 1 rad`). B3 vetoes on the unmodelled-flexible-mode residual and enters closed-loop R4: **0 violations**, with TV of **1,528.1 N·m**. R4 gives up reference tracking to protect the envelope.
 
 Four 10 s test stages: S1 nominal, S2 +35% load/stiction, S3 unilateral contact, S4 unmodelled flexible mode (fault injection).
 
@@ -324,13 +272,13 @@ RMSE compares reference and true state at the same tick. TV is the within-stage 
 | S2 | B2 | 0.020591 | 6309.24 | 0 | — |
 | S2 | B3 | 0.020165 | 2081.44 | 0 | — |
 | S3 | B1 | 0.028964 | 15959.27 | 0 | 64.59 |
-| S3 | B2 | 0.104687 | 12959.24 | 0 | 68.57 |
+| S3 | B2 | 0.086788 | 13837.56 | 0 | 65.61 |
 | S3 | B3 | 0.074317 | 3870.03 | 0 | 19.9 |
 | S4 | B1 | 0.411028 | 10385.35 | 834 | — |
-| S4 | B2 | 0.37224 | 12684.49 | 682 | — |
+| S4 | B2 | 0.370525 | 12677.56 | 680 | — |
 | S4 | B3 | 0.534138 | 1528.1 | 0 | — |
 | S4 | B1+C99 Gate | 0.538413 | 1593.41 | 0 | — |
-| S4 | B2+C99 Gate | 0.455528 | 1663.97 | 0 | — |
+| S4 | B2+C99 Gate | 0.45781 | 1654.03 | 0 | — |
 
 The two gated baselines are bit-identical to their base controllers in S1–S3 (the transparent shell changes nothing there), so only their S4 rows are listed; the shell's effect is exactly the envelope-violation column.
 
@@ -338,9 +286,9 @@ The two gated baselines are bit-identical to their base controllers in S1–S3 (
 
 **Two-layer fairness conclusion.** The comparison is fair at two levels.
 
-**Layer 1 — the 96 B C99 core as a universal runtime-assurance shell.** With the plain baselines, S4 shows **834 (B1) / 682 (B2)** true-state envelope violation ticks; the same B1 and B2 mounted on the identical C99 gate reach **0 violation ticks** in S4 (`B1+C99 Gate`, `B2+C99 Gate` rows). The gate is mounted transparently — zero normal-bank gains, unit feedforward, `blend_alpha = 1`, and identical envelope/residual/latency/hold/R4/slew parameters — so it does not re-tune the graded baseline.
+**Layer 1 — the 96 B C99 core as a universal runtime-assurance shell.** With the plain baselines, S4 shows **834 (B1) / 680 (B2)** true-state envelope violation ticks; the same B1 and B2 mounted on the identical C99 gate reach **0 violation ticks** in S4 (`B1+C99 Gate`, `B2+C99 Gate` rows). The gate is mounted transparently — zero normal-bank gains, unit feedforward, `blend_alpha = 1`, and identical envelope/residual/latency/hold/R4/slew parameters — so it does not re-tune the graded baseline.
 
-**Layer 2 — what the top-level architecture adds beyond a simple safety shell.** Even with the same C99 gate, the single-bank B1 and the continuous-action B2 still violate the S3 compliant-contact budget (peak **64.59 N** and **68.57 N**, both far above the 20 N device budget), because the stiffness/compliance conflict and the S2-vs-S3 Pareto conflict cannot be resolved by one fixed gain set or one memoryless continuous map. The frozen-AI field tuning table shows the same result: with the gate mounted, B1+C99-Gate has **0 feasible candidates** in all four mismatches, while B3 finds feasible knob sets in all four and its independently seeded 40 s S3 missions stay at **12.86–15.12 N**. B3 additionally needs only **15 classifier scalars** and **36 commissioning windows** because it offloads high-bandwidth continuous control to the deterministic core and prior model, then handles regime choice, abstention and three physical knobs at 10 Hz.
+**Layer 2 — what the top-level architecture adds beyond a simple safety shell.** Even with the same C99 gate, the single-bank B1 and the continuous-action B2 still violate the S3 compliant-contact budget (peak **64.59 N** and **65.61 N**, both far above the 20 N device budget), because the stiffness/compliance conflict and the S2-vs-S3 Pareto conflict cannot be resolved by one fixed gain set or one memoryless continuous map. The frozen-AI field tuning table shows the same result: with the gate mounted, B1+C99-Gate has **0 feasible candidates** in all four mismatches, while B3 finds feasible knob sets in all four and its independently seeded 40 s S3 missions stay at **12.86–15.12 N**. B3 additionally needs only **15 classifier scalars** and **36 commissioning windows** because it offloads high-bandwidth continuous control to the deterministic core and prior model, then handles regime choice, abstention and three physical knobs at 10 Hz.
 
 ### 3.3 Frozen AI, field-tuned hardware
 
@@ -398,17 +346,7 @@ Inertia and viscous-damping changes persist through S3/S4; elevated friction bel
 
 B2 trains on **16,000 nominal-model action labels**: 75% cover nearby sinusoidal/ramped trajectories with correlated position and velocity errors, and 25% retain broad error/context coverage. Contact-like context softens its nominal action target. Strong stiction, the moving wall and the flexible actuator are deployment shifts. Panel A separately trains on shifted-unit labels; evaluation trajectories are not training labels.
 
-Panel A uses the actual conditional RBF at 64 / 256 / 1,024 / 4,096 / 16,000 action labels, with up to 512 centers, and reports nominal performance, frozen transfer and retrained transfer on a logarithmic error axis:
-
-| Action labels | RBF centers | Nominal S1 RMSE / rad | Frozen under +35 % drift, S2 RMSE / rad | Retrained under drift, S2 RMSE / rad |
-|---|---:|---:|---:|---:|
-| 64 | 8 | 0.004462 | 0.023433 | 0.029195 |
-| 256 | 32 | 0.003649 | 32.513147 | 0.027647 |
-| 1,024 | 128 | 0.002955 | 0.022781 | 0.021612 |
-| 4,096 | 512 | 0.00277 | 0.022868 | 0.022994 |
-| 16,000 | 512 | 0.002977 | 0.021351 | 0.019762 |
-
-Nominal accuracy improves gradually with the label budget; the 256-label frozen policy under the drift is unstable, and retraining does not consistently beat the frozen policy at large budgets.
+Panel A plots the measured label-budget curve at 64 / 256 / 1,024 / 4,096 / 16,000 action labels (up to 512 centers) on a logarithmic error axis; the raw rows remain in the `--json` report. Nominal accuracy improves gradually with the budget, the 256-label frozen policy under drift is unstable, and retraining does not consistently beat the frozen policy at large budgets.
 
 ### Controller bank
 
@@ -444,35 +382,34 @@ Fixed-bank ablations retain the **same fast safety gates**. Dynamic classificati
 The fixed-bank results expose the load/contact tradeoff: the nominal bank pays 29.77 N in S3, the high-load bank 63.66 N, and the compliant bank accepts S2 tracking error to post 8.51 N. R4's zero contact force is the damping fallback, not a tracking controller. In this run the fixed rule set (same residual and envelope logic, no nearest-class confidence) reproduces the classifier run exactly, which is the expected outcome for a device whose regime boundaries are already known: the difference between the two appears only off the calibrated support, as the next experiment shows.
 
 
-**1 kHz fast-loop gating ablation:** Removing the fast-loop gate turns the layered supervisor into a context sensor. The S4 compound fault then produces **293 violation ticks** and a peak command at the 20 N·m actuator limit. A position-envelope gate alone recovers zero violations only by tripping the cumulative permanent latch after three veto episodes (7,707 latched ticks), and the pre-latch command still reaches **20.0 N·m**. The full B3 path rejects the fault on the first 1 kHz physics-residual sample: zero violations, zero latch, and a **2.51 N·m** S4 peak.
+**1 kHz fast-loop gating ablation:** Removing the fast-loop gate turns the layered supervisor into a context sensor. The S4 compound fault then produces **383 violation ticks** and a peak command at the 20 N·m actuator limit. A position-envelope gate alone cuts that to **14** violations but still reaches **20.0 N·m** and trips the cumulative permanent latch (**8,185 latched ticks**). The full B3 path rejects the fault on the first 1 kHz physics-residual sample: zero violations, zero latch, and a **2.51 N·m** S4 peak.
 
 | Configuration | S4 violation ticks | S4 peak \|u\| / N·m | `GATE_LATCHED_SAFE` ticks | Four-stage TV / N·m |
 | :--- | ---: | ---: | ---: | ---: |
-| `unguarded_dual` (no fast-loop gate) | 293 | 20.0 | 0 | 18,345.9 |
-| `envelope_only_dual` (position envelope only) | 0 | 20.0 | 7,707 | 9,195.8 |
+| `unguarded_dual` (no fast-loop gate) | 383 | 20.0 | 0 | 19,116.9 |
+| `envelope_only_dual` (position envelope only) | 14 | 20.0 | 8,185 | 9,370.0 |
 | full B3 (envelope + 1 kHz residual) | 0 | **2.51** | 0 | 9,045.5 |
 
-**Manifold-external abstention (`off_manifold_abstention`, seeds 0–4):** The fixture keeps the normal amplitude (0.46 rad) and adds an unmodelled constant payload offset (0.08 N·m load bias) that the nominal predictor does not know. Every dimensionless macro feature stays inside the commissioning support band (in-box fraction 1.0), so a single-dimension range rule cannot retreat; the joint signature (near-zero tracking-error energy with elevated slow-residual energy and contact-like one-sided evidence) is visible only in the manifold geometry. The manifold-distance confidence is calibrated by finite-sample split conformal on 199 nominal 10 Hz frames of the same operating condition (5% false-positive level, trip 0.85614, clear 1.0). Across five seeds the classifier abstains on all 19,980 fast-loop gate ticks (19,980 R4 ticks), while the single-dimension rule set and the confidence-knocked-out variant never retreat:
+**Manifold-external abstention (`off_manifold_abstention`, seeds 0–4):** The fixture runs at normal amplitude (0.46 rad) and commissioning noise, and adds an unmodelled coupled constant load torque (0.08 N·m) that the nominal predictor does not know. The single-dimension support box is the empirical per-feature span of the 36 labelled calibration windows with a 25 % margin — not the algebraic saturation caps of the normalization. All five seeds keep **in-box fraction 1.0**, so the range-rule comparator stays inside its own box and retreats on **0 %** of frames; the joint signature is nevertheless off-manifold. The manifold-distance confidence is calibrated on 199 independent nominal 10 Hz frames at a **1 % per-frame split-conformal budget** (trip 0.71959, clear 0.75557, both strictly below 1.0), and a **5-frame (500 ms) persistence** rejects isolated filter transients. Across five seeds the classifier detects **99.5 %** of slow frames (19,380 R4 ticks each); an independent nominal control set records **0** false-veto ticks.
 
-| Seed | In-box fraction | `B3` RMSE / rad | `B3_no_conf` RMSE / rad | `rules` RMSE / rad | `B3` low-confidence ticks | `rules` low-confidence ticks |
-| :---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1.0 | 0.396018 | 0.003182 | 0.003182 | 19980 | 0 |
-| 1 | 1.0 | 0.396015 | 0.003193 | 0.003193 | 19980 | 0 |
-| 2 | 1.0 | 0.396005 | 0.003173 | 0.003173 | 19980 | 0 |
-| 3 | 1.0 | 0.395977 | 0.003167 | 0.003167 | 19980 | 0 |
-| 4 | 1.0 | 0.395994 | 0.00319 | 0.00319 | 19980 | 0 |
+| Seed | In-box | `B3` frame detection | `rules` retreat | `B3` RMSE / rad | `B3_no_conf` RMSE / rad | `rules` RMSE / rad | `B3` low-confidence ticks |
+| :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1.0 | 0.995 | 0.000 | 0.361455 | 0.001106 | 0.001106 | 19380 |
+| 1 | 1.0 | 0.995 | 0.000 | 0.361987 | 0.001148 | 0.001148 | 19380 |
+| 2 | 1.0 | 0.995 | 0.000 | 0.361581 | 0.001236 | 0.001259 | 19380 |
+| 3 | 1.0 | 0.995 | 0.000 | 0.361091 | 0.001368 | 0.001368 | 19380 |
+| 4 | 1.0 | 0.995 | 0.000 | 0.361120 | 0.001380 | 0.001367 | 19380 |
 
-Every configuration keeps zero state-envelope violations and `max|x| = 0.46 rad`. The RMSE of abstaining B3 is deliberately worse than the non-abstaining controls in this fixture: the audit measures detection of a joint shift that the single-dimension rule cannot see, not tracking performance. The abstention is the design response to an unmodelled load; a device that must keep tracking under such an offset would add it to the predictor or to the commissioning archive instead of expecting the classifier to accept it.
+Every configuration keeps zero state-envelope violations and `max|x| = 0.46 rad`. The RMSE of abstaining B3 is deliberately worse than the non-abstaining controls: the audit measures detection of a joint shift that the single-dimension rule cannot see, not tracking performance. The abstention is the design response to an unmodelled load; a device that must keep tracking under such an offset would add it to the predictor or to the commissioning archive instead of expecting the classifier to accept it.
 
-**Contact-memory release:** The contact feature accumulates signed nominal-model residual power with an activation threshold plus a 20 ms stalled-velocity one-signed tracking-error term, and holds the surface for 8 s against it; after the plant retreats, the memory decays with a 2 s constant and re-latches only after 100 ms of genuine re-blockage:
+**Contact-memory release:** The contact feature combines signed nominal-model residual power with a 20 ms stalled-velocity one-signed tracking-error term and holds an 8 s surface memory against real contact. Release is physical, not a slow tail: a 250 ms reference-step blanking rejects inertial command transients, the remembered contact point is abandoned once the state passes it with position-independent speed, and the free-state decay is **0.10 s**; a genuine resistive blockage re-arms the surface immediately.
 
-| Transition | Time of last R3 tick after the transition | Late-window R3 occupancy |
-| :--- | ---: | :--- |
-| `reverse_s3_to_s1` — wall withdrawn | **5.819 s** | last-2-s fraction 0.000 |
-| `retreat_s3_to_s1` — wall kept, reference returns to the interior zero | 15.919 s | last-5-s fraction 0.000 |
+| Transition | Time of last R3 tick after the transition | Late-window R3 occupancy | S1 RMSE / rad |
+| :--- | ---: | :--- | ---: |
+| `reverse_s3_to_s1` — wall withdrawn | **0.219 s** | last-2-s fraction 0.000 | 0.00404 |
+| `retreat_s3_to_s1` — wall kept, reference returns to the interior zero | **0.219 s** | last-5-s fraction 0.000 | 0.03035 |
 
-With the wall withdrawn the loop leaves compliant R3 at 5.82 s and the last two seconds of the S1 stage contain no R3 tick. With the wall kept and the reference returned to zero, release follows physical retreat alone at 15.92 s and the final five seconds contain no R3 tick; S1 tracking RMSE over the retreated segment is 0.043 rad.
-
+Both directions release in **0.219 s**, an order of magnitude faster than the old 2 s memory tail; the final windows contain no R3 tick, and the retreated S1 segment tracks the interior reference at 0.03035 rad RMSE.
 
 The independent physics probe monitors spikes and broadband innovation; the fast loop uses it for explicit OOD abstention. The first spike of the compound fault triggers a veto in the same control tick.
 
@@ -493,7 +430,7 @@ Veto and R4 fractions are distinct: recovery cooldown can retain R4 after a veto
 
 The safety probe combines a median-based spike channel with a **broadband high-frequency innovation envelope**: time-aligned nominal acceleration prediction, two-pole 25 Hz low-pass processing, 5 Hz high-pass innovation, an 8 ms energy window, normalization by 500 rad/s² and a 1 s release envelope. No fault frequency enters the deployed probe.
 
-The full compound fault exercises the fast-loop forced veto in one control tick. **Anomaly detection delay and core response time are different measurements.** With the random glitch channel present, the S4 stage of the main B3 run records **9,577 OOD-veto ticks** and **9,685 SAFE_ZERO ticks**, and the whole-mission maximum state stays at **0.534 rad** (well inside the 1.0 rad envelope). The audit separately removes the fast-loop gate: the unguarded dual loop then posts 293 true-state violations. Persistent slow-mailbox corruption from 22 s (`slow_corruption`) produces **18,000 corrupted frames**, continued closed-loop updates and **zero violations**, with whole-mission maximum **|x| = 0.516 rad**; the corrupt mailbox is visible in flags and counters while valid sensors keep the fallback loop running. A smoothed single-loop baseline (`b1_smoothed`, the same low-pass coefficient on B1) still shows **921 S4 violation ticks**, which isolates the fast-loop gate rather than the smoother as the source of envelope safety.
+The full compound fault exercises the fast-loop forced veto in one control tick. **Anomaly detection delay and core response time are different measurements.** With the random glitch channel present, the S4 stage of the main B3 run records **9,577 OOD-veto ticks**; the residual latch holds, so no HOLD or SAFE_ZERO escalation occurs on this mission, and the whole-mission maximum state stays at **0.516 rad** (well inside the 1.0 rad envelope). The audit separately removes the fast-loop gate: the unguarded dual loop then posts 383 true-state violations. Persistent slow-mailbox corruption from 22 s (`slow_corruption`) produces **18,000 corrupted frames**, continued closed-loop updates and **zero violations**, with whole-mission maximum **|x| = 0.516 rad**; the corrupt mailbox is visible in flags and counters while valid sensors keep the fallback loop running. A smoothed single-loop baseline (`b1_smoothed`, the same low-pass coefficient on B1) still shows **921 S4 violation ticks**, which isolates the fast-loop gate rather than the smoother as the source of envelope safety.
 
 
 #### Interface, multi-axis and timeout conventions

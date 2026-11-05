@@ -18,7 +18,8 @@ defaults = struct('branches',[1 2 3 4 5],'mode','dynamic','fixed_regime',[], ...
     'corrupt_slow_at',Inf,'smoothing',false,'seq_mode',false, ...
     'j_scale',1,'b_scale',1,'f_scale',1, ...
     'act_gain',1,'act_f',0,'act_zeta',1,'act_dz',0,'load_bias',0, ...
-    'rule_bounds',[],'contact_memory','');
+    'rule_bounds',[],'contact_memory','', ...
+    'skip_first_frame',false,'conf_persist',5);
 keys = fieldnames(defaults);
 for j=1:numel(keys)
     if ~isfield(opts,keys{j}), opts.(keys{j})=defaults.(keys{j}); end
@@ -194,7 +195,8 @@ pr=struct('xh',x,'vh',0.,'lp',0.,'lp2',0.,'errlp',0.,'buf',[],'yf',x,'vf',0., ..
     'me',0.,'mu',0.,'hf',0.,'sp',0.,'power',0.,'load_energy',0.,'contact',0., ...
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
     'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0, ...
-    'stall_ticks',0,'block_run',0);
+    'stall_ticks',0,'block_run',0, ...
+    'vlp',0.,'pass_run',0,'r_prev',x,'blk',0);
 end
 
 function f=probe_features(pr,P)
@@ -225,6 +227,7 @@ pr.ae=pr.ae+dt/.008*((ar-pr.alp)^2-pr.ae); pr.hf=sqrt(max(pr.ae,0))/500;
 pr.xh=xp+dt*40*innov; pr.vh=vp+dt*400*innov;
 vd=(ym-pr.yf)/.002; pr.yf=pr.yf+dt/.002*(ym-pr.yf); pr.vf=pr.vf+dt/.002*(vd-pr.vf);
 v25=(pr.y2-old_y2)/dt;
+pr.vlp=pr.vlp+dt/.05*(v25-pr.vlp);
 pr.power=pr.power+dt/.05*(p(1)*pr.alp*v25-pr.power);
 pr.load_energy=pr.load_energy+dt/.05*((p(1)*pr.alp)^2-pr.load_energy);
 % Contact evidence is POSITION-FREE (no absolute wall coordinate) and combines
@@ -238,16 +241,25 @@ pr.load_energy=pr.load_energy+dt/.05*((p(1)*pr.alp)^2-pr.load_energy);
 %       counts after the measured velocity has stayed stalled for 20 ms, and it
 %       is capped at 0.02 so one transient can neither fake a contact nor keep
 %       the surface release engaged.
-% Release is STICKY: a released surface stays released until a real sustained
-% blockage is seen again (block_run >= 100 ms); otherwise one reactive-power
-% transient would re-latch a surface the plant has already left.  The decay time
-% is 8 s against the surface and 2 s after release.
+% A reference step is inertial, not wall reaction: blank the effort channel for
+% 250 ms so a commanded retreat cannot recharge the memory.
+% Release: a remembered contact point is abandoned when the measured state
+% passes it with position-independent speed (50 ms low-pass velocity), or after
+% 3 s of clear retreat.  The free-state decay is 0.1 s, so the 10 Hz classifier
+% sees the contact feature collapse within one frame; a genuine resistive
+% blockage re-arms the surface immediately, while the 250 ms reference-step
+% blanking keeps an inertial command transient from doing so.
+if abs(r-pr.r_prev)>.02
+    pr.blk=250;
+elseif pr.blk>0
+    pr.blk=pr.blk-1;
+end
 ratio=pr.power/(pr.load_energy+.25);
 stall_w=1./(1+(pr.vf/.05).^2);
 if abs(pr.vf)<.05, pr.stall_ticks=pr.stall_ticks+1; else, pr.stall_ticks=0; end
 lead_err=abs(pr.errlp)-.03;
 evidence=0.;
-if pr.power>.10 && ratio>.03
+if pr.power>.10 && ratio>.03 && pr.blk==0
     evidence=pr.power-.10;
 end
 if lead_err>0 && pr.stall_ticks>=20
@@ -263,14 +275,19 @@ end
 if blocked
     pr.cy=ym;
 end
+if ym>pr.cy+.04 && pr.vlp>.05
+    pr.pass_run=pr.pass_run+1;
+else
+    pr.pass_run=0;
+end
 if pr.free
-    if pr.block_run>=100
+    if blocked
         pr.free=0;
     end
-elseif pr.retreat_s>3.0 || ym>pr.cy+.04
+elseif pr.retreat_s>3.0 || pr.pass_run>=100
     pr.free=1;
 end
-tau=8.; if pr.free, tau=2.; end
+tau=8.; if pr.free, tau=.10; end
 if evidence>=pr.contact
     pr.contact=max([pr.contact*(1-dt/tau),evidence,0]);
 else
@@ -279,6 +296,7 @@ end
 pr.me=pr.me+dt/.25*((r-ym)^2-pr.me); pr.mu=pr.mu+dt/.25*(u*u-pr.mu);
 sp=pr.sp; if ~spike_gate, sp=0; end
 pr.veto=max([sp,pr.hf,pr.veto*(1-dt)]);
+pr.r_prev=r;
 yd=pr.vf; res=pr.veto;
 end
 
@@ -302,6 +320,7 @@ cfg.ood_recovery_cooldown_ticks=uint32(P.cfg.ood_recovery_cooldown_ticks);
 cfg.max_hold_ticks=uint32(P.cfg.max_hold_ticks);
 cfg.max_fault_vetoes_before_latch=uint32(P.cfg.max_fault_vetoes_before_latch);
 tuning=single(o.tuning); core=core_init(); ai=1; conf=1.; calls=0;
+low_run=0; ctx_ready=~o.skip_first_frame;
 % Branches 'b1g' / 'b2g' grade the B1 / B2 control law through the SAME 96 B C99
 % core mounted as a transparent safety shell: the baseline command becomes the
 % core's u_ff and the normal banks are neutralised (zero P/I/D, unit
@@ -355,9 +374,22 @@ for k=1:n
         for mi=c.arrivals{k}
             if c.stamp(mi)>=last_stamp
                 last_stamp=c.stamp(mi); ctx=frames(mi,:);
+                skip_start=o.skip_first_frame && mi==1;
+                if ~(o.skip_first_frame && mi==1), ctx_ready=true; end
                 % One committed slow frame, one sequence number.
                 if o.seq_mode, seq=seq+uint32(1); end
-                if ~isempty(P.classifier), [ai,conf]=classify(ctx,P.classifier); end
+                if ~isempty(P.classifier) && ~skip_start
+                    [ai,conf]=classify(ctx,P.classifier);
+                    % Temporal persistence: only conf_persist consecutive low
+                    % 10 Hz frames reach the 1 kHz arbitration.  The core's own
+                    % confidence latch remains immediate.
+                    if conf<P.classifier.trip
+                        low_run=low_run+1;
+                        if low_run<o.conf_persist, conf=1.; end
+                    else
+                        low_run=0;
+                    end
+                end
             end
         end
     end
@@ -388,14 +420,20 @@ for k=1:n
     else
         if ~isempty(o.fixed_regime), ai=o.fixed_regime; conf=1.; end
         if strcmp(mode,'rules')
-            if ctx(4)>.65, ai=3; elseif ctx(3)>.25 || ctx(2)>.55, ai=2; else, ai=1; end
-            conf=1.;
-            % Optional single-dimension retreat bands: the commissioning support
-            % of the four dimensionless features.  Any feature outside its band
-            % retreats to R4; the range rule still cannot see joint geometry.
-            if ~isempty(o.rule_bounds)
-                lo=o.rule_bounds{1}; hi=o.rule_bounds{2};
-                if any(ctx<lo) || any(ctx>hi), ai=4; end
+            if ctx_ready
+                if ctx(4)>.65, ai=3; elseif ctx(3)>.25 || ctx(2)>.55, ai=2; else, ai=1; end
+                conf=1.;
+                % Single-dimension retreat bands from the data-derived
+                % commissioning box.  Any feature outside its band retreats to
+                % R4; the range rule still cannot see joint geometry.  Until the
+                % first real slow frame has arrived it stays nominal, so the
+                % silent startup sample cannot fake an out-of-box retreat.
+                if ~isempty(o.rule_bounds)
+                    lo=o.rule_bounds{1}; hi=o.rule_bounds{2};
+                    if any(ctx<lo) || any(ctx>hi), ai=4; end
+                end
+            else
+                ai=1; conf=1.;
             end
         end
         ci=conf; if ~o.conf_gate, ci=1.; end

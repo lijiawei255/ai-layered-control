@@ -3,8 +3,11 @@
 % Source: https://github.com/lijiawei255/ai-layered-control
 % License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
 % Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
-function classifier = calibrate_coarse_classifier(P, nPerClass)
+function [classifier, samples] = calibrate_coarse_classifier(P, nPerClass)
 %CALIBRATE_COARSE_CLASSIFIER Fit three prototypes from labelled macro windows.
+% The labelled windows are also returned so the audit can derive its empirical
+% single-dimension support box from the same data instead of hard-coding the
+% algebraic saturation caps of the feature normalization.
 if nargin<1, P=load_domain_profile(); end
 if nargin<2, nPerClass=12; end
 samples=zeros(3*nPerClass,4);

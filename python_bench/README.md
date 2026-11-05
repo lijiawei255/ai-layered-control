@@ -50,7 +50,7 @@ RMSE below 0.02 state units; the frozen classifier also serves field tuning.
 
 The harness grades five branches on one 40 s, four-stage fixture (S1 nominal, S2 +35 % load/stiction, S3 unilateral contact, S4 unmodelled flexible mode): B1 (fixed-parameter white-box), B2 (10 Hz context + 1 kHz conditioned RBF action head whose policy input carries 10 features, including one clamped error-integral history feature normalized by the integrator limit), B3 (10 Hz qualitative routing + 1 kHz C99 gate), and the two fairness controls B1+C99 Gate / B2+C99 Gate, where the identical 96 B gate is mounted transparently on top of B1/B2 (zero normal-bank gains, unit feedforward, `blend_alpha = 1`, identical envelope/residual/latency/hold/R4/slew parameters). The comparison therefore separates the universal runtime-assurance shell from the slow qualitative layer.
 
-The contact probe is position-free: it combines a resistive effort/velocity product with a 20 ms stalled-velocity one-signed tracking-error term, charges an 8 s surface memory against the contact, and releases it with a 2 s decay after the plant retreats (re-latching only after 100 ms of genuine re-blockage). The selftest includes a wall-position generalisation check at wall positions 0.30 / 0.43 / 0.55 rad with the reference amplitude shifted by the same 0.07 rad and every controller/probe parameter unchanged, plus a closed-loop `GATE_HOLD_LATENCY` parity test. S4 no longer injects a first-tick spike; the OOD veto rests on the real unmodelled-flexible-mode residual and the random glitch process. The frozen-AI tuning study validates each candidate on two wall phases and grades B1 through the same C99 gate. The off-manifold audit runs at a normal amplitude with an in-box joint shift and a 5 % conformal false-positive budget.
+The contact probe is position-independent: it combines a resistive effort/velocity product with a 20 ms stalled-velocity one-signed tracking-error term and keeps an 8 s surface memory against real contact. Release is physical, not a slow tail: a 250 ms reference-step blanking rejects inertial command transients, the remembered contact point is abandoned once the measured state passes it with position-independent speed, the free-state decay is 0.10 s, and a genuine resistive blockage re-arms the surface immediately. The selftest includes a wall-position generalisation check at wall positions 0.30 / 0.43 / 0.55 rad with the reference amplitude shifted by the same 0.07 rad and every controller/probe parameter unchanged, plus a closed-loop `GATE_HOLD_LATENCY` parity test and an independent nominal control against false confidence vetoes. S4 no longer injects a first-tick spike; the OOD veto rests on the real unmodelled-flexible-mode residual and the random glitch process. The frozen-AI tuning study validates each candidate on two wall phases and grades B1 through the same C99 gate. The off-manifold audit runs at a normal amplitude and commissioning noise with an in-box coupled constant load-torque bias, a 1 % per-frame split-conformal budget plus 5-frame persistence, and a data-derived (not algebraic) single-dimension support box.
 
 ## Adapt three slots and the core API
 
@@ -136,7 +136,7 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 | :--- | :--- | :--- |
 | [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
 | [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通包络，提取标称模型预测残差（新息））、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
-| [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四控制组抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
+| [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四档控制律库抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 行 | Level-2 C-MEX S-Function：`DWork` 持有 96 B 状态，零全局变量、零动态内存，11 输入（10 字段 ABI + 确认上升沿）/ 7 输出 |
 
 [run_benchmark.py](run_benchmark.py) 是基准测试框架：搭建共享物理测试台架、训练 B2、运行分支对比
@@ -149,7 +149,7 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
 测试框架在一条 40 s、四阶段测试台架（S1 标称、S2 +35 % 带载/静摩擦、S3 单边接触、S4 未建模柔性模态）上评估五个分支：B1（定参白盒）、B2（10 Hz 上下文 + 1 kHz 条件 RBF 动作头，其策略输入含 10 个特征，包括一个按积分器限幅归一化的钳位误差积分历史特征）、B3（10 Hz 定性路由 + 1 kHz C99 门控），以及两个公平性对照 B1+C99 Gate / B2+C99 Gate——同一 96 B 门控透明地叠加在 B1/B2 之上（零正常档增益、单位前馈、`blend_alpha = 1`，包络/残差/延迟/保持/R4/斜率参数完全一致）。因此该对比把通用运行时保障外壳与慢环定性层分开。
 
-接触探针与位置无关：它把阻性力矩/速度乘积与 20 ms 停转速度单符号跟踪误差项结合，对接触建立 8 s 表面记忆，并在设备退离后以 2 s 衰减释放（仅在 100 ms 真实再阻塞后重新锁存）。自检包含墙体位置泛化检查（墙体位置 0.30 / 0.43 / 0.55 rad，参考幅值同移 0.07 rad，所有控制器/探针参数不变），以及闭环 `GATE_HOLD_LATENCY` 对拍测试。S4 不再注入首拍尖峰；OOD 否决依赖真实的未建模柔性模态残差与随机毛刺过程。冻结 AI 整定研究在两个墙体相位上验证每个候选，并用同一 C99 门控给 B1 打分。流形外审计以正常幅值运行，叠加盒内关节偏移与 5 % 共形误报预算。
+接触探针与位置无关：它把阻性力矩/速度乘积与 20 ms 停转速度单符号跟踪误差项结合，对真实接触保持 8 s 表面记忆。释放是物理判据而非慢尾：250 ms 参考阶跃消隐切断惯性指令瞬态；对象带位置无关速度越过记忆接触点即放弃该表面；自由态衰减为 0.10 s；真实阻性阻塞会立即重新武装表面。自检包含墙体位置泛化检查（墙体位置 0.30 / 0.43 / 0.55 rad，参考幅值同移 0.07 rad，所有控制器/探针参数不变）、闭环 `GATE_HOLD_LATENCY` 逐帧一致性回放测试，以及独立标称低误报校验。S4 不再注入首拍尖峰；OOD 否决依赖真实的未建模柔性模态残差与随机毛刺过程。冻结 AI 整定研究在两个墙体相位上验证每个候选，并用同一 C99 门控给 B1 打分。流形外审计以正常幅值与建档噪声运行，叠加盒内耦合常值负载偏置、1% 逐帧分裂共形预算 + 5 帧持续性，以及数据导出的单维支撑盒。
 
 ## 运行命令
 
@@ -185,7 +185,7 @@ python python_bench/run_benchmark.py --selftest
 以上三个槽位可由任意 AI 编程助手（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）直接实现；`auto_calibrate` 与 `auto_field_tune` 可直接复用或按现场需求定制。
 
 `Core(config, tuning=(1,1,1))` 接受与 C 完全一致的配置名；`kp`、`kd`、`ki`、`ff_scale`
-四个控制组字段各含四个值。一次调用
+四个控制档位字段各含四个值。一次调用
 
 ```text
 step(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq)
