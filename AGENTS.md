@@ -210,8 +210,9 @@ Measure target execution time separately from host ctypes call time.
 supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_clear)`.
 The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
 windows into 15 classifier scalars (three 4-D prototypes, gamma, confidence trip and confidence
-clear). The confidence threshold is a finite-sample split-conformal quantile with order
-`q = min(1, ceil((N+1)(1-alpha))/N)`.
+clear). The main benchmark sets the trip level from the calibration-manifold lower bound times a
+0.15 conservative safety-margin coefficient; the off-manifold audit separately validates the
+finite-sample split-conformal lower-tail order statistic (1 %).
 Freeze the resulting prototypes and confidence parameters before unit-to-unit adaptation.
 
 ### Step 4 — Tune the physical knobs

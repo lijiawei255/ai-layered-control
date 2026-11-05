@@ -234,7 +234,7 @@ z=sim_core_engine(P,nominal);
 macro=z.b3.macro(2:end,2:end); n=size(macro,1);
 conf=zeros(n,1);
 for j=1:n, [~,conf(j)]=classify_feat(macro(j,:),P.classifier); end
-trip=linear_quantile(sort(conf),conformal_level(.01,n));
+conf=sort(conf); trip=conf(max(1,ceil(.01*n))); % 1% lower-tail order statistic
 clear=min(.999,1.05*trip);
 audit_clf=P.classifier; audit_clf.trip=trip; audit_clf.clear=clear;
 Pa=P; Pa.classifier=audit_clf;
@@ -277,7 +277,7 @@ for seed=0:4
     assert(row.no_conf.low_confidence_ticks==0,'The no-confidence ablation still abstained.');
 end
 for j=1:numel(nom)
-    assert(nom(j).low_confidence_ticks<=100 && nom(j).r4_ticks<=400, ...
+    assert(nom(j).low_confidence_ticks==0 && nom(j).r4_ticks==0, ...
         'Nominal control produced a false confidence veto.');
 end
 A.seeds=rows;
@@ -315,7 +315,7 @@ if strcmp(name,'reverse')
     assert(R.release_s<0.35,'The compliant bank did not release within 0.35 s of wall withdrawal.');
     assert(R.last_r3_rate==0,'Late S1 tracking still routed the compliant bank.');
 else
-    R=contact_memory_stats(P,name,30,27);
+    R=contact_memory_stats(P,name,30,25);
     assert(R.release_s<0.50,'The contact memory did not release within 0.50 s of physical retreat.');
     assert(R.last_r3_rate==0,'Late S1 tracking still routed the compliant bank after retreat.');
     assert(R.s1_rmse<0.05,'The retreated S1 segment did not track the interior reference.');

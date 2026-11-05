@@ -233,6 +233,10 @@ class PythonGatekeeper:
         # never expire; the C core rejects it as a corrupt configuration.
         if cfg['max_hold_ticks'] == 4294967295:
             return True
+        # The lease age saturates at UINT32_MAX ticks: a timeout beyond that
+        # reach can never trip and is rejected exactly as in the C core.
+        if cfg['outer_timeout_s'] >= _f32(_f32(4294967296.0) * cfg['dt_s']):
+            return True
         if not (0 < cfg['blend_alpha'] <= 1 and 0 <= cfg['residual_clear_ratio'] <= 1
                 and 0 <= cfg['min_ai_confidence'] <= cfg['confidence_clear_ratio'] <= 1
                 and 0 < cfg['safety_trip_ratio'] <= 1 and 0 <= cfg['safety_clear_ratio'] <= cfg['safety_trip_ratio']):
@@ -294,7 +298,10 @@ class PythonGatekeeper:
         ai_regime, ai_confidence, outer_age_s = _f32(ai_regime), _f32(ai_confidence), _f32(outer_age_s)
         physics_residual, x, x_dot = _f32(physics_residual), _f32(x), _f32(x_dot)
         r, r_dot, u_ff = _f32(r), _f32(r_dot), _f32(u_ff)
-        outer_seq = int(outer_seq)
+        seq = int(outer_seq)
+        if seq != outer_seq or not 0 <= seq <= 0xFFFFFFFF:
+            raise ValueError("outer_seq must be a uint32 integer")
+        outer_seq = seq
         cfg = self.cfg
         tune = self.tune
         finite = _FINITE_LIMIT
@@ -1119,7 +1126,7 @@ def off_manifold_threshold(clf):
     keep = macro[:, 0] >= 0.1
     confidence = np.array([classify(frame, protos, gamma)[1] for frame in macro[keep, 1:]])
     n = len(confidence)
-    trip = float(np.quantile(np.sort(confidence), conformal_level(0.01, n)))
+    trip = float(np.sort(confidence)[max(0, math.ceil(0.01 * n) - 1)])  # 1% lower-tail order statistic
     return trip, float(min(0.999, 1.05 * trip)), n
 
 def nominal_control(clf, audit_clf, seeds=(0, 1)):
@@ -1346,8 +1353,8 @@ def audit_study(clf, c):
         assert row['no_conf']['low_confidence_ticks'] == 0, row['seed']
     for row in nominal_rows:
         # Nominal control: no offset, same detector -> no false abstention.
-        assert row['low_confidence_ticks'] <= 100, row
-        assert row['r4_ticks'] <= 400, row
+        assert row['low_confidence_ticks'] == 0, row
+        assert row['r4_ticks'] == 0, row
     # ---- S3 -> S1 reverse transition: the compliant bank must let go ------
     rev = reverse_context()
     a = simulate(rev, 'dynamic', clf=clf)['log']
@@ -1366,7 +1373,7 @@ def audit_study(clf, c):
     # memory must release on physical retreat alone (no absolute-coordinate cue).
     ret = retreat_context()
     a = simulate(ret, 'dynamic', clf=clf)['log']
-    q2, tail = ret['stage'] == 0, ret['t'] >= 27.0
+    q2, tail = ret['stage'] == 0, ret['t'] >= 25.0
     r3 = np.flatnonzero(q2 & (a[:, 3] == REGIME_BOUNDARY))
     report['retreat_s3_to_s1'] = dict(
         s1_r3_rate=round(float(np.mean(a[q2, 3] == REGIME_BOUNDARY)), 3),
@@ -1889,6 +1896,15 @@ def selftest():
     a0 = c0.step(1, 1, 0, 1.00000001, 0, 0, 0, 0, 0, 1)
     b0 = p0.step(1, 1, 0, 1.00000001, 0, 0, 0, 0, 0, 1)
     assert a0 == b0, (a0, b0)
+    for bad in (2**32, -1, 1.5):
+        for obj in (c0, p0):
+            try:
+                obj.step(1, 1, 0, 0, 0, 0, 0, 0, 0, bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'outer_seq {bad!r} was not rejected')
+    print('PASS: outer_seq rejects non-uint32 values before ctypes/mirror conversion')
     print(f'PASS: 6000 frames, R1={seen[1]} R2={seen[2]} R3={seen[3]} R4={seen[4]}; '
           f'gate/regime/fault exact; max|du|={maxerr:.3g}')
     print('PASS: uint32 counter saturation, dwell boundary semantics and ten-field step contract')
@@ -1915,7 +1931,7 @@ def selftest():
     audit_clf = (clf[0], clf[1], audit_trip, audit_clear)
     nom = nominal_control(clf, audit_clf)
     nom_ticks = max(r['low_confidence_ticks'] for r in nom)
-    assert nom_ticks <= 100, nom
+    assert nom_ticks == 0, nom
     fx = context(seed=0, duration=6.0, **OFF_MANIFOLD)
     zb = simulate(fx, 'dynamic', clf=audit_clf, skip_first_frame=True,
                   conf_persist=CONF_PERSIST_FRAMES)
@@ -1971,6 +1987,12 @@ def _ablation_summary(c, z):
 
 def main():
     global USE_PYTHON
+    if '-h' in sys.argv or '--help' in sys.argv:
+        print("usage: run_benchmark.py [--selftest] [--json] [--no-c]")
+        print("  --selftest  core/parity self-checks without the full benchmark")
+        print("  --json      print the full report as JSON instead of tables/plots")
+        print("  --no-c      use the Python core mirror instead of the C99 build")
+        return 0
     USE_PYTHON = '--no-c' in sys.argv
     if '--selftest' in sys.argv:
         selftest()

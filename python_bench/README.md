@@ -10,7 +10,7 @@ vetoes independently of the slow loop.
 
 | Module | Size | Role |
 | :--- | :--- | :--- |
-| [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 20 lines for both helpers) and the SLOT 1..3 integration skeleton |
+| [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 statistical scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 20 lines for both helpers) and the SLOT 1..3 integration skeleton |
 | [gate_template.c](../c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU bare-metal ISR template: 32 B `LayeredProbe_t` (median glitch rejection + cascaded high-pass innovation envelope), `blanking_active` hardware blanking window and the `outer_seq` commit-marker pattern |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B state | 1 kHz zero-dependency ANSI C99 safety arbitration and four-bank anti-windup control micro-kernel; the ABI occupies 96/140/12/40/28 B for state/config/tuning/input/output |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 lines | Level-2 C-MEX S-Function: `DWork` holds the 96 B state, zero global variables, zero dynamic memory, 11 inputs (10-field ABI + ack rising edge) and 7 outputs |
@@ -93,8 +93,10 @@ references and feedforward; it uses fixed feedback toward the safe zero.
 Frame age advances every tick from the source timestamp. With `outer_seq` nonzero the core measures
 age on its own 1 kHz clock: a new sequence opens a fresh lease, an unchanged one ages by one tick,
 and a frozen or forged `outer_age_s` cannot mask a stalled mailbox; 0 selects the legacy age mode.
-Native HOLD retains the applied actuator command and is bounded by `max_hold_ticks`, after which the
-core enters `GATE_SAFE_ZERO` and ramps the command to zero in steps of
+Native HOLD is reached only when the fast input itself is unusable: it retains the applied actuator
+command and is bounded by `max_hold_ticks`. A stale slow mailbox with healthy fast sensors instead
+keeps the 1 kHz loop closed on the fixed R4 law. After the bounded HOLD the core enters
+`GATE_SAFE_ZERO` and ramps the command to zero in steps of
 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` — the one-ULP floor applies only when the
 legal slew budget is below one representable step, so a sub-ULP budget still de-energises in finite
 time. On timeout the adapter sends R4 with zero confidence while retaining the real age; malformed
@@ -134,7 +136,7 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
 | 模块 | 规模 | 职责 |
 | :--- | :--- | :--- |
-| [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
+| [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 个统计标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
 | [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通包络，提取标称模型预测残差（新息））、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四档控制律库抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 行 | Level-2 C-MEX S-Function：`DWork` 持有 96 B 状态，零全局变量、零动态内存，11 输入（10 字段 ABI + 确认上升沿）/ 7 输出 |

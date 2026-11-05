@@ -358,7 +358,7 @@ if o.seq_mode
         s_ood=min(n,max(1,s_center)); ood_burst(s_ood:min(n,s_ood+4))=true;
     end
 end
-CI=zeros(n,(9+double(o.seq_mode))*double(o.log_core));
+CI=zeros(n,10*double(o.log_core));
 CO=zeros(n,7*double(o.log_core));
 CT=zeros(n,3*double(o.log_core)); integrators_finite=true;
 for k=1:n
@@ -377,7 +377,7 @@ for k=1:n
                 skip_start=o.skip_first_frame && mi==1;
                 if ~(o.skip_first_frame && mi==1), ctx_ready=true; end
                 % One committed slow frame, one sequence number.
-                if o.seq_mode, seq=seq+uint32(1); end
+                seq=seq+uint32(1);
                 if ~isempty(P.classifier) && ~skip_start
                     [ai,conf]=classify(ctx,P.classifier);
                     % Temporal persistence: only conf_persist consecutive low
@@ -448,10 +448,10 @@ for k=1:n
         if ood_burst(k), residual=single(2.0); end
         age_in=age(k);
         if o.seq_mode, age_in=single(0); end
-        input=single([mai,ci,age_in,residual,ym,yd,r,rd,uff]);
-        if o.seq_mode
-            if seq_drop(k), input(10)=single(0); else, input(10)=single(seq); end
-        end
+        % Nine physical fields are quantized to binary32; the sequence stays
+        % an exact uint32-valued double so 16777217 cannot round to 16777216.
+        input=[double(single([mai,ci,age_in,residual,ym,yd,r,rd,uff])), double(seq)];
+        if o.seq_mode && seq_drop(k), input(10)=0; end  % injected zero-sequence corruption
         tune=tuning(min(k,size(tuning,1)),:);
         [core,result]=core_step(core,cfg,tune,input);
         integrators_finite=integrators_finite && all(isfinite(core.integ));
@@ -465,10 +465,8 @@ for k=1:n
         % is the applied command.  Gate/regime are not logged for the wrapped
         % baselines, matching the Python reference.
         shell_res=res; if ~o.ood_gate, shell_res=0.; end
-        sh_in=single([1,1,age(k),shell_res,ym,yd,r,rd,u]);
-        if o.seq_mode
-            if seq_drop(k), sh_in(10)=single(0); else, sh_in(10)=single(seq); end
-        end
+        sh_in=[double(single([1,1,age(k),shell_res,ym,yd,r,rd,u])), double(seq)];
+        if o.seq_mode && seq_drop(k), sh_in(10)=0; end
         [shell,sh_out]=core_step(shell,shell_cfg,tune_unit,sh_in);
         integrators_finite=integrators_finite && all(isfinite(shell.integ));
         u=sh_out(1);
@@ -775,6 +773,9 @@ bad=bad || c.dt_s<=0 || c.outer_timeout_s<=0 || c.max_physics_residual<=0 || ...
     c.confidence_clear_ratio<c.min_ai_confidence || c.confidence_clear_ratio>1 || ...
     c.safety_trip_ratio<=0 || c.safety_trip_ratio>1 || c.safety_clear_ratio<0 || ...
     c.safety_clear_ratio>c.safety_trip_ratio;
+% The lease age saturates at UINT32_MAX ticks: a timeout beyond that reach can
+% never trip and is rejected exactly as in the C core.
+bad=bad || c.outer_timeout_s>=single(4294967296)*c.dt_s;
 % The per-tick slew budget is the binary32 product slew * dt: one that
 % underflows to zero cannot be honoured by the SAFE_ZERO quantisation floor and
 % one that overflows makes any command reachable in a single tick, so both are

@@ -87,15 +87,16 @@ so emergency damping is not delayed by transfer smoothing.
 
 The two runtime-assurance layers a derived device must re-calibrate against its own reachable sets
 are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
-guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the split-conformal calibration
-abstention threshold (`q = min(1, ceil((N+1)(1-alpha))/N)` in `auto_calibrate`). Both are
-device-specific: the envelope depends on the actuator's reachable set and detection delay, and the
-conformal threshold depends on the commissioning archive.
+guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the abstention-threshold
+calibration in `auto_calibrate` (the calibration-manifold lower bound times a 0.15 conservative
+safety-margin coefficient in the main benchmark; the off-manifold audit separately uses the
+finite-sample split-conformal 1 % lower-tail order statistic). Both are device-specific: the
+envelope depends on the actuator's reachable set and detection delay, and the confidence threshold
+depends on the commissioning archive.
 
 派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
-加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与分裂共形校准弃权阈值
-（`auto_calibrate` 中的 `q = min(1, ceil((N+1)(1-alpha))/N)`）。两者都与设备相关：包络取决于执行器
-可达集与检测延迟，共形校准阈值取决于标定档案。
+加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与 `auto_calibrate` 的弃权阈值标定
+（主基准用标定流形下界乘以 0.15 保守安全裕度系数；流形外审计另行采用有限样本分裂共形 1% 下尾顺序统计量）。两者都与设备相关：包络取决于执行器可达集与检测延迟，置信度阈值取决于标定档案。
 
 ## Three parallel examples / 三类并列实例
 
@@ -120,8 +121,8 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 1. Define the signals, units, nominal model, controller bank and explicit fallback.
 2. Collect labeled macro-feature windows for `auto_calibrate(samples, labels)`.
-3. Freeze prototypes, distance-decay coefficient and the split-conformal calibration confidence trip/clear levels
-   (order `q = min(1, ceil((N+1)(1-alpha))/N)`).
+3. Freeze prototypes, distance-decay coefficient and the confidence trip/clear levels (the calibration-manifold
+   lower bound times 0.15 in the main benchmark; the off-manifold audit uses the split-conformal 1 % lower-tail order statistic).
 4. Run `auto_field_tune(evaluate, current)` with a device-side safe trial callback.
 
 The callback returns measured cost and constraint validity. Invalid candidates are rejected;
@@ -137,7 +138,7 @@ A new physical domain starts with a new interface and commissioning archive.
 
 1. 定义信号、单位、标称模型、控制器组与显式回退。
 2. 采集带标签的宏观特征窗口，调用 `auto_calibrate(samples, labels)`。
-3. 冻结原型、距离衰减系数与置信度阈值。
+3. 冻结原型、距离衰减系数与置信度触发/清除水平（主基准取标定流形下界乘 0.15；流形外审计使用分裂共形 1% 下尾顺序统计量）。
 4. 挂上设备侧的安全试验回调，运行 `auto_field_tune(evaluate, current)`。
 
 回调返回实测代价与约束是否满足：约束不合格的候选直接淘汰；全部候选都不合格时，

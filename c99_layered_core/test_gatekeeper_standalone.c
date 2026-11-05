@@ -2007,6 +2007,7 @@ static void test_settings_bounds(void)
     rejected += out.corrupted && out.gate == GATE_HOLD_LATENCY; } while (0)
     BAD_SETTING(dt_s, 0.0f); BAD_SETTING(dt_s, -0.001f);
     BAD_SETTING(outer_timeout_s, 0.0f); BAD_SETTING(max_physics_residual, 0.0f);
+    BAD_SETTING(outer_timeout_s, 4294968.0f); /* beyond the uint32 lease reach */
     BAD_SETTING(state_safety_limit, 0.0f); BAD_SETTING(u_max, 0.0f);
     BAD_SETTING(u_slew_max_per_s, 0.0f); BAD_SETTING(blend_alpha, 0.0f);
     BAD_SETTING(blend_alpha, 1.01f); BAD_SETTING(integ_limit, -1.0f);
@@ -2018,7 +2019,7 @@ static void test_settings_bounds(void)
     BAD_SETTING(safety_clear_ratio, -0.01f); BAD_SETTING(safety_clear_ratio, 0.91f);
     BAD_SETTING(max_hold_ticks, 0u);
 #undef BAD_SETTING
-    check(rejected == 23, "settings domains: nonphysical timing, limits, smoothing, ratios and a zero hold budget are rejected");
+    check(rejected == 24, "settings domains: nonphysical timing, limits, smoothing, ratios, unreachable timeout and a zero hold budget are rejected");
     cfg = valid;
     knobs[0] = &tun.gain_scale; knobs[1] = &tun.damping_scale; knobs[2] = &tun.safety_margin_scale;
     for (i = 0; i < 3; ++i) {

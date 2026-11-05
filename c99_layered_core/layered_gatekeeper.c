@@ -344,6 +344,12 @@ static int lg_config_is_corrupt(const LayeredConfig_t *c)
         c->safety_clear_ratio < 0.0f || c->safety_clear_ratio > c->safety_trip_ratio) {
         return 1;
     }
+    /* The lease age saturates at UINT32_MAX ticks.  A timeout beyond that reach
+     * can never trip (dt = 0.001 s, timeout = 4294968 s is the canonical case),
+     * so it is a corrupt configuration rather than a legal long grace window. */
+    if (c->outer_timeout_s >= 4294967296.0f * c->dt_s) {
+        return 1;
+    }
     /* The per-tick slew budget is the binary32 product slew * dt.  A product
      * that underflows to zero cannot be honoured by the quantisation floor of
      * GATE_SAFE_ZERO, and one that overflows makes every command reachable in a
@@ -1091,10 +1097,11 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         out.u_target = state->u_target;
         out.blend = state->blend;
     } else {
-        /* GATE_HOLD_LATENCY holds command, target, blend and integrators;
-         * GATE_SAFE_ZERO reports the forced de-energised output written above.
-         * Dwell bookkeeping still advances; the watchdog re-arms recovery.
-         * A held actuator command does not imply a held physical position. */
+        /* GATE_SAFE_ZERO is the only path here: target and integrators were
+         * cleared above and the de-energised output is reported.  A stale
+         * mailbox with valid fast sensors keeps the loop closed on the fixed R4
+         * bank above; only an unusable fast input returned the held command
+         * earlier.  A held actuator command is not a held physical position. */
         out.u = state->u_applied;
         out.u_target = state->u_target;
         out.blend = state->blend;

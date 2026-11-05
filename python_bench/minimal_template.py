@@ -47,7 +47,9 @@ class Core:
         self.tuning, self.state = Tuning(*tuning), State()
         self.lib.Layered_Init(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning))
     def step(self, ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq):
-        inp = Input(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, int(outer_seq))
+        seq = int(outer_seq)
+        if seq != outer_seq or not 0 <= seq <= 0xFFFFFFFF: raise ValueError("outer_seq must be a uint32 integer")
+        inp = Input(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, seq)
         out = self.lib.Layered_Step(ctypes.byref(self.state), ctypes.byref(self.cfg), ctypes.byref(self.tuning), ctypes.byref(inp))
         return out.u, out.gate, out.regime, out.blend, out.fault_audit_bitmask, out.corrupted, out.u_target
     def acknowledge_fault_latch(self):
@@ -64,8 +66,7 @@ def auto_calibrate(samples, labels):
 def auto_field_tune(evaluate, current=(1, 1, 1)):
     """Six bounded trials; device-side validity includes every operating regime."""
     best, score = current, float("inf")
-    grid = ((.75, 1.), (1., 1.), (1.25, 1.),
-            (2., 1.), (1.25, .5), (1.25, .75))
+    grid = ((.75, 1.), (1., 1.), (1.25, 1.), (2., 1.), (1.25, .5), (1.25, .75))
     for gain, damping in grid:
         candidate = (gain, damping, current[2])
         cost, valid = evaluate(candidate)
@@ -103,8 +104,7 @@ def rollout(cfg, tuning=(1, 1, 1), model=None, damping=.4):
     return error, violations == faults == 0 and error < .02, np.array(samples), (violations, faults)
 def main():
     cfg = dict(zip(FLOAT_FIELDS, (.001, .35, 1., .5, .01, .02, 1., .9, .75, .025, 20., 2000., .3, .5, .1)))
-    # Each safety-envelope or physics-residual veto is one episode; after
-    # max_fault_vetoes_before_latch=3 the permanent latch needs Layered_AcknowledgeFaultLatch().
+    # Each veto is one episode; after 3 the permanent latch needs Layered_AcknowledgeFaultLatch().
     cfg.update(min_dwell_ticks=150, ood_recovery_cooldown_ticks=300, kp=[25,35,12,2], kd=[8,10,8,2], ki=[2,8,1,0], ff_scale=[1,1,1,0],
                max_hold_ticks=100, max_fault_vetoes_before_latch=3)
     # SLOT 3: labeled commissioning observations and a measured, safety-checked trial.

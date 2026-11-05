@@ -240,7 +240,7 @@ typedef char lg_sfun_output_size_check[(sizeof(LayeredOutput_t) == 28) ? 1 : -1]
 /* float32 maximum; larger magnitudes saturate here so the frozen firewall
  * (which rejects anything outside +/-3.0e38) keeps its NaN/Inf semantics.
  * Runtime input signals only: block parameters are validated, never saturated. */
-#define LG_SFUN_FLOAT_MAX 3.402823466e38
+#define LG_SFUN_FLOAT_MAX 3.4028234663852886e38
 
 /* Runtime-signal conversion (input ports only).  A block parameter never takes
  * this path: it is validated element by element and rejected unless it is a

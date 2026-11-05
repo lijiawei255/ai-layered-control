@@ -32,7 +32,7 @@ forced veto from an independent physical residual probe.
 | L0 | Hardware safety channel: an independent safety PLC (ISO 13849 Cat.3/4, 1oo2D), dual-channel sensor cross-check, and hardware STO / IEC 60204-1 Stop 0. |
 | L1 | Deterministic fast inner loop: four-bank PID with full-branch reverse-tracking anti-windup plus nominal feedforward; DOB/ESO/ADRC or bounded adaptive compensation can be added in the control-law slot or via `u_ff`. |
 | L2 | Runtime safety arbitration and degradation chain: 96 B C99 Simplex state machine, 1D ZCBF signed envelope look-ahead, blanking hold, per-axis R4 → SAFE_ZERO → LATCHED_SAFE; multi-axis aggregation of `gate_state` plus a shared ack bus for Stop 1/2. (Under ISO/IEC TR 5469 the physical travel/torque/slew/timeout checks are exact a-priori inequalities, and the main-control AI plus the supervisory AI must not extrapolate blindly together out of distribution; this layer is therefore deterministic code, never a second black-box model.) |
-| L3 | Slow qualitative supervision and conformally calibrated abstention: 10 Hz discrete regime advice plus split-conformal manifold-distance confidence. |
+| L3 | Slow qualitative supervision and calibrated abstention: 10 Hz discrete regime advice plus manifold-distance confidence (split-conformal in the off-manifold audit). |
 | L4 | Fleet lifecycle closure: frozen AI weights during operation, append-only 7-bit fault audit mask as trigger tags for OOD data capture, offline prototype supplementation and safety-case update. |
 
 ## Six field problems and the mechanisms that answer them
@@ -54,16 +54,16 @@ stall at the same point.
 **Mechanism:** Continuous quantitative feedback and trajectory tracking are already carried by the
 four pre-commissioned deterministic controller banks and the nominal feedforward, so the 10 Hz slow
 loop only has to perform coarse discrete regime classification and manifold-distance abstention. It
-therefore needs only qualitative coverage: 36 labeled macro windows, 15 scalars, 60 bytes,
+therefore needs only qualitative coverage: 36 labeled macro windows and 15 statistical scalars (60 bytes), built on the prior four-bank deterministic laws and kinematic filter structure,
 calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime prototypes and the
-confidence thresholds. No GPU and no action labels are involved. The template's built-in 15-scalar
+confidence thresholds. No GPU and no action labels are involved. The template's built-in 15-statistical-scalar
 nearest-centroid classifier and six-point constrained search (`auto_field_tune`) are a
 minimal zero-dependency implementation; in a real machine the same interface can host
 a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another
 classification model. B2 serves as the comparison point that quantifies the data cost of the
 continuous route: it evaluates a continuous action head over **5,664 scalars / 22,656 B** on every
 1 ms tick, whereas this architecture only classifies discrete regimes plus a manifold-distance
-confidence at 10 Hz with a model of **15 scalars / 60 B** — reducing the slow-loop task from 1 kHz
+confidence at 10 Hz with a model of **15 statistical scalars / 60 B** — reducing the slow-loop task from 1 kHz
 continuous regression to 10 Hz discrete classification and cutting both sample complexity and online
 inference compute.
 
@@ -220,8 +220,7 @@ fault-frequency input. Noise, context delay and contact stiffness should have in
 The comparison keeps the baselines at full strength. B1 and B3 share the identical nominal
 inverse-dynamics feedforward, anti-windup and limits, and B1's S2 result remains the lowest raw error
 in the table. B2 runs its action head at the full 1 kHz rate (40,000 inferences, zero fast-loop
-state delay); without an explicit integrator or physical gate it carries larger S2 error, 65.61 N S3
-contact and 680 S4 violation ticks. The rule tree and the prototype classifier agree on the main
+state delay); with its clamped error-integral history feature but no external deterministic PID stabilizer, and no physical gate, it carries larger S2 error, 65.61 N S3 contact and 680 S4 violation ticks. The rule tree and the prototype classifier agree on the main
 S1/S2/S3/S4 results, including the 19.9 N S3 contact peak, but in the off-manifold case the rule tree
 cannot abstain. The layered branch records S4 RMSE 0.534138 rad with TV 1528.1 N·m and zero S4
 violations, while B1 keeps the lower raw S2 error; these observations define the interpretation of

@@ -46,8 +46,8 @@
  * promoting to a wider type, so a single-precision FPU never calls into the
  * __aeabi_d* software library.
  *
- * Purely a reference implementation for the benchmark in ../matlab_simulink/:
- * it is hardware independent and unit tested by test_gatekeeper_standalone.c.
+ * Deterministic C99 runtime-assurance and authority-arbitration core:
+ * hardware independent and unit tested by test_gatekeeper_standalone.c.
  * ---------------------------------------------------------------------------
  */
 
@@ -55,6 +55,10 @@
 #define LAYERED_GATEKEEPER_H
 
 #include <stdint.h>
+
+#if defined(__FAST_MATH__)
+#error "layered_gatekeeper requires strict IEEE-754 NaN/Inf semantics; do not compile with -ffast-math."
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -27,11 +27,11 @@ float LayeredProbe_Step(LayeredProbe_t *p, float raw, int blanking_active)
 {
     float a, b, c, med, innov1, innov2, mag1, mag2;
     if (blanking_active) {
-        /* Scheduled artefact (stimulation pulse, commutation edge): freeze every
-         * state and hold the residual. Zero-order hold, not zero: an elevated
-         * residual must stay latched so one sustained fault is not fragmented. */
+        /* Scheduled artefact: freeze every state and hold the residual (ZOH). */
         return p->residual;
     }
+    /* A non-finite sample is reported, never folded into the IIR history. */
+    if (!(raw >= -3.402823466e38f && raw <= 3.402823466e38f)) return raw;
     /* 3-point median: a one-tick EMI glitch cannot seed the IIR section. */
     a = raw;
     b = p->h0;
