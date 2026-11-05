@@ -25,7 +25,7 @@
  *   slow outer loop (10 Hz, any Linux/Android/edge accelerator)
  *        |  mailbox: regime in {1,2,3}, confidence in [0,1], heartbeat
  *        v
- *   THIS MODULE (1 kHz, deterministic, 88 B state + 132 B config + 12 B tuning)
+ *   THIS MODULE (1 kHz, deterministic, 96 B state + 140 B config + 12 B tuning)
  *        - fast-input firewall; bad slow mailboxes/tuning request closed-loop R4
  *        - heartbeat watchdog: survives 10 Hz jitter / dropped frames
  *        - physics-residual + confidence veto: explicit ABSTENTION
@@ -71,7 +71,13 @@ typedef enum {
     GATE_HOLD_LATENCY          = 1, /* stale heartbeat or unusable fast input  */
     GATE_VETO_OOD_RESIDUAL     = 2, /* physics innovation too large: ABSTAIN    */
     GATE_VETO_LOW_CONFIDENCE   = 3, /* AI self-confidence too low: ABSTAIN     */
-    GATE_VETO_SAFETY_ENVELOPE  = 4  /* state at/approaching hard safety limit  */
+    GATE_VETO_SAFETY_ENVELOPE  = 4, /* state at/approaching hard safety limit  */
+    GATE_SAFE_ZERO             = 5, /* native HOLD ran past its budget:        */
+                                    /* command ramped to zero (slew-limited),  */
+                                    /* integrators cut                         */
+    GATE_LATCHED_SAFE          = 6  /* cumulative severe faults: permanently   */
+                                    /* locked in R4 until an explicit external */
+                                    /* acknowledgement re-arms the AI         */
 } layered_gate_state_t;
 
 /* ------------------------------------------------------------------------- */
@@ -84,6 +90,8 @@ typedef enum {
 #define LAYERED_FAULT_BIT_LOW_CONFIDENCE   ((uint32_t)1u << 2)
 #define LAYERED_FAULT_BIT_ENVELOPE_BREACH  ((uint32_t)1u << 3)
 #define LAYERED_FAULT_BIT_NAN_CORRUPTION   ((uint32_t)1u << 4)
+#define LAYERED_FAULT_BIT_HOLD_TIMEOUT     ((uint32_t)1u << 5)
+#define LAYERED_FAULT_BIT_PERMANENT_LATCH  ((uint32_t)1u << 6)
 
 /* ------------------------------------------------------------------------- */
 /* On-site field calibration: the ONLY three numbers a technician touches    */
@@ -135,6 +143,16 @@ typedef struct {
     float ki[LAYERED_NUM_REGIMES];
     float ff_scale[LAYERED_NUM_REGIMES]; /* normal-bank feedforward scaling;    */
                                          /* index 3 is reserved, R4 ignores it  */
+
+    uint32_t max_hold_ticks;    /* maximum consecutive native HOLD ticks;      */
+                                /* beyond it the core forces GATE_SAFE_ZERO;   */
+                                /* must be > 0 and < UINT32_MAX, otherwise the */
+                                /* configuration is invalid (the counter       */
+                                /* saturates, so UINT32_MAX never times out)   */
+    uint32_t max_fault_vetoes_before_latch; /* safety+OOD veto EPISODES (since  */
+                                /* Layered_Init or the last acknowledgement)   */
+                                /* that latch GATE_LATCHED_SAFE; 0 disables    */
+                                /* the cumulative permanent latch              */
 } LayeredConfig_t;
 
 /* ------------------------------------------------------------------------- */
@@ -152,6 +170,8 @@ typedef struct {
     float u_ff;             /* deterministic feedforward command produced by  */
                             /* the commissioning model / trajectory generator */
                             /* (0.0 when the plant has no feedforward term)   */
+    uint32_t outer_seq;     /* slow-frame sequence number; 0 = not sequenced, */
+                            /* outer_age_s is authoritative                   */
 } LayeredInput_t;
 
 /* ------------------------------------------------------------------------- */
@@ -178,9 +198,10 @@ typedef struct {
     float blend;                 /* bumpless-transfer progress in [0,1]         */
     int control_started;         /* 0 until the first clean control step        */
     layered_regime_t regime;     /* last effective regime                       */
-    int ood_latched;             /* sticky OOD veto                             */
-    int safety_latched;          /* sticky safety-envelope veto                 */
-    int conf_latched;            /* sticky low-confidence veto                  */
+    uint8_t ood_latched;         /* sticky OOD veto                             */
+    uint8_t safety_latched;      /* sticky safety-envelope veto                 */
+    uint8_t conf_latched;        /* sticky low-confidence veto                  */
+    uint8_t permanent_latched;   /* cumulative-fault latch, cleared by the API  */
     uint32_t dwell_ticks;        /* ticks since the last normal regime change   */
     uint32_t recovery_ticks;     /* remaining clean ticks in recovery cooldown  */
     uint32_t fault_audit_bitmask;/* sticky root-cause flags                     */
@@ -190,6 +211,12 @@ typedef struct {
     uint32_t low_confidence_veto_count;
     uint32_t latency_hold_count;
     uint32_t corrupted_frame_count;
+    uint32_t hold_ticks;         /* consecutive ticks in GATE_HOLD_LATENCY      */
+    uint32_t last_outer_seq;     /* last accepted slow-frame sequence number    */
+    uint32_t outer_age_ticks;    /* locally measured slow-frame age, in ticks   */
+    uint32_t latch_episode_count;/* new safety+OOD veto episodes since          */
+                                 /* Layered_Init or the last acknowledgement;   */
+                                 /* drives the cumulative permanent latch       */
 } LayeredState_t;
 
 /* ------------------------------------------------------------------------- */
@@ -222,6 +249,14 @@ void Layered_Init(LayeredState_t *state,
  *    corrupted_frame_count and re-arm recovery cooldown.
  *    ai_regime == 4 is *not* corruption: it is an explicit AI abstention and
  *    is handled as GATE_VETO_LOW_CONFIDENCE.
+ *    A native HOLD counts consecutive held ticks in state->hold_ticks. The
+ *    corrupt-frame path (invalid fast sensor, or invalid configuration with its
+ *    fixed LAYERED_CORRUPT_CONFIG_MAX_HOLD_TICKS = 100 budget) escalates to
+ *    GATE_SAFE_ZERO past the budget: target and integrators are cleared, the
+ *    command is ramped to zero under the commissioned slew limit (immediately
+ *    zeroed when the slew configuration itself is untrusted), and
+ *    HOLD_TIMEOUT plus PERMANENT_LATCH latch. A stale heartbeat (section d)
+ *    uses config->max_hold_ticks and latches HOLD_TIMEOUT only.
  *
  * 1. DECISION PRIORITY (highest first, evaluated every clean step):
  *      a) GATE_VETO_SAFETY_ENVELOPE : |x| > safety_trip_ratio*limit_eff, or
@@ -240,7 +275,18 @@ void Layered_Init(LayeredState_t *state,
  *         The last *applied* command is held; this does not hold position.
  *         Integrators/target/blend hold; dwell advances and recovery re-arms.
  *         -> latches LAYERED_FAULT_BIT_LATENCY_TIMEOUT.
+ *         After max_hold_ticks consecutive HOLD ticks the decision escalates
+ *         to GATE_SAFE_ZERO: u_target = 0, all integrators cleared, the
+ *         command ramped to zero under the commissioned slew rate, and
+ *         HOLD_TIMEOUT latches (a heartbeat-only timeout never arms the
+ *         permanent latch). No controller runs while the fault persists.
  *      e) GATE_NORMAL               : AI regime accepted.
+ *    A cumulative permanent latch (max_fault_vetoes_before_latch > 0) beats
+ *    all of the above: once the configured number of safety/OOD veto EPISODES
+ *    has accumulated, the gate reports GATE_LATCHED_SAFE, the regime is
+ *    REGIME_SAFE_FALLBACK and only Layered_AcknowledgeFaultLatch() releases
+ *    the core. Cleared residual/envelope conditions or an expired recovery
+ *    cooldown do not release it.
  *    All vetoes are emergency transitions and bypass the dwell timer.
  *
  * 2. ANTI-CHATTER DWELL TIME
@@ -257,6 +303,25 @@ void Layered_Init(LayeredState_t *state,
  *    REGIME_SAFE_FALLBACK (gate GATE_NORMAL, no veto) until that many
  *    CONSECUTIVE clean samples have elapsed; only then is the AI regime
  *    switching re-enabled.  A single clean tick is never enough.
+ *
+ * 3b. LOCAL FRAME LEASE (outer_seq)
+ *    With input->outer_seq != 0 the slow-frame age is measured by the L1 clock
+ *    instead of the transported outer_age_s: a changed sequence number opens a
+ *    fresh lease (outer_age_ticks = 0), an unchanged one ages it by one inner
+ *    period. A forged or frozen outer_age_s therefore cannot mask a stalled
+ *    mailbox.  If the sequence was active and suddenly reads 0, the mailbox is
+ *    treated as anomalous and the core runs closed-loop R4.  With outer_seq
+ *    always 0 the legacy outer_age_s mode is used unchanged.
+ *
+ * 3c. CUMULATIVE SEVERE-FAULT LATCH
+ *    When max_fault_vetoes_before_latch > 0, the safety/OOD veto EPISODE that
+ *    brings state->latch_episode_count to the configured threshold sets
+ *    permanent_latched and latches PERMANENT_LATCH.  latch_episode_count
+ *    counts only episodes since Layered_Init or the last successful
+ *    Layered_AcknowledgeFaultLatch, so an acknowledgement restores the full
+ *    tolerance.  safety_veto_count / ood_veto_count remain lifetime audit
+ *    history and are never reset by the latch API; they therefore cannot
+ *    re-arm the latch by themselves.
  *
  * 4. CONTROLLER BANK + ANTI-WINDUP + BUMPLESS TRANSFER
  *    u_pid[i] = kp[i]*e + kd[i]*ed + ki[i]*integ[i] + ff_scale[i]*u_ff
@@ -276,13 +341,34 @@ void Layered_Init(LayeredState_t *state,
  *    On the first clean control step the pre-clamp target snaps to the active
  *    bank output and blend = 1, so the command does not ramp up from zero.
  *    On later steps it follows u_pid[i] through a first-order filter with
- *    coefficient blend_alpha, and a bank switch restarts blend at 0.  Finally
- *    the command is hard clamped in magnitude and slew rate.
+ *    coefficient blend_alpha, and a bank switch restarts blend at 0.
+ *    EMERGENCY BYPASS: while a veto is active (or the permanent latch is set)
+ *    and the active regime is REGIME_SAFE_FALLBACK, the blend filter is
+ *    bypassed: the target is the R4 bank output directly and blend = 1.  This
+ *    removes the first-order phase lag from the emergency damping response.
+ *    The magnitude and slew limits below still apply to every command.
+ *    Finally the command is hard clamped in magnitude and slew rate.
  */
 LayeredOutput_t Layered_Step(LayeredState_t *state,
                              const LayeredConfig_t *config,
                              const FieldTuning_t *tuning,
                              const LayeredInput_t *input);
+
+/* External acknowledgement of a permanent safe latch.
+ *
+ * Checks the pointers and the configuration (same validity rules as
+ * Layered_Step) and, on success, clears the three independent veto latches
+ * (envelope, residual, low confidence) plus permanent_latched, hold_ticks and
+ * latch_episode_count, and re-arms the recovery cooldown
+ * (ood_recovery_cooldown_ticks) so the AI cannot be re-armed on the
+ * very next tick.  fault_audit_bitmask, step_count and all *_veto_count
+ * counters are AUDIT HISTORY and are never cleared here; resetting the
+ * episode counter is what gives the unit its full max_fault_vetoes_before_latch
+ * tolerance after a field acknowledgement.
+ *
+ * Returns 1 when the latch was released, 0 for a null/corrupt argument. */
+int Layered_AcknowledgeFaultLatch(LayeredState_t *state,
+                                  const LayeredConfig_t *config);
 
 /* Human-readable names for logs / test harness (never NULL). */
 const char *Layered_GateName(layered_gate_state_t gate);

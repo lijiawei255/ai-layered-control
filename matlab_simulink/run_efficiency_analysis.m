@@ -29,6 +29,13 @@ for j=1:2
     drift=[.35 .5]; drift=drift(j); started=tic;
     [candidates,knobs]=search(P,drift,3);
     [b1_candidates,b1_knobs]=search(P,drift,1);
+    % Equal six-candidate budget for B1.  The deployment knobs are only
+    % updated by a candidate that satisfies the same joint constraints as B3,
+    % so with no feasible candidate the commissioned (1,1,1) is retained
+    % (the Python tuning_study contract).  The lowest-cost trial is still kept
+    % separately: it is the Figure-2 counterfactual, not an accepted tuning.
+    b1_valid=cellfun(@(a) a.valid,b1_candidates);
+    if ~any(b1_valid), b1_knobs=[1 1 1]; end
     b1_costs=cellfun(@(a) a.score,b1_candidates); [~,best_b1]=min(b1_costs);
     b1_best_knobs=b1_candidates{best_b1}.knobs;
     valid=struct('branches',[1 3],'scenario',1,'duration',6,'seed',811, ...
@@ -52,7 +59,10 @@ for j=1:2
 end
 p=P.policy; E.model_scalars=numel(p.mu)+numel(p.sd)+numel(p.centers)+numel(p.w)+1;
 E.model_fp64_bytes=8*E.model_scalars; E.model_fp32_bytes=4*E.model_scalars;
-E.classifier_scalars=15; E.state_bytes=88; E.config_bytes=132; E.tuning_bytes=12;
+% Storage categories are reported separately: trained model, supervisor,
+% and the per-axis deterministic core ABI (LayeredState_t / LayeredConfig_t /
+% FieldTuning_t).
+E.classifier_scalars=15; E.state_bytes=96; E.config_bytes=140; E.tuning_bytes=12;
 feature=zeros(1,9); checksum=0; started=tic;
 for j=1:10000
     z=(feature-p.mu)./p.sd; phi=exp(-sum((p.centers-z).^2,2)/(2*p.width^2));

@@ -43,6 +43,7 @@ build/
 *.slx~
 *.mdl~
 *.bak
+matlab_crash_dump*
 
 # --- C / native build artefacts -------------------------------------------
 *.exe
@@ -53,7 +54,9 @@ build/
 *.so
 *.dylib
 *.lib
+*.a
 *.exp
+*.def
 *.pdb
 *.ilk
 *.stackdump
@@ -63,10 +66,21 @@ a.out
 # --- Cross-platform test / equivalence / scratch artefacts ----------------
 c99_layered_core/test_gatekeeper_standalone
 c99_layered_core/verify_core_equivalence
+c99_layered_core/gate_template
 c99_layered_core/*.bin
 c99_layered_core/*.csv
 matlab_simulink/*.bin
 matlab_simulink/*.csv
+# Benchmark result JSON and run logs
+*.json
+*.log
+# Simulink S-Function build products (suffix-less on Windows is *.mexw64)
+simulink_sfunc/*.mex*
+simulink_sfunc/*.obj
+simulink_sfunc/*.o
+simulink_sfunc/*.lib
+simulink_sfunc/*.exp
+simulink_sfunc/*.pdb
 
 # --- Local IDE / AI-agent / OS files ---------------------------------------
 .vscode/
@@ -74,6 +88,7 @@ matlab_simulink/*.csv
 .cursor/
 .deepseek/
 .claude/
+.codex/
 .DS_Store
 Thumbs.db
 desktop.ini
@@ -82,7 +97,9 @@ desktop.ini
 
 # --- Intermediates produced while rebuilding the Simulink package ----------
 *.slx.zip
+*.zip
 *.zip.tmp
+*.tmp
 
 # --- Local scratch space used while iterating on the benchmark -------------
 _scratch/

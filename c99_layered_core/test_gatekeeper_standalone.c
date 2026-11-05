@@ -8,7 +8,7 @@
  * ---------------------------------------------------------------------------
  * Deterministic standalone regression test for layered_gatekeeper.c.
  *
- *   gcc -std=c99 -pedantic -Wall -Wextra -O2 -o test_gatekeeper_standalone.exe
+ *   gcc -std=c99 -pedantic -Wall -Wextra -Werror -O2 -o test_gatekeeper_standalone.exe
  *       layered_gatekeeper.c test_gatekeeper_standalone.c
  *   ./test_gatekeeper_standalone.exe        exit code 0 = every check passed
  *
@@ -25,6 +25,13 @@
  *   stage 6   anti-chatter dwell, recovery cooldown, sticky fault audit bits
  *   stage 7   NaN/Inf/out-of-range IPC firewall
  *   stage 8   tracking anti-windup across a saturated bank switch
+ *   stage 10  deterministic feedforward u_ff
+ *   stage 11  sticky confidence veto
+ *   stage 12  first-step snap, latency cooldown, per-bank ff_scale
+ *   phase A   bounded HOLD -> slew-limited GATE_SAFE_ZERO incl. corrupt-config
+ *             de-energise (A1), cumulative latch + explicit acknowledgement and
+ *             post-ack episode-quota re-arm (A2), local outer_seq frame lease
+ *             (A3), emergency R4 blend bypass (A4)
  * ---------------------------------------------------------------------------
  */
 
@@ -66,6 +73,28 @@ static void check(int ok, const char *fmt, ...)
 static float t_absf(float v)
 {
     return (v < 0.0f) ? -v : v;
+}
+
+/* Finite binary32 check without <math.h>: NaN fails v == v, and +/-Inf makes
+ * (v - v) NaN, which fails the second test. */
+static int t_is_finite(float v)
+{
+    return (v == v) && ((v - v) == 0.0f);
+}
+
+/* Fully initialised frames: the legacy scenarios fill the nine physical
+ * fields and leave outer_seq at 0 (no local sequence lease).  Spelling every
+ * field out keeps -Wmissing-field-initializers quiet on strict compilers. */
+static LayeredInput_t zero_input(void)
+{
+    LayeredInput_t in = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0u};
+    return in;
+}
+
+static LayeredOutput_t zero_output(void)
+{
+    LayeredOutput_t out = {0.0f, 0.0f, GATE_NORMAL, REGIME_NOMINAL, 0.0f, 0u, 0};
+    return out;
 }
 
 /* ========================================================================= */
@@ -158,6 +187,8 @@ static void build_config(LayeredConfig_t *c)
 
     c->min_dwell_ticks = 150u;
     c->ood_recovery_cooldown_ticks = 500u;
+    c->max_hold_ticks = 100u;
+    c->max_fault_vetoes_before_latch = 3u;
 
     c->kp[0] = 1.20f;
     c->kp[1] = 0.90f;
@@ -198,8 +229,9 @@ static void print_header(const LayeredConfig_t *c)
     printf("       u_max=%.2f slew=%.1f/s alpha=%.3f integ_limit=%.2f windup_tau=%.3f s\n",
            (double)c->u_max, (double)c->u_slew_max_per_s, (double)c->blend_alpha,
            (double)c->integ_limit, (double)c->windup_tau_s);
-    printf("       dwell=%u ticks  recovery_cooldown=%u ticks\n",
-           (unsigned)c->min_dwell_ticks, (unsigned)c->ood_recovery_cooldown_ticks);
+    printf("       dwell=%u ticks  recovery_cooldown=%u ticks  max_hold=%u ticks  latch_after=%u veto episodes\n",
+           (unsigned)c->min_dwell_ticks, (unsigned)c->ood_recovery_cooldown_ticks,
+           (unsigned)c->max_hold_ticks, (unsigned)c->max_fault_vetoes_before_latch);
     printf("       kp=%.2f/%.2f/%.2f/%.2f  kd=%.2f/%.2f/%.2f/%.2f  ki=%.2f/%.2f/%.2f/%.2f\n",
            (double)c->kp[0], (double)c->kp[1], (double)c->kp[2], (double)c->kp[3],
            (double)c->kd[0], (double)c->kd[1], (double)c->kd[2], (double)c->kd[3],
@@ -244,7 +276,7 @@ static LayeredOutput_t step_checked(inv_t *inv,
 
     out = Layered_Step(st, cfg, tun, in);
 
-    if (!(out.u == out.u) || !(out.u_target == out.u_target) || !(out.blend == out.blend)) {
+    if (!t_is_finite(out.u) || !t_is_finite(out.u_target) || !t_is_finite(out.blend)) {
         inv->nan_count++;
         bad = 1;
     }
@@ -371,7 +403,7 @@ static void test_mission(void)
 
     for (k = 0; k < MISSION_STEPS; ++k) {
         double t = (double)k * (double)cfg.dt_s;
-        LayeredInput_t in;
+        LayeredInput_t in = zero_input();
         float r;
         float r_dot;
         float x_dot;
@@ -628,7 +660,7 @@ static void run_tracking(const LayeredConfig_t *cfg,
                          inv_t *inv)
 {
     LayeredState_t st;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     sine_gen_t ref;
     int k;
@@ -685,6 +717,8 @@ static void test_tuning_gain(void)
 
     inv_reset(&inv);
     run_tracking(&cfg, &t_low, TRACK_STEPS, 0.60f, 0, 0, &mean_low, &inv);
+    check(inv.violations == 0,
+          "stage 5: the actuator invariants hold on the first gain_scale sweep");
     inv_reset(&inv);
     run_tracking(&cfg, &t_high, TRACK_STEPS, 0.60f, 0, 0, &mean_high, &inv);
 
@@ -716,6 +750,8 @@ static void test_tuning_damping(void)
 
     inv_reset(&inv);
     run_tracking(&cfg, &t_soft, TRACK_STEPS, 0.60f, u_soft, ed_log, &mean_soft, &inv);
+    check(inv.violations == 0,
+          "stage 5: the actuator invariants hold on the first damping_scale sweep");
     inv_reset(&inv);
     run_tracking(&cfg, &t_stiff, TRACK_STEPS, 0.60f, u_stiff, ed_log, &mean_stiff, &inv);
 
@@ -741,7 +777,7 @@ static void test_tuning_damping(void)
 static int run_safety_ramp(const LayeredConfig_t *cfg, const FieldTuning_t *tun)
 {
     LayeredState_t st;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     inv_t inv;
     int k;
@@ -802,7 +838,7 @@ static void test_dwell(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     sine_gen_t ref;
     int k;
@@ -882,7 +918,7 @@ static void test_recovery_cooldown(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int k;
     int fallback_ticks = 0;
@@ -970,8 +1006,8 @@ static void test_firewall(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t good;
-    LayeredInput_t bad;
+    LayeredInput_t good = zero_input();
+    LayeredInput_t bad = zero_input();
     LayeredOutput_t out;
     float integ_snapshot[LAYERED_NUM_REGIMES];
     float saved_u;
@@ -1100,7 +1136,7 @@ static void test_antiwindup(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int k;
     float u_before;
@@ -1190,7 +1226,7 @@ static void priority_case(const char *what,
     LayeredState_t st;
     LayeredConfig_t cfg;
     FieldTuning_t tun;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
 
     build_config(&cfg);
@@ -1238,7 +1274,7 @@ static void test_api(void)
     LayeredState_t st;
     LayeredConfig_t cfg;
     FieldTuning_t tun;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int i;
     int integ_zero = 1;
@@ -1256,13 +1292,14 @@ static void test_api(void)
     check(st.initialized == 1 && st.regime == REGIME_NOMINAL,
           "api: Layered_Init leaves the core initialised in %s", Layered_RegimeName(st.regime));
     check(st.ood_latched == 0 && st.safety_latched == 0 && st.conf_latched == 0 &&
-          st.fault_audit_bitmask == 0u,
-          "api: Layered_Init clears the safety/OOD/confidence latches and the fault audit bitmask");
+          st.permanent_latched == 0u && st.fault_audit_bitmask == 0u,
+          "api: Layered_Init clears the safety/OOD/confidence/permanent latches and the fault audit bitmask");
     check(st.u_applied == 0.0f && st.u_target == 0.0f && st.blend == 0.0f && integ_zero != 0,
           "api: Layered_Init zeroes the command, the blend and every integrator");
     check(st.dwell_ticks == 0u && st.recovery_ticks == 0u && st.step_count == 0u &&
-          st.corrupted_frame_count == 0u,
-          "api: Layered_Init zeroes the dwell/recovery/step/corruption counters");
+          st.corrupted_frame_count == 0u && st.hold_ticks == 0u &&
+          st.last_outer_seq == 0u && st.outer_age_ticks == 0u,
+          "api: Layered_Init zeroes the dwell/recovery/step/corruption/hold/sequence counters");
     check(st.safety_veto_count == 0u && st.ood_veto_count == 0u &&
           st.low_confidence_veto_count == 0u && st.latency_hold_count == 0u,
           "api: Layered_Init zeroes every veto counter");
@@ -1271,16 +1308,19 @@ static void test_api(void)
           Layered_GateName(GATE_VETO_OOD_RESIDUAL) != 0 &&
           Layered_GateName(GATE_VETO_LOW_CONFIDENCE) != 0 &&
           Layered_GateName(GATE_VETO_SAFETY_ENVELOPE) != 0 &&
+          Layered_GateName(GATE_SAFE_ZERO) != 0 &&
+          Layered_GateName(GATE_LATCHED_SAFE) != 0 &&
           Layered_RegimeName(REGIME_NOMINAL) != 0 &&
           Layered_RegimeName(REGIME_HIGH_LOAD_DAMPED) != 0 &&
           Layered_RegimeName(REGIME_BOUNDARY_COMPLIANT) != 0 &&
           Layered_RegimeName(REGIME_SAFE_FALLBACK) != 0,
           "api: every gate/regime has a human-readable name");
-    printf("       names: %s | %s | %s | %s | %s\n",
+    printf("       names: %s | %s | %s | %s | %s | %s | %s\n",
            Layered_GateName(GATE_NORMAL), Layered_GateName(GATE_HOLD_LATENCY),
            Layered_GateName(GATE_VETO_OOD_RESIDUAL),
            Layered_GateName(GATE_VETO_LOW_CONFIDENCE),
-           Layered_GateName(GATE_VETO_SAFETY_ENVELOPE));
+           Layered_GateName(GATE_VETO_SAFETY_ENVELOPE),
+           Layered_GateName(GATE_SAFE_ZERO), Layered_GateName(GATE_LATCHED_SAFE));
 
     /* self-healing: a caller that forgot Layered_Init() */
     st.initialized = 0;
@@ -1295,6 +1335,7 @@ static void test_api(void)
     st.ood_latched = 0;
     st.safety_latched = 0;
     st.conf_latched = 0;
+    st.permanent_latched = 0u;
     st.dwell_ticks = 0u;
     st.recovery_ticks = 0u;
     st.fault_audit_bitmask = 0u;
@@ -1304,6 +1345,9 @@ static void test_api(void)
     st.low_confidence_veto_count = 0u;
     st.latency_hold_count = 0u;
     st.corrupted_frame_count = 0u;
+    st.hold_ticks = 0u;
+    st.last_outer_seq = 0u;
+    st.outer_age_ticks = 0u;
 
     in.ai_regime = 1.0f;
     in.ai_confidence = 0.95f;
@@ -1342,7 +1386,7 @@ static float run_ff_steady(const LayeredConfig_t *cfg,
                            inv_t *inv)
 {
     LayeredState_t st;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int k;
 
@@ -1402,6 +1446,8 @@ static void test_feedforward(void)
     /* run C: u_ff needs two slew-limited ticks -> the integrator absorbs that
      * startup transient (normal for tracking anti-windup), so the offset is
      * u_ff up to a small residual. */
+    check(inv.violations == 0,
+          "stage 10 feedforward: the actuator invariants hold on the middle feedforward level (u_ff=0.15)");
     inv_reset(&inv);
     u_ff_big = run_ff_steady(&cfg, &tun, 0.35f, 600, &st, &out, &inv);
     check(t_absf((u_ff_big - u_no_ff) - 0.35f) <= 0.01f,
@@ -1441,7 +1487,7 @@ static void test_confidence_latch(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int k;
 
@@ -1531,8 +1577,8 @@ static void test_first_control_step(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     inv_t inv;
-    LayeredInput_t in;
-    LayeredInput_t bad;
+    LayeredInput_t in = zero_input();
+    LayeredInput_t bad = zero_input();
     LayeredOutput_t out;
 
     build_config(&cfg);
@@ -1584,7 +1630,7 @@ static void test_cooldown_latency(void)
     FieldTuning_t tun;
     LayeredState_t st;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int i;
     int fallback_ticks = 0;
@@ -1668,7 +1714,7 @@ static void test_ff_scale(void)
     FieldTuning_t tun;
     LayeredState_t st;
     inv_t inv;
-    LayeredInput_t in;
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int i;
 
@@ -1718,7 +1764,7 @@ static void test_settings_and_clamp(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     LayeredState_t st;
-    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f};
+    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0u};
     LayeredOutput_t out;
     float *fields[34];
     int n = 0, i, j, rejected = 0, fallback = 0;
@@ -1761,8 +1807,8 @@ static void test_settings_and_clamp(void)
     }
     check(rejected == 62, "config firewall: 31 floating fields reject NaN and Inf while holding state");
     check(fallback == 6, "tuning firewall: three NaN/Inf knobs enter closed-loop R4");
-    check(sizeof(LayeredState_t) == 88 && sizeof(LayeredConfig_t) == 132 &&
-          sizeof(FieldTuning_t) == 12, "binary contract: state/config/tuning = 88/132/12 bytes");
+    check(sizeof(LayeredState_t) == 96 && sizeof(LayeredConfig_t) == 140 &&
+          sizeof(FieldTuning_t) == 12, "binary contract: state/config/tuning = 96/140/12 bytes");
     Layered_Init(&st, &cfg, &tun);
     st.control_started = 1; st.u_applied = 1.0f; st.u_target = 1.0f;
     cfg.kp[0] = 1.0e38f; cfg.kd[0] = -1.0e38f;
@@ -1783,8 +1829,8 @@ static void test_mailbox_fallback(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     LayeredState_t st;
-    LayeredInput_t good = {1.0f, 0.95f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 5.0f, 100.0f};
-    LayeredInput_t in;
+    LayeredInput_t good = {1.0f, 0.95f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 5.0f, 100.0f, 0u};
+    LayeredInput_t in = zero_input();
     LayeredOutput_t out;
     int i, k, accepted = 0, continuous = 0, cooldown = 0;
     float peak, velocity;
@@ -1859,7 +1905,7 @@ static void test_settings_bounds(void)
     LayeredConfig_t cfg, valid;
     FieldTuning_t tun;
     LayeredState_t st;
-    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, -0.02f, -0.03f, -0.05f, -0.01f, -0.01f};
+    LayeredInput_t in = {1.0f, 0.95f, 0.0f, 0.0f, -0.02f, -0.03f, -0.05f, -0.01f, -0.01f, 0u};
     LayeredOutput_t out;
     float *knobs[3];
     float upper[3] = {4.0f, 4.0f, 1.0f};
@@ -1880,8 +1926,9 @@ static void test_settings_bounds(void)
     BAD_SETTING(confidence_clear_ratio, 0.44f); BAD_SETTING(confidence_clear_ratio, 1.01f);
     BAD_SETTING(safety_trip_ratio, 0.0f); BAD_SETTING(safety_trip_ratio, 1.01f);
     BAD_SETTING(safety_clear_ratio, -0.01f); BAD_SETTING(safety_clear_ratio, 0.91f);
+    BAD_SETTING(max_hold_ticks, 0u);
 #undef BAD_SETTING
-    check(rejected == 22, "settings domains: nonphysical timing, limits, smoothing and ratios are rejected");
+    check(rejected == 23, "settings domains: nonphysical timing, limits, smoothing, ratios and a zero hold budget are rejected");
     cfg = valid;
     knobs[0] = &tun.gain_scale; knobs[1] = &tun.damping_scale; knobs[2] = &tun.safety_margin_scale;
     for (i = 0; i < 3; ++i) {
@@ -1906,9 +1953,9 @@ static void test_settings_bounds(void)
     out = Layered_Step(&st, &cfg, &tun, &in);
     check(out.corrupted && out.gate == GATE_HOLD_LATENCY,
           "fast firewall: residual alone must be nonnegative");
-    check(sizeof(LayeredState_t) == 88 && sizeof(LayeredConfig_t) == 132 &&
-          sizeof(FieldTuning_t) == 12 && sizeof(LayeredInput_t) == 36 && sizeof(LayeredOutput_t) == 28,
-          "binary contract: state/config/tuning/input/output = 88/132/12/36/28 bytes");
+    check(sizeof(LayeredState_t) == 96 && sizeof(LayeredConfig_t) == 140 &&
+          sizeof(FieldTuning_t) == 12 && sizeof(LayeredInput_t) == 40 && sizeof(LayeredOutput_t) == 28,
+          "binary contract: state/config/tuning/input/output = 96/140/12/40/28 bytes");
 }
 
 static void test_safe_bank_and_r3(void)
@@ -1916,8 +1963,8 @@ static void test_safe_bank_and_r3(void)
     LayeredConfig_t cfg;
     FieldTuning_t low, high;
     LayeredState_t a, b;
-    LayeredInput_t ia = {4.0f, 1.0f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 10.0f, 100.0f};
-    LayeredInput_t ib;
+    LayeredInput_t ia = {4.0f, 1.0f, 0.0f, 0.0f, 0.2f, 0.1f, 20.0f, 10.0f, 100.0f, 0u};
+    LayeredInput_t ib = zero_input();
     LayeredOutput_t oa, ob;
     float expected;
     int k, same = 1;
@@ -1956,7 +2003,7 @@ static void test_runtime_tuning_faults(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun, nominal;
     LayeredState_t st, reference;
-    LayeredInput_t in, ref_in;
+    LayeredInput_t in = zero_input(), ref_in = zero_input();
     LayeredOutput_t out, ref_out;
     int fault, k, bank;
     build_config(&cfg);
@@ -2022,8 +2069,8 @@ static void test_counter_boundaries(void)
     LayeredConfig_t cfg;
     FieldTuning_t tun;
     LayeredState_t st;
-    LayeredInput_t in = {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f};
-    LayeredInput_t bad;
+    LayeredInput_t in = {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0u};
+    LayeredInput_t bad = zero_input();
     LayeredOutput_t out;
     int i, immediate = 0;
     build_config(&cfg);
@@ -2058,6 +2105,11 @@ static void test_counter_boundaries(void)
           "counter boundary: maximum dwell threshold accepts a saturated count");
 
     build_config(&cfg); cfg.ood_recovery_cooldown_ticks = 0u;
+    /* This block exercises saturating audit counters and the original gate
+     * priority chain; the cumulative permanent latch has its own dedicated
+     * regression below, so it is disabled here to keep the counters/bitmask
+     * expectations focused on saturation arithmetic. */
+    cfg.max_fault_vetoes_before_latch = 0u;
     in.ai_regime = 1.0f; bad = in;
     bad.ai_regime = make_nan(); bad.x = 1.1f; bad.physics_residual = 2.0f;
     bad.outer_age_s = cfg.outer_timeout_s + cfg.dt_s * 0.5f;
@@ -2071,8 +2123,12 @@ static void test_counter_boundaries(void)
     }
     check(st.step_count == UINT32_MAX && st.corrupted_frame_count == UINT32_MAX &&
           st.safety_veto_count == UINT32_MAX && st.ood_veto_count == UINT32_MAX &&
-          st.low_confidence_veto_count == UINT32_MAX && st.latency_hold_count == UINT32_MAX,
+          st.low_confidence_veto_count == UINT32_MAX,
           "counter boundary: repeated fault episodes saturate all diagnostic counters");
+    /* The fault frame is veto-masked (envelope outranks the latency HOLD), so
+     * it must not count a native-HOLD entry any more. */
+    check(st.latency_hold_count == UINT32_MAX - 1u,
+          "counter boundary: a veto-masked stale frame does not count a HOLD episode");
     check(out.gate == GATE_VETO_SAFETY_ENVELOPE && out.regime == REGIME_SAFE_FALLBACK &&
           out.corrupted && out.fault_audit_bitmask == 31u,
           "counter boundary: saturation preserves gate priority and all sticky fault bits");
@@ -2081,6 +2137,569 @@ static void test_counter_boundaries(void)
     check(out.gate == GATE_HOLD_LATENCY && st.step_count == UINT32_MAX &&
           st.corrupted_frame_count == UINT32_MAX,
           "counter boundary: fast-input firewall counters also remain saturated");
+
+    /* latency_hold_count counts native-HOLD entry edges, so its saturation is
+     * covered separately with a pure stale mailbox that no veto masks. */
+    Layered_Init(&st, &cfg, &tun);
+    st.latency_hold_count = UINT32_MAX - 1u;
+    in.ai_regime = 1.0f; in.ai_confidence = 0.95f;
+    in.x = 0.0f; in.physics_residual = 0.0f;
+    in.outer_age_s = cfg.outer_timeout_s + cfg.dt_s * 0.5f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_HOLD_LATENCY && st.latency_hold_count == UINT32_MAX &&
+          st.hold_ticks == 1u,
+          "counter boundary: one native-HOLD entry saturates latency_hold_count");
+}
+
+/* ========================================================================= */
+/* Phase A1: bounded native HOLD -> mandatory safe de-energise               */
+/* ========================================================================= */
+
+static void test_hold_timeout(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    LayeredConfig_t bad_cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    inv_t inv;
+    int i;
+    int hold_bad = 0;
+    int integ_zero = 1;
+    int zero_bad = 0;
+    int zero_step = -1;
+    float prev_u;
+    float du_max;
+    /* Fixed HOLD budget the core uses when the configuration itself is
+     * rejected; the header documents the value, so mirror it here. */
+    const uint32_t corrupt_config_hold_ticks = 100u;
+
+    build_config(&cfg); /* max_hold_ticks == 100, max_fault_vetoes_before_latch == 3 */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.r = 0.4f;
+    in.r_dot = 0.0f;
+    in.x = 0.20f;
+    in.x_dot = 0.0f;
+    in.u_ff = 0.0f;
+    in.outer_seq = 0u;
+
+    /* A1a: a corrupt fast sensor must hold the last command for the whole
+     * budget and then de-energise under the commissioned slew limit instead of
+     * stepping the actuator in one tick.  Every tick of this segment runs
+     * through step_checked(), so magnitude and slew compliance are verified on
+     * each sample rather than on the endpoint alone. */
+    inv_reset(&inv);
+    for (i = 0; i < 200; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && t_absf(out.u) > 0.0f && st.hold_ticks == 0u,
+          "A1 hold: healthy frames run the closed loop (u=%.6f, hold_ticks=0)", (double)out.u);
+
+    /* Corrupt the fast measurement: the first max_hold_ticks ticks must hold,
+     * the next one must start the slew-limited de-energise. */
+    in.x = make_nan();
+    for (i = 0; i < (int)cfg.max_hold_ticks; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (out.gate != GATE_HOLD_LATENCY) {
+            hold_bad++;
+        }
+    }
+    check(hold_bad == 0 && st.hold_ticks == cfg.max_hold_ticks,
+          "A1 hold: the first %u consecutive corrupted ticks stay in GATE_HOLD_LATENCY (hold_ticks=%u)",
+          (unsigned)cfg.max_hold_ticks, (unsigned)st.hold_ticks);
+    prev_u = out.u; /* the command held through the whole HOLD window */
+    du_max = cfg.u_slew_max_per_s * cfg.dt_s;
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
+        if (st.integ[i] != 0.0f) {
+            integ_zero = 0;
+        }
+    }
+    check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f &&
+          st.u_target == 0.0f &&
+          t_absf(out.u - prev_u) <= du_max + 1e-6f &&
+          t_absf(out.u) < t_absf(prev_u) && integ_zero != 0 &&
+          st.permanent_latched == 1u &&
+          (st.fault_audit_bitmask &
+           (LAYERED_FAULT_BIT_HOLD_TIMEOUT | LAYERED_FAULT_BIT_PERMANENT_LATCH)) ==
+          (LAYERED_FAULT_BIT_HOLD_TIMEOUT | LAYERED_FAULT_BIT_PERMANENT_LATCH),
+          "A1 hold: tick %u (budget %u + 1) forces GATE_SAFE_ZERO and ramps the command under "
+          "the slew limit (u %.6f -> %.6f, u_target=0, permanent=%u, mask=0x%02X)",
+          (unsigned)cfg.max_hold_ticks + 1u, (unsigned)cfg.max_hold_ticks,
+          (double)prev_u, (double)out.u, (unsigned)st.permanent_latched,
+          (unsigned)st.fault_audit_bitmask);
+    check(integ_zero != 0,
+          "A1 hold: every branch integrator is cleared before the zero command");
+    check((st.fault_audit_bitmask & LAYERED_FAULT_BIT_HOLD_TIMEOUT) != 0u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0u,
+          "A1 hold: HOLD_TIMEOUT and NAN_CORRUPTION are latched (mask 0x%02X)",
+          (unsigned)st.fault_audit_bitmask);
+    check(st.permanent_latched == 1u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_PERMANENT_LATCH) != 0u,
+          "A1 hold: a sensor-caused hold timeout also arms the permanent latch");
+
+    /* Same sensor fault but a valid configuration: the remaining command is
+     * walked to zero one du_max per tick, then the zero output is held. */
+    zero_step = -1;
+    zero_bad = 0;
+    for (i = 1; i <= 8; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (out.gate != GATE_SAFE_ZERO) {
+            zero_bad++;
+        }
+        if (out.u == 0.0f) {
+            zero_step = i;
+            break;
+        }
+    }
+    check(zero_step >= 1 && zero_bad == 0,
+          "A1 hold: the slew-limited de-energise reaches exactly u == 0.0f after %d extra "
+          "tick(s) and stays in GATE_SAFE_ZERO", zero_step);
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO && out.u == 0.0f,
+          "A1 hold: a still-corrupt sensor keeps the de-energised output");
+    in.x = 0.20f;
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.gate == GATE_LATCHED_SAFE && out.regime == REGIME_SAFE_FALLBACK,
+          "A1 hold: recovering from a sensor-timeout safe zero needs the latch API (%s)",
+          Layered_GateName(out.gate));
+    check(inv.violations == 0 && inv.nan_count == 0,
+          "A1 hold: every valid-configuration tick obeys |u|<=u_max and |du|<=u_slew*dt "
+          "(worst |u|=%.6f, |du|=%.6f)",
+          (double)inv.worst_abs_u, (double)inv.worst_abs_du);
+
+    /* A1b: an untrusted configuration is held for the fixed corrupt-config
+     * budget and then de-energised immediately: its slew limit cannot be used.
+     * Direct Layered_Step() is deliberate here. */
+    Layered_Init(&st, &cfg, &tun);
+    inv_reset(&inv);
+    for (i = 0; i < 200; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && t_absf(out.u) > 0.0f && inv.violations == 0,
+          "A1 config_bad: the healthy prelude energises the actuator (u=%.6f)",
+          (double)out.u);
+    bad_cfg = cfg;
+    bad_cfg.kp[0] = make_nan();
+    hold_bad = 0;
+    for (i = 0; i < (int)corrupt_config_hold_ticks; ++i) {
+        out = Layered_Step(&st, &bad_cfg, &tun, &in);
+        if (out.gate != GATE_HOLD_LATENCY) {
+            hold_bad++;
+        }
+    }
+    prev_u = out.u;
+    check(hold_bad == 0 && st.hold_ticks == corrupt_config_hold_ticks,
+          "A1 config_bad: the first %u corrupt-config ticks hold the last command (hold_ticks=%u)",
+          (unsigned)corrupt_config_hold_ticks, (unsigned)st.hold_ticks);
+    out = Layered_Step(&st, &bad_cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO && out.u == 0.0f && st.u_applied == 0.0f &&
+          st.permanent_latched == 1u &&
+          (st.fault_audit_bitmask &
+           (LAYERED_FAULT_BIT_HOLD_TIMEOUT | LAYERED_FAULT_BIT_PERMANENT_LATCH)) ==
+          (LAYERED_FAULT_BIT_HOLD_TIMEOUT | LAYERED_FAULT_BIT_PERMANENT_LATCH),
+          "A1 config_bad: tick %u de-energises immediately (u %.6f -> 0.0) because the "
+          "rejected configuration's slew limit is untrusted",
+          (unsigned)corrupt_config_hold_ticks + 1u, (double)prev_u);
+
+    /* A1b': UINT32_MAX can never time out (the counter saturates), so it must
+     * be rejected as a corrupt configuration on the very first tick. */
+    bad_cfg = cfg;
+    bad_cfg.max_hold_ticks = UINT32_MAX;
+    Layered_Init(&st, &bad_cfg, &tun);
+    out = Layered_Step(&st, &bad_cfg, &tun, &in);
+    check(out.corrupted == 1 && out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 1u,
+          "A1 config_bad: max_hold_ticks == UINT32_MAX is rejected as a corrupt configuration "
+          "(corrupted=%d, gate=%s, hold_ticks=%u)",
+          out.corrupted, Layered_GateName(out.gate), (unsigned)st.hold_ticks);
+
+    /* A1c: a stale slow mailbox alone must de-energise WITHOUT the permanent
+     * latch and without breaking the commissioned slew limit. */
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.20f;
+    inv_reset(&inv);
+    for (i = 0; i < 200; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+    }
+    prev_u = out.u; /* the command that must be walked down, not stepped down */
+    in.outer_age_s = 10.0f; /* heartbeat gone for good */
+    hold_bad = 0;
+    for (i = 0; i < (int)cfg.max_hold_ticks; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (out.gate != GATE_HOLD_LATENCY) {
+            hold_bad++;
+        }
+    }
+    check(hold_bad == 0 && st.hold_ticks == cfg.max_hold_ticks,
+          "A1 hold: the first %u stale-heartbeat ticks stay in GATE_HOLD_LATENCY (hold_ticks=%u)",
+          (unsigned)cfg.max_hold_ticks, (unsigned)st.hold_ticks);
+    du_max = cfg.u_slew_max_per_s * cfg.dt_s;
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.gate == GATE_SAFE_ZERO && out.u_target == 0.0f && st.u_target == 0.0f &&
+          t_absf(out.u - prev_u) <= du_max + 1e-6f && t_absf(out.u) < t_absf(prev_u) &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_HOLD_TIMEOUT) != 0u &&
+          st.permanent_latched == 0u,
+          "A1 hold: a latency-only timeout -> %s u=%.6f (ramped from %.6f by <= %.6f) "
+          "permanent=%u hold_ticks=%u",
+          Layered_GateName(out.gate), (double)out.u, (double)prev_u, (double)du_max,
+          (unsigned)st.permanent_latched, (unsigned)st.hold_ticks);
+    zero_step = -1;
+    zero_bad = 0;
+    for (i = 1; i <= 8; ++i) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (out.gate != GATE_SAFE_ZERO) {
+            zero_bad++;
+        }
+        if (out.u == 0.0f) {
+            zero_step = i;
+            break;
+        }
+    }
+    check(zero_step >= 1 && zero_bad == 0,
+          "A1 hold: a latency-only timeout reaches exactly u == 0.0f after %d extra "
+          "slew-limited tick(s)", zero_step);
+    in.outer_age_s = 0.005f;
+    out = step_checked(&inv, &st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && st.hold_ticks == 0u &&
+          out.regime == REGIME_SAFE_FALLBACK,
+          "A1 hold: a fresh heartbeat leaves safe zero and clears hold_ticks (%s / %s)",
+          Layered_GateName(out.gate), Layered_RegimeName(out.regime));
+    check(inv.violations == 0 && inv.nan_count == 0,
+          "A1 hold: every valid-configuration tick obeys |u|<=u_max and |du|<=u_slew*dt "
+          "(worst |u|=%.6f, |du|=%.6f)",
+          (double)inv.worst_abs_u, (double)inv.worst_abs_du);
+
+    /* A1d: latency_hold_count counts the exact native-HOLD entry edge.  A first
+     * frame already 10 periods past the timeout is one episode, not zero. */
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.20f;
+    in.outer_age_s = cfg.outer_timeout_s + 10.0f * cfg.dt_s;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_HOLD_LATENCY && st.latency_hold_count == 1u &&
+          st.hold_ticks == 1u,
+          "A1 hold: a first stale frame 10 periods past the timeout counts one HOLD entry "
+          "(gate=%s, count=%u, hold_ticks=%u)",
+          Layered_GateName(out.gate), (unsigned)st.latency_hold_count,
+          (unsigned)st.hold_ticks);
+
+    /* A1e: five constant frames half a period past the timeout stay one episode. */
+    Layered_Init(&st, &cfg, &tun);
+    in.x = 0.20f;
+    in.outer_age_s = cfg.outer_timeout_s + 0.5f * cfg.dt_s;
+    hold_bad = 0;
+    for (i = 0; i < 5; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (out.gate != GATE_HOLD_LATENCY) {
+            hold_bad++;
+        }
+    }
+    check(hold_bad == 0 && st.latency_hold_count == 1u && st.hold_ticks == 5u,
+          "A1 hold: five constant stale frames stay one HOLD episode (count=%u, hold_ticks=%u)",
+          (unsigned)st.latency_hold_count, (unsigned)st.hold_ticks);
+}
+
+/* ========================================================================= */
+/* Phase A2: cumulative severe-fault latch + explicit acknowledgement        */
+/* ========================================================================= */
+
+static void test_permanent_latch(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    LayeredConfig_t bad_cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out = zero_output();
+    int episode;
+    int i;
+    int latched_through_cooldown = 1;
+    uint32_t ood_history;
+    uint32_t safety_history;
+    uint32_t mask_history;
+    uint32_t step_history;
+
+    build_config(&cfg); /* max_fault_vetoes_before_latch == 3 */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.r = 0.0f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    in.outer_seq = 0u;
+
+    for (episode = 0; episode < (int)cfg.max_fault_vetoes_before_latch; ++episode) {
+        in.physics_residual = 3.0f;
+        for (i = 0; i < 5; ++i) {
+            out = Layered_Step(&st, &cfg, &tun, &in);
+        }
+        in.physics_residual = 0.10f;
+        for (i = 0; i < 5; ++i) {
+            out = Layered_Step(&st, &cfg, &tun, &in);
+        }
+        if (episode + 1 < (int)cfg.max_fault_vetoes_before_latch) {
+            check(st.permanent_latched == 0u && out.gate != GATE_LATCHED_SAFE,
+                  "A2 latch: %d veto episode(s) stay recoverable (latched=0)",
+                  episode + 1);
+        }
+    }
+    check(st.ood_veto_count == cfg.max_fault_vetoes_before_latch &&
+          st.permanent_latched == 1u &&
+          (st.fault_audit_bitmask & LAYERED_FAULT_BIT_PERMANENT_LATCH) != 0u &&
+          out.gate == GATE_LATCHED_SAFE && out.regime == REGIME_SAFE_FALLBACK,
+          "A2 latch: %u accumulated OOD episodes latch GATE_LATCHED_SAFE in R4",
+          (unsigned)st.ood_veto_count);
+
+    for (i = 0; i < (int)cfg.ood_recovery_cooldown_ticks + 100; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (out.gate != GATE_LATCHED_SAFE || out.regime != REGIME_SAFE_FALLBACK) {
+            latched_through_cooldown = 0;
+        }
+    }
+    check(latched_through_cooldown != 0 && st.recovery_ticks == 0u,
+          "A2 latch: the latch survives the full %u-tick recovery cooldown",
+          (unsigned)cfg.ood_recovery_cooldown_ticks);
+
+    bad_cfg = cfg;
+    bad_cfg.max_hold_ticks = 0u;
+    check(Layered_AcknowledgeFaultLatch(0, 0) == 0 &&
+          Layered_AcknowledgeFaultLatch(&st, 0) == 0 &&
+          Layered_AcknowledgeFaultLatch(&st, &bad_cfg) == 0,
+          "A2 latch: the acknowledgement API rejects null pointers and a corrupt configuration");
+
+    ood_history = st.ood_veto_count;
+    safety_history = st.safety_veto_count;
+    mask_history = st.fault_audit_bitmask;
+    step_history = st.step_count;
+    check(Layered_AcknowledgeFaultLatch(&st, &cfg) == 1,
+          "A2 latch: the explicit acknowledgement releases the latch");
+    check(st.permanent_latched == 0u && st.ood_latched == 0u &&
+          st.safety_latched == 0u && st.conf_latched == 0u &&
+          st.hold_ticks == 0u &&
+          st.recovery_ticks == cfg.ood_recovery_cooldown_ticks,
+          "A2 latch: ack clears latches/hold_ticks and re-arms the %u-tick cooldown",
+          (unsigned)st.recovery_ticks);
+    check(st.ood_veto_count == ood_history && st.safety_veto_count == safety_history &&
+          st.fault_audit_bitmask == mask_history && st.step_count == step_history,
+          "A2 latch: ack preserves the audit history (%u OOD episodes, mask 0x%02X)",
+          (unsigned)st.ood_veto_count, (unsigned)st.fault_audit_bitmask);
+
+    for (i = 0; i <= (int)cfg.ood_recovery_cooldown_ticks; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && out.regime == REGIME_NOMINAL &&
+          st.permanent_latched == 0u,
+          "A2 latch: after ack the AI bank is re-armed once the clean cooldown expires (%s / %s)",
+          Layered_GateName(out.gate), Layered_RegimeName(out.regime));
+
+    check(st.latch_episode_count == 0u && st.ood_veto_count == ood_history,
+          "A2 latch: ack resets the episode quota (episodes=%u) but keeps the %u OOD "
+          "episodes in the audit history",
+          (unsigned)st.latch_episode_count, (unsigned)st.ood_veto_count);
+
+    /* The acknowledgement restores the full tolerance: only three NEW OOD
+     * episodes may re-arm the latch, while the lifetime audit counter keeps
+     * counting across the release. */
+    for (episode = 1; episode <= (int)cfg.max_fault_vetoes_before_latch; ++episode) {
+        in.physics_residual = 3.0f;
+        for (i = 0; i < 5; ++i) {
+            out = Layered_Step(&st, &cfg, &tun, &in);
+        }
+        in.physics_residual = 0.10f;
+        for (i = 0; i < 5; ++i) {
+            out = Layered_Step(&st, &cfg, &tun, &in);
+        }
+        if (episode < (int)cfg.max_fault_vetoes_before_latch) {
+            check(st.permanent_latched == 0u &&
+                  st.latch_episode_count == (uint32_t)episode &&
+                  out.gate != GATE_LATCHED_SAFE,
+                  "A2 latch: after ack, new OOD episode %d stays recoverable "
+                  "(episodes=%u, latched=%u)",
+                  episode, (unsigned)st.latch_episode_count,
+                  (unsigned)st.permanent_latched);
+        }
+    }
+    check(st.ood_veto_count == 2u * cfg.max_fault_vetoes_before_latch &&
+          st.latch_episode_count == cfg.max_fault_vetoes_before_latch &&
+          st.permanent_latched == 1u && out.gate == GATE_LATCHED_SAFE,
+          "A2 latch: after ack, %u fresh OOD episodes re-arm the latch "
+          "(audit OOD episodes=%u, episodes=%u)",
+          (unsigned)cfg.max_fault_vetoes_before_latch, (unsigned)st.ood_veto_count,
+          (unsigned)st.latch_episode_count);
+}
+
+/* ========================================================================= */
+/* Phase A3: L1 local slow-frame lease (outer_seq)                           */
+/* ========================================================================= */
+
+static void test_outer_sequence_lease(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    int first_hold = -1;
+    int early_hold = 0;
+
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.0f; /* forged: the mailbox claims a brand-new frame */
+    in.physics_residual = 0.10f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.r = 0.0f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    in.outer_seq = 7u;
+
+    /* The sequence number never changes: only the local clock may age it. */
+    for (i = 0; i < 300; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (out.gate == GATE_HOLD_LATENCY && first_hold < 0) {
+            first_hold = i;
+        }
+        if (i < 200 && out.gate == GATE_HOLD_LATENCY) {
+            early_hold++;
+        }
+    }
+    check(early_hold == 0 && first_hold >= 240 && first_hold <= 260,
+          "A3 seq: forged outer_age_s=0.0 cannot mask an unchanged sequence (local hold at tick %d)",
+          first_hold);
+    check(st.outer_age_ticks == 299u && st.last_outer_seq == 7u,
+          "A3 seq: 300 identical sequence numbers age the local lease to %u ticks",
+          (unsigned)st.outer_age_ticks);
+
+    in.outer_seq = 8u;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate != GATE_HOLD_LATENCY && st.outer_age_ticks == 0u,
+          "A3 seq: a changed sequence number opens a fresh local lease (%s)",
+          Layered_GateName(out.gate));
+    for (i = 0; i < 200; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate != GATE_HOLD_LATENCY && st.outer_age_ticks == 200u,
+          "A3 seq: 201 ticks on the fresh lease stay inside the timeout (age_ticks=%u)",
+          (unsigned)st.outer_age_ticks);
+
+    /* A sequence that was live and then reads 0 is a mailbox anomaly. */
+    in.outer_seq = 0u;
+    in.outer_age_s = 0.005f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_VETO_LOW_CONFIDENCE &&
+          out.regime == REGIME_SAFE_FALLBACK && st.conf_latched == 1u,
+          "A3 seq: a sequence falling back to 0 is treated as mailbox corruption and forces R4");
+    check(out.corrupted == 1 && st.corrupted_frame_count == 1u,
+          "A3 seq: the sequence fallback is reported as one corrupt frame (corrupted=%d, count=%u)",
+          out.corrupted, (unsigned)st.corrupted_frame_count);
+    check((st.fault_audit_bitmask & LAYERED_FAULT_BIT_NAN_CORRUPTION) != 0u,
+          "A3 seq: the NAN_CORRUPTION audit bit records the sequence fallback (mask 0x%02X)",
+          (unsigned)st.fault_audit_bitmask);
+
+    /* Legacy mode stays bit-compatible when outer_seq is never used. */
+    Layered_Init(&st, &cfg, &tun);
+    in.outer_seq = 0u;
+    in.outer_age_s = 0.50f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_HOLD_LATENCY && st.last_outer_seq == 0u,
+          "A3 seq: outer_seq == 0 keeps the legacy outer_age_s timeout");
+}
+
+/* ========================================================================= */
+/* Phase A4: emergency R4 entry bypasses the slow blend filter               */
+/* ========================================================================= */
+
+static void test_emergency_r4_bypass(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    float prev_u;
+    float integ3;
+    float expected;
+    float du_max;
+
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.x = 0.10f;
+    in.x_dot = 0.02f;
+    in.r = 0.20f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    in.outer_seq = 0u;
+
+    for (i = 0; i < 300; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+
+    /* Force a partial blend and a stale target: the emergency path must
+     * ignore both and write the raw R4 target. */
+    st.blend = 0.25f;
+    st.u_target = 0.0f;
+    integ3 = st.integ[3];
+    prev_u = st.u_applied;
+    du_max = cfg.u_slew_max_per_s * cfg.dt_s;
+
+    in.physics_residual = 3.0f; /* independent OOD veto -> immediate R4 */
+    out = Layered_Step(&st, &cfg, &tun, &in);
+
+    expected = cfg.kp[3] * (-in.x) + cfg.kd[3] * (-in.x_dot) + cfg.ki[3] * integ3;
+    check(out.gate == GATE_VETO_OOD_RESIDUAL && out.regime == REGIME_SAFE_FALLBACK,
+          "A4 bypass: an OOD veto enters R4 on the same tick (%s / %s)",
+          Layered_GateName(out.gate), Layered_RegimeName(out.regime));
+    check(out.blend == 1.0f && t_absf(out.u_target - expected) <= 1.0e-7f,
+          "A4 bypass: blend=%.3f and the target is the raw R4 law (diff %.9f)",
+          (double)out.blend, (double)t_absf(out.u_target - expected));
+    check(t_absf(out.u) <= cfg.u_max + 1.0e-6f &&
+          t_absf(out.u - prev_u) <= du_max + 1.0e-6f,
+          "A4 bypass: magnitude and slew limits still apply (|u|=%.6f, |du|=%.6f)",
+          (double)t_absf(out.u), (double)t_absf(out.u - prev_u));
+
+    /* Staying in R4 keeps the direct target as well. */
+    st.blend = 0.20f;
+    st.u_target = 0.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.blend == 1.0f && out.regime == REGIME_SAFE_FALLBACK,
+          "A4 bypass: an already active R4 keeps blend at 1.0");
+
+    /* A healthy normal-regime step must still use the slow filter. */
+    Layered_Init(&st, &cfg, &tun);
+    in.physics_residual = 0.10f;
+    for (i = 0; i < 300; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    st.blend = 0.25f;
+    st.u_target = 0.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && out.blend > 0.25f && out.blend < 1.0f,
+          "A4 bypass: normal tracking still follows blend_alpha (blend=%.3f)",
+          (double)out.blend);
 }
 
 int main(void)
@@ -2128,6 +2747,12 @@ int main(void)
     test_safe_bank_and_r3();
     test_runtime_tuning_faults();
     test_counter_boundaries();
+
+    printf("\n-- phase A: bounded HOLD / permanent latch / seq lease / R4 bypass --\n");
+    test_hold_timeout();
+    test_permanent_latch();
+    test_outer_sequence_lease();
+    test_emergency_r4_bypass();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

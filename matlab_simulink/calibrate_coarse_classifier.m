@@ -24,11 +24,21 @@ for j=1:3, d(:,j)=sqrt(sum((samples-prototypes(j,:)).^2,2)); end
 d=sort(d,2);
 gamma=1/max(linear_quantile(d(:,1),.95),1e-6);
 score=(d(:,2)-d(:,1))./(d(:,2)+d(:,1)+1e-9).*exp(-gamma*d(:,1));
-trip=.15*linear_quantile(score,.01);
-classifier=struct('prototypes',prototypes,'gamma',gamma,'trip',trip,'clear',1.25*trip);
+% The Python supervisor returns twice the helper's 0.15x quantile trip; the
+% clear level is 1.25x the trip.  The caps only bound pathological scores and
+% stay inactive for the calibrated benchmark values.
+trip=2.0*0.15*linear_quantile(score,.01);
+trip=min(trip,0.25);
+clear=1.25*trip;
+clear=min(clear,0.35);
+classifier=struct('prototypes',prototypes,'gamma',gamma,'trip',trip,'clear',clear);
 end
 
 function q=linear_quantile(x,p)
-x=sort(x); pos=1+(numel(x)-1)*p; lo=floor(pos); hi=ceil(pos);
-q=x(lo)+(pos-lo)*(x(hi)-x(lo));
+% Same formula and index arithmetic as numpy.quantile(method='linear'): the
+% virtual position is (n-1)*p without an extra +1/-1 round trip, so the
+% interpolation weight matches the Python supervisor bit for bit.
+x=sort(x);
+pos=(numel(x)-1)*p; lo=floor(pos); hi=min(lo+1,numel(x)-1);
+q=x(lo+1)+(pos-lo)*(x(hi+1)-x(lo+1));
 end

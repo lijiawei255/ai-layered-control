@@ -14,8 +14,11 @@
  *   dt timeout max_res res_clear min_conf conf_clear x_limit trip clear
  *   predict u_max slew alpha integ_limit windup min_dwell recovery
  *   kp0 kp1 kp2 kp3 kd0..kd3 ki0..ki3 ff0..ff3
+ *   max_hold_ticks max_fault_vetoes_before_latch use_seq
  *   then N lines of 12 float32 bit patterns: three FieldTuning_t scales
- *   followed by the nine LayeredInput_t fields.
+ *   followed by the nine LayeredInput_t fields.  When use_seq is 1 each line
+ *   carries one more unsigned integer, the outer_seq of that frame; when it is
+ *   0 the legacy unsequenced mailbox is replayed (outer_seq = 0).
  *
  * Output: N lines of
  *   u u_target gate regime blend fault_audit_bitmask corrupted
@@ -39,6 +42,7 @@ int main(int argc, char **argv)
     int N;
     int k;
     int j;
+    unsigned use_seq;
     LayeredConfig_t cfg;
     LayeredState_t st;
     FieldTuning_t tun;
@@ -83,6 +87,20 @@ int main(int argc, char **argv)
     for (j = 0; j < LAYERED_NUM_REGIMES; ++j) {
         if (fscanf(f, "%f", &cfg.ff_scale[j]) != 1) { fclose(f); return 2; }
     }
+    /* The two fail-safe configuration fields and the per-row sequence flag are
+     * part of the header so a replay exercises the commissioned values instead
+     * of a harness-local guess. */
+    if (fscanf(f, "%u %u %u", &cfg.max_hold_ticks,
+               &cfg.max_fault_vetoes_before_latch, &use_seq) != 3) {
+        fprintf(stderr, "bad config header (hold budget, latch threshold, use_seq)\n");
+        fclose(f);
+        return 2;
+    }
+    if (use_seq > 1u) {
+        fprintf(stderr, "bad use_seq\n");
+        fclose(f);
+        return 2;
+    }
 
     tun.gain_scale = 1.0f;
     tun.damping_scale = 1.0f;
@@ -99,11 +117,18 @@ int main(int argc, char **argv)
         LayeredInput_t in;
         LayeredOutput_t out;
         unsigned bits[12];
+        unsigned seq = 0u;
         if (fscanf(f, "%u %u %u %u %u %u %u %u %u %u %u %u",
                    &bits[0], &bits[1], &bits[2], &bits[3], &bits[4],
                    &bits[5], &bits[6], &bits[7], &bits[8],
                    &bits[9], &bits[10], &bits[11]) != 12) {
             fprintf(stderr, "bad trace row %d\n", k);
+            fclose(f);
+            fclose(g);
+            return 2;
+        }
+        if (use_seq != 0u && fscanf(f, "%u", &seq) != 1) {
+            fprintf(stderr, "bad trace sequence %d\n", k);
             fclose(f);
             fclose(g);
             return 2;
@@ -120,6 +145,7 @@ int main(int argc, char **argv)
         in.r = input_value(bits[9]);
         in.r_dot = input_value(bits[10]);
         in.u_ff = input_value(bits[11]);
+        in.outer_seq = (uint32_t)seq;
         out = Layered_Step(&st, &cfg, &tun, &in);
         fprintf(g, "%.9g %.9g %d %d %.9g %u %d\n",
                 (double)out.u, (double)out.u_target,

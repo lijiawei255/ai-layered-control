@@ -11,11 +11,11 @@ P=load_domain_profile(); P.classifier=calibrate_coarse_classifier(P);
 P.policy=train_continuous_policy(P);
 fprintf('[1/5] Shared four-stage fixture and continuous 1 kHz actions\n');
 [main,D]=sim_core_engine(P); M=main.metrics;
-D.regime_fraction=zeros(4,4); D.gate_ticks=zeros(4,5);
+D.regime_fraction=zeros(4,4); D.gate_ticks=zeros(4,7);
 for s=0:3
     selected=main.stage==s;
     for r=1:4, D.regime_fraction(s+1,r)=mean(main.b3.regime(selected)==r); end
-    for g=0:4, D.gate_ticks(s+1,g+1)=sum(main.b3.gate(selected)==g); end
+    for g=0:6, D.gate_ticks(s+1,g+1)=sum(main.b3.gate(selected)==g); end
 end
 fresh=[true; diff(main.b3.age)<-.0005] & main.stage<3 & main.b3.age<=P.cfg.outer_timeout_s;
 D.fresh_low_confidence_frames=sum(fresh & main.b3.confidence<P.classifier.trip);
@@ -60,7 +60,10 @@ for j=1:numel(cases)
         D.(cases{j})=contact_stats(z);
     end
 end
+% Broadband probe isolation: neutralise the envelope limit and the cumulative
+% permanent latch so only the independent physics-residual veto can trip.
 Q=P; Q.cfg.state_safety_limit=100; Q.cfg.outer_timeout_s=100;
+Q.cfg.max_fault_vetoes_before_latch=0;
 z=sim_core_engine(Q,struct('branches',3,'spikes',false,'probe_spikes',false,'conf_gate',false));
 V.broadband_only=z.metrics;
 first=find(z.b3.gate==2 & z.context.fault,1); onset=find(z.context.fault,1);
@@ -185,7 +188,7 @@ nexttile; plot(z.t,z.b3.residual,'Color',colors(3,:),'LineWidth',.8); hold on; y
 ylabel('Normalized residual'); ylim([0 4]);
 nexttile; stairs(z.t,z.b3.regime,'Color',colors(3,:),'LineWidth',1.1); hold on;
 stairs(z.t,z.b3.gate,'Color',[.55 .35 .65],'LineWidth',.7); ylabel('Discrete state'); xlabel('Time [s]');
-legend('Regime','Gate','Location','northwest','AutoUpdate','off'); yticks(0:4);
+legend('Regime','Gate','Location','northwest','AutoUpdate','off'); yticks(0:6);
 axeslist=findall(f,'Type','axes');
 for ax=axeslist', grid(ax,'on'); xlim(ax,[0 40]); for t=[10 20 30], xline(ax,t,':','Color',[.55 .55 .55]); end; end
 exportgraphics(f,fullfile(folder,'benchmark_4stages_showdown.png'),'Resolution',240); close(f);

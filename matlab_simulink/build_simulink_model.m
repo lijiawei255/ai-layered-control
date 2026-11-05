@@ -5,7 +5,7 @@
 % Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function [mdl, status] = build_simulink_model(out_path)
 %BUILD_SIMULINK_MODEL Built-in-block illustration with explicit rate boundaries.
-% The numeric engine owns the trained RBF, Karnopp plant and nine-gate core.
+% The numeric engine owns the trained RBF, Karnopp plant and nine-duty, seven-gate core.
 if nargin < 1
     out_path=fullfile(fileparts(mfilename('fullpath')),'ai_layered_control_bench.slx');
 end
