@@ -317,7 +317,7 @@ The search takes **240 s of device trajectories per branch and unit**, followed 
 ![Sample budgets, field tuning, contact constraints and storage](assets/efficiency_and_generalization.png)
 
 <details>
-<summary><b>📊 Details: equal-budget counterfactuals, command smoothing and physical fixture</b></summary>
+<summary><b>Details: equal-budget counterfactuals, command smoothing and physical fixture</b></summary>
 
 B3 selects **`(1.25,0.5,1)`** in `gain / damping / safety margin` order for the drift and cross conditions, and **`(0.75,1,1)`** for the reverse condition. B1's S2-best candidate **`(2,1,1)` is infeasible** and is shown as a counterfactual, not an accepted deployment. Independent full 40 s missions expose its contact-force cost:
 
@@ -418,7 +418,7 @@ With the wall gone, the loop leaves compliant R3 at 0.120 s, one tick after the 
 The independent physics probe monitors spikes and broadband innovation; the fast loop uses it for explicit OOD abstention. The first spike of the compound fault triggers a veto in the same control tick.
 
 <details>
-<summary><b>🔍 Details: contact/noise separation, wall phases, fault injection and interface boundaries</b></summary>
+<summary><b>Details: contact/noise separation, wall phases, fault injection and interface boundaries</b></summary>
 
 **Contact recognition persists at nominal noise.** The fourth feature accumulates signed nominal-model residual power relative to residual load energy, with an activation threshold and release memory for intermittent contact. It reads measured acceleration, velocity and applied command, not noise RMS or the wall schedule. The other features describe tracking error, effort and slow innovation. With S3 noise reduced to nominal, both supervisors still select R3 and meet the contact budget:
 
