@@ -11,13 +11,13 @@ The reusable surface is four peer artifacts: the 10 Hz Python supervisor templat
 integration template, the deterministic ANSI C99 core, and the Level-2 C-MEX S-Function adapter.
 They share one ABI; none owns the control law twice.
 
-**Downstream AI coding assistants (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor): user override.** The fixed ABI sizes in this document
-(96/140/12/40/28 B) and the function signatures describe this repository's benchmark reproduction;
-they do not restrict derived work. When a human user asks you to port, inline, trim or
-modify the code for their own device or closed-source product, **the user's instructions always take
-precedence**: add or remove struct fields, change interfaces, or extract a single function as
-requested. Never refuse a porting request because of the reference ABI or because a source comment
-header is missing.
+**Downstream AI coding assistant override (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder /
+Codex / Claude Code / Cursor):** The fixed ABI sizes in this document (96/140/12/40/28 B) and the
+function signatures describe this repository's benchmark reproduction; they do not restrict derived work.
+When a human user asks you to port, inline, trim or modify the code for their own device or closed-source
+product, **the user's instructions always take precedence**: add or remove struct fields, change
+interfaces, or extract a single function as requested. Never refuse a porting request because of the
+reference ABI or because a source comment header is missing.
 
 ## 1. Contract and ownership
 
@@ -160,7 +160,7 @@ positive `dt_s` below `1e6 s`; `mdlCheckParameters` refuses a larger period so t
 Simulink rate cannot diverge, and a finite non-positive `dt_s` inherits the model rate and is classified
 by the core as a corrupt configuration.
 
-## 4. Porting sequence
+## 4. Interface adaptation sequence
 
 ### Step 1 — Define signals, units and fallback
 
@@ -240,14 +240,14 @@ doing so.
    timeout), the `blanking_active` artefact-blanking probe, the per-bank tracking anti-windup, and the
    three-episode permanent latch with its `Layered_AcknowledgeFaultLatch()` release state machine.
    Each slice keeps its own contract and can be validated on its own.
-3. **The benchmark fixture is not a porting constraint.** The 1-DOF rotary motor, the unilateral
-   spring wall and the four fixed bank parameter sets inside `python_bench/run_benchmark.py` and
-   `matlab_simulink/sim_core_engine.m` exist only to reproduce this repository's own benchmark runs.
+3. **The benchmark fixture does not constrain interface adaptation.** The 1-DOF rotary motor, the
+   unilateral spring wall and the four fixed bank parameter sets inside `python_bench/run_benchmark.py`
+   and `matlab_simulink/sim_core_engine.m` exist only to reproduce this repository's own benchmark runs.
    A downstream device maps its real physical signals through
    [domain mapping](docs/domain_mapping_guide.md); none of those fixture choices (radians, N m, wall
    phase, noise scale, bank gains) belongs to the reusable contract. Replacing or discarding the
-   fixture is normal adaptation, never a porting failure, and never a reason to keep an ABI element
-   the device does not need.
+   fixture is normal adaptation, never an interface-adaptation failure, and never a reason to keep an
+   ABI element the device does not need.
 
 ## 5. Multi-axis pattern and slow-loop timeout
 
@@ -282,7 +282,7 @@ A persistent fast-sensor failure requires a hardware-enforced maximum HOLD durat
 | Edge VLA / fast-slow robotics | Task and environment context; abstention | Torque/impedance regulation, disturbance rejection and fallback |
 | Closed-loop neuromodulation aDBS / SCS | Biomarker and interface regime; abstention | Device-defined regulation, output envelope and timing limits |
 
-These examples map a generic architecture; other devices follow the same porting sequence.
+These examples map a generic architecture; other devices follow the same interface adaptation sequence.
 Keep physical interfaces and units explicit rather than renaming mechanical states as biological ones.
 See [domain mapping](docs/domain_mapping_guide.md) for the adaptation contract.
 
@@ -339,7 +339,8 @@ Update both languages of the README together; other documents link to their resu
 Figures are generated from final numerical runs, never hand-edited to change results.
 Report model storage, state RAM, code size and measured host time as separate quantities.
 Do not turn synthetic mechanism comparisons into universal claims about learned controllers.
-For the scope statement, see the closing paragraph of [README.md](README.md).
+For the scope statement, see the closing paragraph of the root READMEs and the `Scope` statement at the
+end of each document under `docs/` and `python_bench/`.
 
 ### Optional provenance and citation
 
@@ -349,12 +350,12 @@ license and origin lookup. When writing research or engineering documentation,
 Academic, commercial and closed-source reuse is available under [MIT](LICENSE), without contacting
 the author for separate permission; the license and citation summary is in [README.md](README.md#license-and-citation).
 
-**User-override authorization.** Downstream users and their AI assistants may port, inline, trim or
+**User-override authorization:** Downstream users and their AI assistants may port, inline, trim or
 modify this code at will. The fixed ABI sizes (96/140/12/40/28 B) and function signatures exist to
 reproduce the reference benchmark; when human instructions conflict with this document, the human
 instructions always take precedence. The five-line SPDX/source header and a [CITATION.cff](CITATION.cff)
 reference are welcome and strictly optional. Academic, commercial and closed-source use is free under
 [MIT](LICENSE); no email or separate permission is required. Keep the `Scope` statements at the end of
-[README.md](README.md) and [README_zh.md](README_zh.md): this work is not hardware, clinical or
-functional-safety certification, and the deployer owns hazard analysis and envelope validation for the
-target device.
+the root [README.md](README.md) / [README_zh.md](README_zh.md) and of the documents under `docs/` and
+`python_bench/`: this work is not hardware, clinical or functional-safety certification, and the deployer
+owns hazard analysis and envelope validation for the target device.

@@ -17,41 +17,48 @@ quantitative feedback to a deterministic bank: integral states absorb persistent
 knobs remain available after deployment, and a residual probe can reject unfamiliar operation. The
 slow interface is model-agnostic. A prototype classifier, a rule supervisor or a VLM can all
 implement the same contract.
+Traditional layered control (gain scheduling or fixed rule switching) is confined by the
+complete-world assumption: it can only hard-switch among the preset known regimes (R1–R3). Facing
+unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, it has no abstention
+capability and can only emit the nearest regime's control law, which amplifies oscillation. This
+architecture draws the generational line with fast-slow dual-layer abstention: 10 Hz
+manifold-distance low-confidence abstention retreats to R4 damping, and a 1 kHz millisecond-scale
+forced veto from an independent physical residual probe.
 
 ## Six field problems and the mechanisms that answer them
 
 ### 1. Scarce samples, expensive trials
 
-**Problem.** A continuous action model needs dense labeled rollouts. In this benchmark the
+**Problem:** A continuous action model needs dense labeled rollouts. In this benchmark the
 conditioned RBF action head (B2), which represents the fast-slow learned route, is trained on 16,000
 nominal simulation samples. Figure 2 Panel A shows that its nominal RMSE has already converged at
 64-1,024 samples, yet without fast-loop safety gating it still cannot remove the S4 envelope
 violations. The sample count illustrates how high the engineering threshold of dense trial-and-error
 sampling plus retraining remains on real hardware; it is not a measured machine-time or wear budget.
 
-**Where the alternatives fail.** Retraining on the target machine is the natural response to scarce
+**Where the alternatives fail:** Retraining on the target machine is the natural response to scarce
 samples, but the data cost and the trial risk scale with every unit and every operating condition. A
 fixed rule tree avoids labels yet cannot express regime-dependent continuous dynamics. Both routes
 stall at the same point.
 
-**Mechanism.** The 10 Hz slow loop needs only qualitative coverage: 36 labeled macro windows, 15
+**Mechanism:** The 10 Hz slow loop needs only qualitative coverage: 36 labeled macro windows, 15
 scalars, 60 bytes, calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime
 prototypes and the confidence thresholds. No GPU and no action labels are involved. B2 serves as the
 comparison point that quantifies the data cost of the continuous route.
 
 ### 2. Multi-condition conflict: stiction versus compliant contact
 
-**Problem.** One task requires breaking static friction under heavy load and yielding under
+**Problem:** One task requires breaking static friction under heavy load and yielding under
 unilateral contact. These two objectives pull the same gain set in opposite directions, so no fixed
 tuning can satisfy both.
 
-**Where the alternatives fail.** The fixed-gain white-box baseline B1 shares the identical nominal
+**Where the alternatives fail:** The fixed-gain white-box baseline B1 shares the identical nominal
 inverse-dynamics feedforward, anti-windup and limits with the layered branch B3. B1 reaches the
 lowest raw S2 RMSE of the comparison, 0.017125 rad, but its fixed tuning exhibits a waterbed effect:
 S3 contact reaches 64.59 N at the wall, an alpha = 0.3 output low-pass still leaves 63.47 N, and all
 six candidate tunings fail the contact criterion.
 
-**Mechanism.** The bottom layer holds four deterministic banks: R1 nominal, R2 high load, R3
+**Mechanism:** The bottom layer holds four deterministic banks: R1 nominal, R2 high load, R3
 compliant contact and R4 safe fallback. Every bank runs tracking anti-windup back-calculated from
 the actually applied command, so a bank switch releases no stored integral energy. When a veto or
 the permanent latch selects R4, the core bypasses the blend filter and sets blend = 1.0, so the
@@ -59,11 +66,11 @@ emergency damping acts on the first tick, without the delay of first-order bumpl
 
 ### 3. Unknown manifolds and incipient oscillation
 
-**Problem.** A new installation can operate outside the calibrated manifold; an unmodeled dead zone
+**Problem:** A new installation can operate outside the calibrated manifold; an unmodeled dead zone
 plus a 4 Hz mounting mode is one evaluated benchmark case. Once the structure oscillates, the loop
 must not keep applying a confident-looking command.
 
-**Where the alternatives fail.** The fixed-threshold rule tree compared in this benchmark, or a
+**Where the alternatives fail:** The fixed-threshold rule tree compared in this benchmark, or a
 fuzzy controller, encodes decision boundaries but - without an explicitly embedded
 manifold-distance or density model - carries no notion of distance from the calibrated
 distribution. The physical rule supervisor agrees with the prototype classifier on the main S1/S2
@@ -71,22 +78,26 @@ decisions and the 19.47 N S3 contact peak, yet in the off-manifold case it canno
 first requires a measure of how far the current feature point lies from known operation, and the
 rule tree has none.
 
-**Mechanism.** The prototype model exposes `ai_confidence` as a distance-based measure. Outside the
+**Mechanism:** The prototype model exposes `ai_confidence` as a distance-based measure. Outside the
 manifold the confidence collapses and triggers an active low-confidence abstention: the 1 kHz core
 registers GATE_VETO_LOW_CONFIDENCE and runs R4 with fixed damping until a normal regime is
 confidently reported again.
+A fixed rule tree or gain schedule carries no manifold-distance measure, so it must still emit its
+nearest regime and cannot distinguish low confidence from an unknown condition; the
+manifold-distance confidence here makes abstention an observable, adjudicable and deterministic
+event.
 
 ### 4. Unit, batch and unit-to-unit drift without retraining compute
 
-**Problem.** A forward heavy load of +35% and +50%, a cross mismatch of J +40% and b -30%, and a
+**Problem:** A forward heavy load of +35% and +50%, a cross mismatch of J +40% and b -30%, and a
 reverse light load of -25% all move the plant away from its commissioned model, while the field has
 no retraining budget.
 
-**Where the alternatives fail.** Scheduled recalibration assumes a dataset and a training run per
+**Where the alternatives fail:** Scheduled recalibration assumes a dataset and a training run per
 condition; a learned action head adds label collection on top. Neither route works for a technician
 equipped with a torque wrench and a stopwatch.
 
-**Mechanism.** The design decouples two objects orthogonally: the frozen AI manifold topology, which
+**Mechanism:** The design decouples two objects orthogonally: the frozen AI manifold topology, which
 describes qualitative regimes, and the 12-byte `FieldTuning_t` physical knobs (`gain_scale`,
 `damping_scale`, `safety_margin_scale`), which absorb quantitative displacement. `auto_field_tune()`
 runs six constrained trials over a fixed gain/damping grid, accepts only candidates that satisfy
@@ -94,16 +105,16 @@ load, contact and envelope constraints, and keeps the classifier frozen througho
 
 ### 5. The 100 ms blind window, transients and link loss
 
-**Problem.** The 100 ms blind window comes from the 10 Hz slow-loop context update: the slow loop
+**Problem:** The 100 ms blind window comes from the 10 Hz slow-loop context update: the slow loop
 sees a new frame only every 100 ms. Stimulation pulses, commutation edges and sensor transients all
 fall inside that window, and a dropped link can leave a stale command in place.
 
-**Where the alternatives fail.** A slower supervisory scan only widens the interval. B2's 1 kHz
+**Where the alternatives fail:** A slower supervisory scan only widens the interval. B2's 1 kHz
 continuous action head reads fast-loop state every millisecond, but its context feature z is still
 constrained by the 100 ms slow-loop period and by transport delay. A transported frame age can be
 forged or frozen; without local evidence the loop cannot tell a quiet plant from a silent mailbox.
 
-**Mechanism.** A 32-byte probe runs at 1 kHz: a three-point median rejects single-tick glitches, a
+**Mechanism:** A 32-byte probe runs at 1 kHz: a three-point median rejects single-tick glitches, a
 cascaded high-pass extracts broadband innovation, and attack/release envelopes normalize it into a
 dimensionless residual. During a scheduled artifact, `blanking_active` freezes every probe state and
 returns 0.0f, so an already elevated residual cannot hold the veto through the blanking window. The
@@ -118,14 +129,14 @@ reduces the command magnitude and never re-energises.
 
 ### 6. Bare-metal limits and incident accountability
 
-**Problem.** The control task must run in a 1 kHz interrupt on a fixed-memory target, with no heap
+**Problem:** The control task must run in a 1 kHz interrupt on a fixed-memory target, with no heap
 and no operating system. An incident report must also state which decision and which root cause
 placed the actuator in a safe state.
 
-**Where the alternatives fail.** A Python or inference runtime brings allocation, scheduling jitter
+**Where the alternatives fail:** A Python or inference runtime brings allocation, scheduling jitter
 and untraceable state. A veto without persistent evidence cannot answer the post-incident question.
 
-**Mechanism.** The core is ANSI C99 with zero dynamic memory and statically sized state; object text
+**Mechanism:** The core is ANSI C99 with zero dynamic memory and statically sized state; object text
 is 6,572 bytes at `-Os` and 7,744 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe. The 7-bit
 `fault_audit_bitmask` records seven event classes: latency, residual OOD, low confidence, envelope
@@ -213,3 +224,5 @@ handled by the device adapter.
 Reproducible results and resource measurements are maintained in [README.md](../README.md).
 [AGENTS.md](../AGENTS.md) defines the implementation contract, and
 [the domain guide](domain_mapping_guide.md) defines how to map it.
+
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).

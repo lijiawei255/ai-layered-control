@@ -104,9 +104,11 @@ The C99 standalone regression passes 245 checks with zero failures; Python/C `--
 frames with all seven outputs at max diff = 0.0; the compiled object text measures 6,572 B at `-Os`
 and 7,744 B at `-O2`.
 
-For porting order, multi-axis ownership and timeout behavior, see [AGENTS.md](../AGENTS.md) and
+For interface adaptation order, multi-axis ownership and timeout behavior, see [AGENTS.md](../AGENTS.md) and
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md). Full numerical evidence is maintained in
 the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
+
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).
 
 ---
 
@@ -120,11 +122,11 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 | 模块 | 规模 | 职责 |
 | :--- | :--- | :--- |
 | [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
-| [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通新息包络）、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
+| [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通包络，提取标称模型预测残差（新息））、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四控制组抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 行 | Level-2 C-MEX S-Function：`DWork` 持有 96 B 状态，零全局变量、零动态内存，11 输入（10 字段 ABI + 确认上升沿）/ 7 输出 |
 
-[run_benchmark.py](run_benchmark.py) 是基准测试框架：搭建共享物理装置、训练 B2、运行分支对比
+[run_benchmark.py](run_benchmark.py) 是基准测试框架：搭建共享物理测试台架、训练 B2、运行分支对比
 与现场整定实验，并输出结果表。权威数值结果见根目录 [README.md](../README.md) 与
 [README_zh.md](../README_zh.md)；MIT 复用与可选引用说明见根目录的
 [license and citation guide](../README.md#license-and-citation)，作者与引用元数据在
@@ -153,9 +155,9 @@ python python_bench/run_benchmark.py --selftest
 零状态包络越界、零异常门控 / R4 / 损坏 tick，且 RMSE 低于 0.02 状态单位；冻结后的分类器
 同时用于现场整定。
 
-## 三槽位设备移植指南
+## 三槽位接口适配与核心 API
 
-模板中的三个槽位对应需要替换成设备代码的三处：
+模板中的三个槽位对应需要对接设备侧接口的三处：
 
 1. **SLOT 1**：把传感器、轨迹与执行器 I/O 换成设备的实测状态与指令通道。
 2. **SLOT 2**：定义已标定的标称预测器、独立残差探针，以及归一化的无量纲特征。
@@ -180,28 +182,30 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 `(measured_cost, valid)`：无效候选不能胜出；全部候选都不合格时，保留当前旋钮。固定搜索评估
 六组联合候选——增益/阻尼组合 `(0.75,1)`、`(1,1)`、`(1.25,1)`、`(2,1)`、`(1.25,0.5)`、
 `(1.25,0.75)`——每组在相同约束下独立判定，高阻尼试验不可行不会牵连低阻尼的对应项。
-增益/阻尼范围 [0.10,4.0]，裕度刻度范围 [0.10,1.0]；自动搜索增益/阻尼期间安全裕度刻度保持
+增益/阻尼范围 [0.10,4.0]，裕度缩放系数范围 [0.10,1.0]；自动搜索增益/阻尼期间安全裕度缩放系数保持
 冻结。试验要覆盖带载/静摩擦与接触工况，并约束接触力、否决占比与 R4 驻留时间。R4 忽略这些
 增益缩放、轨迹参考与前馈，只做指向安全零点的固定反馈。
 
 帧龄从源时间戳起每拍推进。`outer_seq` 非零时，内核用自己的 1 kHz 时钟测龄：新序号开启新租约，
-序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖停滞的邮箱；取 0 退回传统帧龄模式。
-原生 HOLD 保持已下发的执行器指令，以 `max_hold_ticks` 为界；超过后内核进入 `GATE_SAFE_ZERO`，
+序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖慢环通信停滞；取 0 退回传统帧龄模式。
+内核级 HOLD（指令保持）保持已下发的执行器指令，以 `max_hold_ticks` 为界；超过后内核进入 `GATE_SAFE_ZERO`，
 按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令归零——单 ULP 保底步长
-只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成去能。
-超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环邮箱字段畸形或现场旋钮非法时，
+只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成能量泄放归零。
+超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环通信帧字段畸形或现场旋钮非法时，
 以 `corrupted=1` 运行闭环 R4。探针模板的 `blanking_active` 输入在计划内刺激脉冲或换向边沿期间
-冻结全部探针状态并返回 0.0f，被消隐的扰动因此不会一直顶住 OOD 否决。安全/OOD 否决累计三次即
+冻结全部探针状态并返回 0.0f，被消隐的扰动因此不会在消隐期内持续锁死 OOD 否决状态。安全/OOD 否决累计三次即
 永久锁存 `GATE_LATCHED_SAFE`，直到确认解除；安全违规的统计以真实/实测状态为准，与门控动作无关。
 
 ## 基准验证摘要
 
 C99 独立回归 245 项全部通过、零失败；Python/C `--selftest` 回放 6,000 帧，binary32 下
-max |du| = 0 位级一致；MATLAB/C 等价性回放 40,000 帧正常帧与 40,000 帧损坏邮箱帧，并叠加非法
+max |du| = 0 位级一致；MATLAB/C 等价性回放 40,000 帧正常帧与 40,000 帧慢环通信损坏帧，并叠加非法
 旋钮注入，max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；Level-2
 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0；编译目标代码体积 `-Os` 下 6,572 B、
 `-O2` 下 7,744 B。
 
-移植顺序、多轴归属与超时行为见 [AGENTS.md](../AGENTS.md) 与
+接口适配顺序、多轴归属与超时行为见 [AGENTS.md](../AGENTS.md) 与
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md)。完整数值证据维护在根目录
 [README.md](../README.md) 与 [README_zh.md](../README_zh.md) 中。
+
+> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。

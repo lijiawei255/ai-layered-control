@@ -14,11 +14,11 @@ the mechanical benchmark is one common test fixture for all of them.
 | `x, x_dot` | Measured/estimated controlled state and rate, with explicit units（实测或估计的受控状态及其变化率，单位必须显式声明） |
 | `r, r_dot` | Reference and reference rate in the same units（与状态同单位的参考量及其变化率） |
 | `u_ff` | Deterministic commissioned-model feedforward（基于已标定模型的确定性前馈） |
-| `physics_residual` | Dimensionless independent nominal-physics innovation（由独立通道计算的无量纲标称物理新息） |
+| `physics_residual` | Dimensionless independent nominal-physics innovation（由独立通道计算的无量纲标称模型预测残差（新息）） |
 | `ai_regime, ai_confidence` | Normal regime 1–3 or explicit abstention 4, and confidence in [0,1]（正常工况编号 1–3，或显式弃权 4；置信度取值 [0,1]） |
 | `outer_age_s` | Transported age of the source frame, updated every fast tick（随帧传输的源帧龄，每个快拍更新一次） |
 | `outer_seq` | uint32 slow-frame sequence number; 0 selects the legacy `outer_age_s` mode（uint32 慢帧序号；取 0 时退回传统 `outer_age_s` 模式） |
-| `FieldTuning_t` | 12 B physical knobs: gain, damping and commissioned safety-margin scales（12 B 物理旋钮：增益、阻尼与已标定的安全裕度刻度） |
+| `FieldTuning_t` | 12 B physical knobs: gain, damping and commissioned safety-margin scales（12 B 物理旋钮：增益、阻尼与已标定的安全裕度缩放系数） |
 
 | ABI | Size |
 | :--- | :--- |
@@ -44,9 +44,9 @@ pulse or commutation edge, so an elevated residual cannot hold the OOD veto thro
 window; the device masks the gate for the same window and the probe resumes afterwards.
 
 [gate_template.c](../c99_layered_core/gate_template.c) 提供 1 kHz 探针模板：先做三点中值滤波，
-再串联高通新息包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部状态
-并输出 0.0f，这样计划内的刺激脉冲或换向边沿不会把已经抬高的残差带过硬件消隐窗口、一直顶住
-OOD 否决；设备侧在同一窗口内屏蔽门控输出，消隐结束后探针自动恢复工作。
+再串联高通预测残差包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部状态
+并输出 0.0f，这样计划内的刺激脉冲或换向边沿不会把已经抬高的残差带过硬件消隐窗口，也不会在消隐期内持续锁死
+OOD 否决状态；设备侧在同一窗口内屏蔽门控输出，消隐结束后探针自动恢复工作。
 
 ## Gate decisions and audit bits / 门控决策与审计位
 
@@ -54,16 +54,16 @@ OOD 否决；设备侧在同一窗口内屏蔽门控输出，消隐结束后探�
 | :---: | :--- | :--- |
 | 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs（接受决策层工况，运行所选控制组） |
 | 1 | `GATE_HOLD_LATENCY` | Stale frame or unusable fast input; last command held（帧过期或快环输入不可用，保持上一条指令） |
-| 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4（物理新息超出分布，弃权并切入 R4） |
+| 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4（物理预测残差超出分布，弃权并切入 R4） |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4（置信度低于阈值或显式工况 4，弃权并切入 R4） |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | State envelope or look-ahead exceeded; R4（状态包络或前视检查越界，切入 R4） |
-| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor toward zero applies only when the legal slew budget is below one representable step, only reduces \|u\| and never re-energises（原生 HOLD 超过 `max_hold_ticks = 100` 后：积分器清零，指令按上述步长单调归零；单 ULP 保底步长仅在合法斜率预算不足一个可表示步进时生效，只减小 \|u\|，绝不重新加能） |
+| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor toward zero applies only when the legal slew budget is below one representable step, only reduces \|u\| and never re-energises（内核级 HOLD（指令保持）超过 `max_hold_ticks = 100` 后：积分器清零，指令按上述步长单调归零；单 ULP 保底步长仅在合法斜率预算不足一个可表示步进时生效，只减小 \|u\|，绝不反向注入能量） |
 | 6 | `GATE_LATCHED_SAFE` | Cumulative severe faults (`max_fault_vetoes_before_latch = 3`): permanently in R4 until acknowledged（严重故障累计达 `max_fault_vetoes_before_latch = 3` 次：永久驻留 R4，直到人工确认解除） |
 
 | Bit | Fault |
 | :---: | :--- |
 | 1<<0 | `LATENCY_TIMEOUT`（帧龄/传输超时） |
-| 1<<1 | `OOD_RESIDUAL`（物理新息越界） |
+| 1<<1 | `OOD_RESIDUAL`（物理预测残差越界） |
 | 1<<2 | `LOW_CONFIDENCE`（置信度过低） |
 | 1<<3 | `ENVELOPE_BREACH`（状态包络越界） |
 | 1<<4 | `NAN_CORRUPTION`（NaN 数据损坏） |
@@ -127,7 +127,7 @@ A new physical domain starts with a new interface and commissioning archive.
 
 回调返回实测代价与约束是否满足：约束不合格的候选直接淘汰；全部候选都不合格时，
 沿用当前旋钮。试验要同时覆盖带载/静摩擦与接触工况，并对接触力、否决占比和 R4 驻留
-时间设限。自动搜索增益/阻尼期间，安全裕度刻度保持冻结。增益/阻尼限在 [0.10,4.0]，
+时间设限。自动搜索增益/阻尼期间，安全裕度缩放系数保持冻结。增益/阻尼限在 [0.10,4.0]，
 裕度限在 [0.10,1.0]。固定搜索共评估 6 组联合候选，每组都在相同约束下独立判定。
 同一接口内更换机台可以沿用已冻结的语义档案；进入全新物理领域则要重新建立接口与
 标定档案。
@@ -158,8 +158,8 @@ R4 uses fixed gains, zero-state error and no feedforward, independent of field t
 新帧到达后，要经过恢复冷却期（参考实现为 350 ms 超时加 300 ms 冷却）才恢复正常决策。
 慢环字段畸形同样切入闭环 R4，包络与残差的优先级不受影响。`outer_seq` 非零时，内核用自己的
 1 kHz 时钟测量帧龄：新序号开启一份新租约，序号不变则每拍老化一次；冻结或伪造的
-`outer_age_s` 无法掩盖停滞的邮箱，而序号回落到 0 会被视为数据损坏，而不是新帧。
-原生 HOLD 保持的是已下发的执行器指令，不是某个机械位置；超过 `max_hold_ticks` 后内核进入
+`outer_age_s` 无法掩盖慢环通信停滞，而序号回落到 0 会被视为数据损坏，而不是新帧。
+内核级 HOLD（指令保持）保持的是已下发的执行器指令，不是某个机械位置；超过 `max_hold_ticks` 后内核进入
 `GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令
 严格单调地归零。R4 使用固定增益、零状态误差、零前馈，与现场整定无关。
 
@@ -172,9 +172,13 @@ keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 
 S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
 
 C99 独立回归 245 项全部通过、零失败，`gate_template.c` 自检打印 PASS。Python/C `--selftest`
-回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、损坏邮箱帧与非法旋钮
+回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、慢环通信损坏帧与非法旋钮
 注入下均保持 max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；
 Level-2 S-Function 回放 1,100 帧，全部 7 路输出 max diff = 0.0。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).
+
+> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。
+
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).
