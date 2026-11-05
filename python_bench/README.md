@@ -1,24 +1,23 @@
-# Python entry point — v2.0.2
+# Python quick start and integration guide — v2.0.2
 
-This project is a full-stack dual-loop architecture: a 10 Hz qualitative supervisor feeds a 1 kHz
-deterministic C99 controller, and four reusable modules carry the integration. Each module is complete
-on its own: the Python template and the MCU probe are working references, the core is the deployable
-kernel, and the S-Function is the Simulink bridge. This directory hosts the template and the benchmark
-harness.
+This directory is the Python entry point of the repository: it hosts the integration template and the
+benchmark harness. Four reusable modules carry the integration, and each is complete on its own.
+
+## Directory role and the four reusable modules
 
 | Module | Size | Role |
 | :--- | :--- | :--- |
 | [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 20 lines for both helpers) and the SLOT 1..3 integration skeleton |
 | [gate_template.c](../c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU bare-metal ISR template: 32 B `LayeredProbe_t` (median glitch rejection + cascaded high-pass innovation envelope), `blanking_active` hardware blanking window and the `outer_seq` commit-marker pattern |
-| [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B state | 1 kHz zero-dependency ANSI C99 safety arbitration and four-bank anti-windup control micro-kernel |
+| [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B state | 1 kHz zero-dependency ANSI C99 safety arbitration and four-bank anti-windup control micro-kernel; the ABI occupies 96/140/12/40/28 B for state/config/tuning/input/output |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 lines | Level-2 C-MEX S-Function: `DWork` holds the 96 B state, zero global variables, zero dynamic memory, 11 inputs (10-field ABI + ack rising edge) and 7 outputs |
 
 [run_benchmark.py](run_benchmark.py) is the benchmark harness: it builds the shared physical fixture,
 trains B2, runs the branch comparisons and field-tuning experiments, and writes the result tables.
-Authoritative numerical results are in [README.md](../README.md) and [README_zh.md](../README_zh.md).
-MIT reuse and optional citation are described in the root
-[license and citation guide](../README.md#license-and-citation); [CITATION.cff](../CITATION.cff)
-contains the author and citation metadata.
+Authoritative numerical results live in [README.md](../README.md) and
+[README_zh.md](../README_zh.md); MIT reuse and optional citation are described in the root
+[license and citation guide](../README.md#license-and-citation), and
+[CITATION.cff](../CITATION.cff) contains the author and citation metadata.
 
 ## Run
 
@@ -32,79 +31,173 @@ python python_bench/run_benchmark.py --no-c
 python python_bench/run_benchmark.py --selftest
 ```
 
-The template requires a C99 compiler (`gcc` by default, or `CC`).
-It rebuilds the dynamic library when either `layered_gatekeeper.c` or `.h` changes.
-Compilation errors propagate directly. The benchmark's `--no-c` option selects its complete
-Python core mirror; `--selftest` compares the mirror with compiled C.
-Generated libraries and the Python preview figure remain ignored build artifacts.
+- `minimal_template.py` runs the self-contained template mission. It requires Python 3 plus the
+  packages in `requirements.txt`, and a C99 compiler (`gcc` by default, or the one named by `CC`,
+  looked up on `PATH`). It rebuilds the dynamic library whenever `layered_gatekeeper.c` or
+  `.h` changes, and compilation errors propagate directly.
+- `run_benchmark.py` executes the full benchmark suite under the same prerequisites.
+- `--no-c` selects the complete Python core mirror when no C compiler is available.
+- `--selftest` compares the Python mirror against the compiled C core.
 
-## Adapt three slots
+Generated libraries and the Python preview figure remain ignored build artifacts. The template's
+own PASS criteria are zero state-envelope violations, zero abnormal gate/R4/corruption ticks and
+RMSE below 0.02 state units; the frozen classifier also serves field tuning.
 
-1. Replace the sensor, trajectory and actuator I/O with the device's measured state and command.
-2. Define the commissioned nominal predictor, independent residual probe and normalized features.
-3. Supply labeled commissioning windows and a safe device-trial callback.
+## Adapt three slots and the core API
 
-`Core(config, tuning=(1,1,1))` accepts the exact C configuration names.
-Its `step(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq)`
-returns `(u, gate, regime, blend, fault_audit_bitmask, corrupted, u_target)`.
-The configuration bank fields `kp`, `kd`, `ki` and `ff_scale` each contain four values.
-`acknowledge_fault_latch()` calls `Layered_AcknowledgeFaultLatch()` and is the only release path for
-`GATE_LATCHED_SAFE`; the lifetime veto counters and the 7-bit `fault_audit_bitmask` survive the call.
+The three slots in the template mark the device-specific code:
 
-`auto_calibrate(samples, labels)` expects four dimensionless features and labels 1–3.
-It returns three prototypes and three confidence parameters.
-Freeze these parameters, then call `auto_field_tune(evaluate, current)`.
-The trial callback returns `(measured_cost, valid)`; reject constraint violations.
-Include load/stiction and contact trials, contact-force limits, veto fraction and R4 occupancy.
-Invalid candidates cannot win, and an entirely invalid search returns the current knobs.
-The fixed six-trial joint grid uses gain/damping pairs `(0.75,1)`, `(1,1)`, `(1.25,1)`,
-`(2,1)`, `(1.25,0.5)` and `(1.25,0.75)`. Safety margin stays fixed.
-Each pair is evaluated independently: an infeasible higher-damping trial does not exclude its
-lower-damping counterpart. Gain/damping lie in [0.10,4.0], margin in [0.10,1.0]. R4 ignores these gain
-scalings, trajectory references and feedforward; it uses fixed feedback toward the safe zero.
+1. **SLOT 1** — replace the sensor, trajectory and actuator I/O with the device's measured state and
+   command path.
+2. **SLOT 2** — define the commissioned nominal predictor, the independent residual probe and the
+   normalized dimensionless features.
+3. **SLOT 3** — supply the labeled commissioning windows and a safe device-trial callback for
+   field tuning.
 
-Frame age advances every tick from the source timestamp. With `outer_seq` nonzero the core measures age
-on its own 1 kHz clock: a new sequence opens a fresh lease, an unchanged one ages by one tick, and a
-frozen or forged `outer_age_s` cannot mask a stalled mailbox; 0 selects the legacy age mode.
-On timeout the adapter sends R4 with zero confidence while retaining the real age.
-Native HOLD retains an actuator command and is bounded by `max_hold_ticks`, after which the core enters
-`GATE_SAFE_ZERO` and ramps the command to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`, so a legal sub-ULP slew budget still de-energises in finite time.
-Malformed slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`.
-Invalid knobs use internal nominal scales; invalid configuration or fast sensors retain native HOLD.
-Three safety/OOD veto episodes latch `GATE_LATCHED_SAFE` permanently until acknowledged.
-Count safety violations from true/measured state, independently of gate activity.
+`Core(config, tuning=(1,1,1))` accepts the exact C configuration names; the bank fields `kp`, `kd`,
+`ki` and `ff_scale` each contain four values. One call
 
-The template commissions three viscous-load classes from measured velocity changes and applied effort.
-Its smooth trajectory starts at rest. PASS requires zero state-envelope violations, zero abnormal
-gate/R4/corruption ticks and RMSE below 0.02 state units; the frozen classifier also serves field tuning.
+```text
+step(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq)
+```
 
-## Benchmark contract
+takes 10 inputs — `ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot,
+u_ff, outer_seq` — and returns 7 outputs: `(u, gate, regime, blend, fault_audit_bitmask, corrupted,
+u_target)`. `acknowledge_fault_latch()` calls `Layered_AcknowledgeFaultLatch()` and is the only
+release path for `GATE_LATCHED_SAFE`; the lifetime veto counters and the 7-bit
+`fault_audit_bitmask` survive the call.
 
-The three branches are white-box feedforward plus PID, conditioned RBF continuous action,
-and a coarse supervisor plus deterministic gatekeeper. Both learned continuous actions and C control
-run at 1 kHz; only context/supervisor updates run at 10 Hz.
-The physical fixture combines Karnopp friction, unit drift, moving unilateral contact,
-white measurement noise and a variable-frequency flexible mode with positive stiffness and damping.
-The benchmark regenerates its training samples and classifier archive deterministically.
-It reports the four-stage metrics, mode ablations, frozen-AI tuning and action-sample efficiency.
-Per branch/unit, six full 40 s candidate missions provide 240 s of search trajectories;
-independent validation uses two 6 s S2 runs plus a 40 s mission, totaling 52 s.
-Search candidates must have zero breaches, nominal tracking and acceptable normal-stage contact
-force, veto fraction and R4 occupancy. Host simulation time is reported separately from trajectory time.
-The deployment path reads measured features; stage labels are confined to plant generation and scoring.
+`auto_calibrate(samples, labels)` expects four dimensionless features per window and labels 1–3,
+and returns three prototypes and three confidence parameters. Freeze these parameters, then call
+`auto_field_tune(evaluate, current)`. The trial callback returns `(measured_cost, valid)`; an
+invalid candidate cannot win, and if every candidate fails the constraints the search returns the
+current knobs. The fixed search evaluates six joint candidates — gain/damping pairs `(0.75,1)`,
+`(1,1)`, `(1.25,1)`, `(2,1)`, `(1.25,0.5)` and `(1.25,0.75)` — each independently under the same
+constraints, so an infeasible higher-damping trial does not exclude its lower-damping counterpart.
+Gain/damping lie in [0.10,4.0] and the margin scale in [0.10,1.0]; the safety-margin scale stays
+fixed during the automated gain/damping search. Include load/stiction and contact trials and
+constrain contact force, veto fraction and R4 occupancy. R4 ignores these gain scalings, trajectory
+references and feedforward; it uses fixed feedback toward the safe zero.
 
-The layered branch records S4 RMSE 0.539985 rad and TV 1545.01 N·m in the main comparison.
-C99 standalone regression passes 245 checks with zero failures, and the 120-line `gate_template.c`
-self-check prints PASS. Python/C `--selftest` replays 6,000 frames (R1 = 901, R2 = 900, R3 = 304,
-R4 = 3,895, including acknowledgement re-arming and the 7→5→3→1→0 ramp-down) with identical discrete
-outputs and max |du| = 0, bit-exact in binary32. MATLAB/C `verify_core_equivalence` covers 40,000 normal
-frames, 40,000 corrupted-mailbox frames and four 40,000-frame runs with illegal knob injection at
-max |du| = 5e-9; a 10,000-tick `outer_seq` lease replay covering HOLD → `SAFE_ZERO` and the
-zero-sequence corruption path stays within max |du| = 4.19e-8. The Level-2 S-Function replays 1,100
-frames with all seven outputs at max diff = 0.0.
-Object text measures 6,572 B at `-Os` and 7,744 B at `-O2` with GCC 4.9.2 TDM64 on x86-64.
-The ABI occupies 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe.
+Frame age advances every tick from the source timestamp. With `outer_seq` nonzero the core measures
+age on its own 1 kHz clock: a new sequence opens a fresh lease, an unchanged one ages by one tick,
+and a frozen or forged `outer_age_s` cannot mask a stalled mailbox; 0 selects the legacy age mode.
+Native HOLD retains the applied actuator command and is bounded by `max_hold_ticks`, after which the
+core enters `GATE_SAFE_ZERO` and ramps the command to zero in steps of
+`max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` — the one-ULP floor applies only when the
+legal slew budget is below one representable step, so a sub-ULP budget still de-energises in finite
+time. On timeout the adapter sends R4 with zero confidence while retaining the real age; malformed
+slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`. The
+`blanking_active` input of the probe template freezes every probe state and returns 0.0f during a
+scheduled stimulation pulse or commutation edge, so a blanked disturbance cannot hold the OOD veto
+open. Three safety/OOD veto episodes latch `GATE_LATCHED_SAFE` permanently until acknowledged;
+count safety violations from the true/measured state, independently of gate activity.
 
-Porting order, multi-axis ownership and timeout behavior are specified in
-[AGENTS.md](../AGENTS.md). The domain mapping contract is in
-[domain_mapping_guide.md](../docs/domain_mapping_guide.md).
+## Verification summary
+
+The C99 standalone regression passes 245 checks with zero failures; Python/C `--selftest` replays
+6,000 frames bit-exact in binary32 with max |du| = 0; MATLAB/C equivalence replays 40,000 normal and
+40,000 corrupted-mailbox frames plus illegal-knob runs at max |du| = 5e-9, and a 10,000-tick
+`outer_seq` lease replay stays within max |du| = 4.19e-8; the Level-2 S-Function replays 1,100
+frames with all seven outputs at max diff = 0.0; the compiled object text measures 6,572 B at `-Os`
+and 7,744 B at `-O2`.
+
+For porting order, multi-axis ownership and timeout behavior, see [AGENTS.md](../AGENTS.md) and
+[domain_mapping_guide.md](../docs/domain_mapping_guide.md). Full numerical evidence is maintained in
+the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
+
+---
+
+# Python 快速上手与接入指南 — v2.0.2
+
+本目录是仓库的 Python 入口：集成模板与基准测试框架都放在这里。接入工作由四个可复用模块承担，
+每个模块都可以独立使用。
+
+## 目录定位与四大模块概览表
+
+| 模块 | 规模 | 职责 |
+| :--- | :--- | :--- |
+| [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
+| [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通新息包络）、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
+| [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四控制组抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
+| [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 行 | Level-2 C-MEX S-Function：`DWork` 持有 96 B 状态，零全局变量、零动态内存，11 输入（10 字段 ABI + 确认上升沿）/ 7 输出 |
+
+[run_benchmark.py](run_benchmark.py) 是基准测试框架：搭建共享物理装置、训练 B2、运行分支对比
+与现场整定实验，并输出结果表。权威数值结果见根目录 [README.md](../README.md) 与
+[README_zh.md](../README_zh.md)；MIT 复用与可选引用说明见根目录的
+[license and citation guide](../README.md#license-and-citation)，作者与引用元数据在
+[CITATION.cff](../CITATION.cff) 中。
+
+## 运行命令
+
+在仓库根目录执行：
+
+```powershell
+python -m pip install -r python_bench/requirements.txt
+python python_bench/minimal_template.py
+python python_bench/run_benchmark.py
+python python_bench/run_benchmark.py --no-c
+python python_bench/run_benchmark.py --selftest
+```
+
+- `minimal_template.py` 运行自包含的模板任务。前置条件是 Python 3 加 `requirements.txt` 中的
+  依赖，以及一个 C99 编译器（默认 `gcc`，也可用 `CC` 指定，在 `PATH` 上查找）。
+  `layered_gatekeeper.c` 或 `.h` 有变动时会自动重建动态库，编译错误直接抛出。
+- `run_benchmark.py` 在同样的前置条件下运行完整基准套件。
+- `--no-c` 在没有 C 编译器时改用完整的 Python 内核镜像。
+- `--selftest` 把 Python 镜像与编译出的 C 内核逐帧对拍。
+
+生成的动态库与 Python 预览图均为被忽略的构建产物，不会入库。模板自带的 PASS 判据是：
+零状态包络越界、零异常门控 / R4 / 损坏 tick，且 RMSE 低于 0.02 状态单位；冻结后的分类器
+同时用于现场整定。
+
+## 三槽位设备移植指南
+
+模板中的三个槽位对应需要替换成设备代码的三处：
+
+1. **SLOT 1**：把传感器、轨迹与执行器 I/O 换成设备的实测状态与指令通道。
+2. **SLOT 2**：定义已标定的标称预测器、独立残差探针，以及归一化的无量纲特征。
+3. **SLOT 3**：提供带标签的标定窗口，以及一个安全的设备试验回调用于现场整定。
+
+`Core(config, tuning=(1,1,1))` 接受与 C 完全一致的配置名；`kp`、`kd`、`ki`、`ff_scale`
+四个控制组字段各含四个值。一次调用
+
+```text
+step(ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq)
+```
+
+接收 10 个输入——`ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot,
+u_ff, outer_seq`——返回 7 个输出：`(u, gate, regime, blend, fault_audit_bitmask, corrupted,
+u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultLatch()`，是解除
+`GATE_LATCHED_SAFE` 的唯一路径；终身否决计数与 7 位 `fault_audit_bitmask` 在调用后保留。
+
+`auto_calibrate(samples, labels)` 要求每个窗口给出四个无量纲特征，标签取 1–3，返回三个原型
+与三个置信度参数。冻结这些参数后调用 `auto_field_tune(evaluate, current)`。试验回调返回
+`(measured_cost, valid)`：无效候选不能胜出；全部候选都不合格时，保留当前旋钮。固定搜索评估
+六组联合候选——增益/阻尼组合 `(0.75,1)`、`(1,1)`、`(1.25,1)`、`(2,1)`、`(1.25,0.5)`、
+`(1.25,0.75)`——每组在相同约束下独立判定，高阻尼试验不可行不会牵连低阻尼的对应项。
+增益/阻尼范围 [0.10,4.0]，裕度刻度范围 [0.10,1.0]；自动搜索增益/阻尼期间安全裕度刻度保持
+冻结。试验要覆盖带载/静摩擦与接触工况，并约束接触力、否决占比与 R4 驻留时间。R4 忽略这些
+增益缩放、轨迹参考与前馈，只做指向安全零点的固定反馈。
+
+帧龄从源时间戳起每拍推进。`outer_seq` 非零时，内核用自己的 1 kHz 时钟测龄：新序号开启新租约，
+序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖停滞的邮箱；取 0 退回传统帧龄模式。
+原生 HOLD 保持已下发的执行器指令，以 `max_hold_ticks` 为界；超过后内核进入 `GATE_SAFE_ZERO`，
+按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令归零——单 ULP 保底步长
+只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成去能。
+超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环邮箱字段畸形或现场旋钮非法时，
+以 `corrupted=1` 运行闭环 R4。探针模板的 `blanking_active` 输入在计划内刺激脉冲或换向边沿期间
+冻结全部探针状态并返回 0.0f，被消隐的扰动因此不会一直顶住 OOD 否决。安全/OOD 否决累计三次即
+永久锁存 `GATE_LATCHED_SAFE`，直到确认解除；安全违规的统计以真实/实测状态为准，与门控动作无关。
+
+## 基准验证摘要
+
+C99 独立回归 245 项全部通过、零失败；Python/C `--selftest` 回放 6,000 帧，binary32 下
+max |du| = 0 位级一致；MATLAB/C 等价性回放 40,000 帧正常帧与 40,000 帧损坏邮箱帧，并叠加非法
+旋钮注入，max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；Level-2
+S-Function 回放 1,100 帧，7 路输出 max diff = 0.0；编译目标代码体积 `-Os` 下 6,572 B、
+`-O2` 下 7,744 B。
+
+移植顺序、多轴归属与超时行为见 [AGENTS.md](../AGENTS.md) 与
+[domain_mapping_guide.md](../docs/domain_mapping_guide.md)。完整数值证据维护在根目录
+[README.md](../README.md) 与 [README_zh.md](../README_zh.md) 中。

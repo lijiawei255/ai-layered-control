@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you find this reference architecture or benchmark useful in your research or engineering projects, citation using the metadata below is welcome and optional."
 type: software
 title: "ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control"
-abstract: "A full-stack fast-slow reference architecture for layered closed-loop AI control. A 10 Hz qualitative supervisor is commissioned from 36 labeled macro-windows, stores 15 scalars (60 B) as prototypes, exposes a distance-based confidence and abstains explicitly outside its manifold. The frozen supervisor is paired with a 12 B three-knob physical tuning tuple for constrained on-site calibration, and with a 1 kHz 32 B blanking residual probe that rejects broadband innovation while freezing through stimulation and commutation artifacts. A 96 B zero-dynamic-memory ANSI C99 gatekeeper owns the 1 kHz command through four anti-windup control banks, seven observable gate states, cumulative severe-fault latching and a 7-bit audit mask. Python and MATLAB/Simulink C-MEX paths replay the same frozen core, with domain interface mappings for Industrial WAAM, Edge VLA, and Closed-Loop Neuromodulation."
+abstract: "A fast-slow reference architecture for layered closed-loop AI control, built on strict fast/slow authority decoupling: the slow-loop AI gets no actuator authority, and the deterministic fast loop alone writes the actuator command. A 10 Hz qualitative supervisor is commissioned from 36 labeled macro-windows, stores 15 scalars (60 B) as prototypes, exposes a distance-based confidence and abstains explicitly outside its manifold. The frozen supervisor is paired with a 12 B three-knob physical tuning tuple for constrained on-site calibration, and with a 1 kHz 32 B blanking residual probe that rejects broadband innovation while freezing through stimulation and commutation artifacts. A 96 B zero-dynamic-memory ANSI C99 gatekeeper owns the 1 kHz command through four anti-windup control banks, seven observable gate states, cumulative severe-fault latching and a 7-bit audit mask. Python and MATLAB/Simulink C-MEX paths replay the same frozen core, with domain interface mappings for Industrial WAAM, Edge VLA, and Closed-Loop Neuromodulation."
 authors:
   - family-names: "Li"
     given-names: "Jiawei"
@@ -19,7 +19,7 @@ keywords:
   - "embedded-c"
   - "runtime-assurance"
   - "ood-detection"
-  - "vision-language-action"
+  - "simplex-architecture"
   - "neuromodulation"
   - "python"
   - "fast-slow-decoupling"

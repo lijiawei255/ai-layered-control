@@ -4,27 +4,27 @@ The architecture is a generic division of control authority. Industrial WAAM / P
 Edge VLA / fast-slow robotics and closed-loop aDBS / SCS are three equal application examples;
 the mechanical benchmark is one common test fixture for all of them.
 
-本架构提供通用的控制权限分工。工业 WAAM／PLC 伺服、边缘具身智能、植入式闭环神经调控是并列实例，
-机械基准是三者共用的一套试验台。
+本架构只规定控制权限如何划分，与具体被控对象无关。工业 WAAM／PLC 伺服、边缘具身智能、
+闭环神经调控（aDBS／SCS）是三个地位并列的应用实例，机械基准则是三者共用的同一套试验台。
 
 ## The interface / 接口
 
 | Contract | Device-specific definition |
 | :--- | :--- |
-| `x, x_dot` | Measured/estimated controlled state and rate, with explicit units |
-| `r, r_dot` | Reference and reference rate in the same units |
-| `u_ff` | Deterministic commissioned-model feedforward |
-| `physics_residual` | Dimensionless independent nominal-physics innovation |
-| `ai_regime, ai_confidence` | Normal regime 1–3 or explicit abstention 4, and confidence in [0,1] |
-| `outer_age_s` | Transported age of the source frame, updated every fast tick |
-| `outer_seq` | uint32 slow-frame sequence number; 0 selects the legacy `outer_age_s` mode |
-| `FieldTuning_t` | 12 B physical knobs: gain, damping and commissioned safety-margin scales |
+| `x, x_dot` | Measured/estimated controlled state and rate, with explicit units（实测或估计的受控状态及其变化率，单位必须显式声明） |
+| `r, r_dot` | Reference and reference rate in the same units（与状态同单位的参考量及其变化率） |
+| `u_ff` | Deterministic commissioned-model feedforward（基于已标定模型的确定性前馈） |
+| `physics_residual` | Dimensionless independent nominal-physics innovation（由独立通道计算的无量纲标称物理新息） |
+| `ai_regime, ai_confidence` | Normal regime 1–3 or explicit abstention 4, and confidence in [0,1]（正常工况编号 1–3，或显式弃权 4；置信度取值 [0,1]） |
+| `outer_age_s` | Transported age of the source frame, updated every fast tick（随帧传输的源帧龄，每个快拍更新一次） |
+| `outer_seq` | uint32 slow-frame sequence number; 0 selects the legacy `outer_age_s` mode（uint32 慢帧序号；取 0 时退回传统 `outer_age_s` 模式） |
+| `FieldTuning_t` | 12 B physical knobs: gain, damping and commissioned safety-margin scales（12 B 物理旋钮：增益、阻尼与已标定的安全裕度刻度） |
 
 | ABI | Size |
 | :--- | :--- |
-| `LayeredState_t` / `LayeredConfig_t` | 96 B / 140 B |
-| `FieldTuning_t` / `LayeredInput_t` / `LayeredOutput_t` | 12 B / 40 B / 28 B |
-| `LayeredProbe_t` (`gate_template.c`) | 32 B |
+| `LayeredState_t` / `LayeredConfig_t` | 96 B / 140 B（内核状态 / 配置） |
+| `FieldTuning_t` / `LayeredInput_t` / `LayeredOutput_t` | 12 B / 40 B / 28 B（整定旋钮 / 输入 / 输出） |
+| `LayeredProbe_t` (`gate_template.c`) | 32 B（探针状态） |
 
 Define the actuator mapping, state envelope, slew bounds and fallback objective together.
 Express the commissioned fallback point as state zero for the fixed R4 law.
@@ -32,9 +32,10 @@ Nominal-model mismatch informs the probe; the classifier cannot redefine that ev
 Choose dimensionless macro-features from measured signals and commission their scales.
 No deployed mode decision may use benchmark stage labels or scheduled fault times.
 
-执行器映射、状态包络、斜率限制与回退目标应一起定义。标称模型残差由独立探针计算，
-分类器不能改变这份物理证据。宏观特征来自可测信号，尺度通过设备标定确定。
-部署路径不读取阶段真值或预定故障时刻。
+执行器映射、状态包络、斜率上限与回退目标要放在一起定义，不能分开决定。固定的 R4 回退律
+以标定好的回退点为状态零点。标称模型失配由独立探针量化为残差，分类器无权修改这份物理证据。
+无量纲宏观特征必须取自可测信号，其尺度在设备标定时确定。任何部署态的模态决策都不得使用
+基准的阶段标签或预设故障时刻。
 
 The 1 kHz probe template in [gate_template.c](../c99_layered_core/gate_template.c) runs a three-point
 median followed by a cascaded high-pass innovation envelope and fits in a 32 B `LayeredProbe_t`.
@@ -42,31 +43,32 @@ Its `blanking_active` input freezes every probe state and returns 0.0f during a 
 pulse or commutation edge, so an elevated residual cannot hold the OOD veto through a hardware blanking
 window; the device masks the gate for the same window and the probe resumes afterwards.
 
-[gate_template.c](../c99_layered_core/gate_template.c) 提供 1 kHz 探针模板：三点中值后接级联高通
-新息包络，状态仅 32 B。`blanking_active` 有效时冻结全部探针状态并返回 0.0f，使计划内的刺激脉冲
-或换向边沿不会把已抬高的残差带过硬件消隐窗口；同一窗口内设备侧屏蔽门控输出，消隐结束后探针恢复。
+[gate_template.c](../c99_layered_core/gate_template.c) 提供 1 kHz 探针模板：先做三点中值滤波，
+再串联高通新息包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部状态
+并输出 0.0f，这样计划内的刺激脉冲或换向边沿不会把已经抬高的残差带过硬件消隐窗口、一直顶住
+OOD 否决；设备侧在同一窗口内屏蔽门控输出，消隐结束后探针自动恢复工作。
 
 ## Gate decisions and audit bits / 门控决策与审计位
 
 | Code | Gate | Meaning |
 | :---: | :--- | :--- |
-| 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs |
-| 1 | `GATE_HOLD_LATENCY` | Stale frame or unusable fast input; last command held |
-| 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4 |
-| 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4 |
-| 4 | `GATE_VETO_SAFETY_ENVELOPE` | State envelope or look-ahead exceeded; R4 |
-| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor toward zero applies only when the legal slew budget is below one representable step, only reduces \|u\| and never re-energises |
-| 6 | `GATE_LATCHED_SAFE` | Cumulative severe faults (`max_fault_vetoes_before_latch = 3`): permanently in R4 until acknowledged |
+| 0 | `GATE_NORMAL` | Supervisor regime accepted; the selected bank runs（接受决策层工况，运行所选控制组） |
+| 1 | `GATE_HOLD_LATENCY` | Stale frame or unusable fast input; last command held（帧过期或快环输入不可用，保持上一条指令） |
+| 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4（物理新息超出分布，弃权并切入 R4） |
+| 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4（置信度低于阈值或显式工况 4，弃权并切入 R4） |
+| 4 | `GATE_VETO_SAFETY_ENVELOPE` | State envelope or look-ahead exceeded; R4（状态包络或前视检查越界，切入 R4） |
+| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor toward zero applies only when the legal slew budget is below one representable step, only reduces \|u\| and never re-energises（原生 HOLD 超过 `max_hold_ticks = 100` 后：积分器清零，指令按上述步长单调归零；单 ULP 保底步长仅在合法斜率预算不足一个可表示步进时生效，只减小 \|u\|，绝不重新加能） |
+| 6 | `GATE_LATCHED_SAFE` | Cumulative severe faults (`max_fault_vetoes_before_latch = 3`): permanently in R4 until acknowledged（严重故障累计达 `max_fault_vetoes_before_latch = 3` 次：永久驻留 R4，直到人工确认解除） |
 
 | Bit | Fault |
 | :---: | :--- |
-| 1<<0 | `LATENCY_TIMEOUT` |
-| 1<<1 | `OOD_RESIDUAL` |
-| 1<<2 | `LOW_CONFIDENCE` |
-| 1<<3 | `ENVELOPE_BREACH` |
-| 1<<4 | `NAN_CORRUPTION` |
-| 1<<5 | `HOLD_TIMEOUT` |
-| 1<<6 | `PERMANENT_LATCH` |
+| 1<<0 | `LATENCY_TIMEOUT`（帧龄/传输超时） |
+| 1<<1 | `OOD_RESIDUAL`（物理新息越界） |
+| 1<<2 | `LOW_CONFIDENCE`（置信度过低） |
+| 1<<3 | `ENVELOPE_BREACH`（状态包络越界） |
+| 1<<4 | `NAN_CORRUPTION`（NaN 数据损坏） |
+| 1<<5 | `HOLD_TIMEOUT`（保持超时） |
+| 1<<6 | `PERMANENT_LATCH`（永久锁存） |
 
 A safety or OOD veto episode increments the latch counter; the third episode latches
 `GATE_LATCHED_SAFE`. `Layered_AcknowledgeFaultLatch()` is the only release path: it clears the veto and
@@ -75,10 +77,11 @@ permanent latches, resets the episode counter, keeps the lifetime veto counters 
 accepted again. A veto or the permanent latch selects R4 with the blend filter bypassed (blend = 1.0),
 so emergency damping is not delayed by transfer smoothing.
 
-安全或残差否决的一个 episode 增加一次锁存计数，累计 3 次即进入 `GATE_LATCHED_SAFE`。
-唯一解除路径是 `Layered_AcknowledgeFaultLatch()`：清除否决与永久锁存、重置 episode 计数，
-保留终身否决计数与 7 位 `fault_audit_bitmask` 供事后追溯，并重新武装恢复冷却期后才允许接受正常工况。
-否决激活或永久锁存切入 R4 时旁路 blend 滤波（blend = 1.0），紧急阻尼不受一阶无扰切换的延迟影响。
+安全否决或残差否决每发生一次完整事件，锁存计数加一；累计第 3 次即锁存为 `GATE_LATCHED_SAFE`。
+唯一的解除路径是调用 `Layered_AcknowledgeFaultLatch()`：它清除否决锁存与永久锁存、把事件计数
+归零，但保留终身否决计数和 7 位 `fault_audit_bitmask` 供事后追溯，并重新启动恢复冷却期，
+冷却结束后才允许再次接受正常工况。一旦否决生效或永久锁存，控制器直接切入 R4 并旁路 blend
+滤波（blend = 1.0），紧急阻尼不会被无扰切换的平滑过程拖延。
 
 ## Three parallel examples / 三类并列实例
 
@@ -94,9 +97,10 @@ For robotics, separate task semantics from the fast measured-state control inter
 For neuromodulation, define device-specific states and timing constraints;
 mechanical PID gains and torque limits do not transfer by renaming variables.
 
-工业过程控制先选可观测过程量及其执行器模型；伺服先确定驱动单位与接触约束。
-机器人把任务语义与快速状态闭环分开。
-神经调控按设备定义状态、输出和时序约束，不能把机械增益和力矩阈值直接改名套用。
+工业 WAAM 要先选定一个可观测的过程量及其因果执行器模型；伺服应用则要先明确驱动侧的
+实际单位与接触约束。机器人应把任务语义与基于实测状态的快速闭环接口分开，两层各管各的。
+神经调控按设备自身定义状态、输出与时序约束——机械基准里的 PID 增益和力矩限值，
+不会因为改了变量名就能直接套用。
 
 ## Commission, freeze, tune / 建档、冻结、整定
 
@@ -114,12 +118,19 @@ The fixed search evaluates six joint candidates, each independently under the sa
 A new unit within the same interface can retain the semantic archive.
 A new physical domain starts with a new interface and commissioning archive.
 
-每次候选试验返回实测误差与约束是否满足；不合格候选不能被选中，
-全部不合格时保留当前旋钮。自动增益／阻尼搜索保持已确定的安全裕度不变。
-试验覆盖重载静摩擦与接触工况，同时限制接触力、否决率和 R4 占比。
-增益／阻尼范围为 [0.10,4.0]，安全裕度范围为 [0.10,1.0]。
-固定搜索评估 6 组联合候选，每组都在相同约束下独立判定。
-同场景换机台可冻结语义档案，全新物理领域先建立新接口与标定档案。
+中文操作顺序与上文一致：
+
+1. 定义信号、单位、标称模型、控制器组与显式回退。
+2. 采集带标签的宏观特征窗口，调用 `auto_calibrate(samples, labels)`。
+3. 冻结原型、距离衰减系数与置信度阈值。
+4. 挂上设备侧的安全试验回调，运行 `auto_field_tune(evaluate, current)`。
+
+回调返回实测代价与约束是否满足：约束不合格的候选直接淘汰；全部候选都不合格时，
+沿用当前旋钮。试验要同时覆盖带载/静摩擦与接触工况，并对接触力、否决占比和 R4 驻留
+时间设限。自动搜索增益/阻尼期间，安全裕度刻度保持冻结。增益/阻尼限在 [0.10,4.0]，
+裕度限在 [0.10,1.0]。固定搜索共评估 6 组联合候选，每组都在相同约束下独立判定。
+同一接口内更换机台可以沿用已冻结的语义档案；进入全新物理领域则要重新建立接口与
+标定档案。
 
 ## Multi-axis and timeout / 多轴与超时
 
@@ -140,16 +151,17 @@ Native HOLD preserves the applied command, not a mechanical position; past `max_
 enters `GATE_SAFE_ZERO` and ramps to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
 R4 uses fixed gains, zero-state error and no feedforward, independent of field tuning.
 
-每通道独立持有状态、探针、旋钮与源时间戳。
-只有单位和控制定义相同的通道才能共享只读配置。
-适配层处理耦合约束与协调回退，C API 保持单轴形式。
-超时后保留真实帧龄并显式发送 R4，既运行确定性回退，又保留延迟故障的可观测性。
-新鲜帧经过恢复冷却期后才重新启用正常模态。
-慢环字段损坏也进入闭环 R4，保留包络与残差优先级。
-`outer_seq` 非零时，内核用本地 1 kHz 时钟测量帧龄：序号变化即打开新租约，序号不变则每 tick 老化一次，
-冻结或伪造的 `outer_age_s` 无法掩盖停滞的邮箱。原生 HOLD 保持的是执行器指令而非机械位置；
-超过 `max_hold_ticks` 后进入 `GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长严格单调归零。
-R4 固定增益、零状态参考和零前馈，不受现场增益旋钮缩放。
+每个通道各自持有状态、探针、整定参数与源时间戳。只有单位和控制定义完全相同的通道才允许
+共享只读配置。耦合约束的评估与各轴回退的协调由适配层负责，核心 C API 保持单轴形态。
+
+帧过期时，保留真实帧龄并显式发送 R4 弃权：确定性回退继续运行，延迟故障也依然可观测。
+新帧到达后，要经过恢复冷却期（参考实现为 350 ms 超时加 300 ms 冷却）才恢复正常决策。
+慢环字段畸形同样切入闭环 R4，包络与残差的优先级不受影响。`outer_seq` 非零时，内核用自己的
+1 kHz 时钟测量帧龄：新序号开启一份新租约，序号不变则每拍老化一次；冻结或伪造的
+`outer_age_s` 无法掩盖停滞的邮箱，而序号回落到 0 会被视为数据损坏，而不是新帧。
+原生 HOLD 保持的是已下发的执行器指令，不是某个机械位置；超过 `max_hold_ticks` 后内核进入
+`GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令
+严格单调地归零。R4 使用固定增益、零状态误差、零前馈，与现场整定无关。
 
 ## Verification / 验证
 
@@ -159,9 +171,10 @@ keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 
 `outer_seq` lease replay stays within max |du| = 4.19e-8, and the Level-2
 S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
 
-C99 独立回归 245 项全部通过、0 失败；`gate_template.c` 自检输出 PASS。
-Python/C `--selftest` 回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、损坏邮箱帧
-与非法旋钮注入下均保持 max |du| = 5e-9；10,000 tick 的 `outer_seq` 租约回放 max |du| = 4.19e-8；Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
+C99 独立回归 245 项全部通过、零失败，`gate_template.c` 自检打印 PASS。Python/C `--selftest`
+回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、损坏邮箱帧与非法旋钮
+注入下均保持 max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 4.19e-8；
+Level-2 S-Function 回放 1,100 帧，全部 7 路输出 max diff = 0.0。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).
