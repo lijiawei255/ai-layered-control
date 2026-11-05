@@ -39,14 +39,18 @@ No deployed mode decision may use benchmark stage labels or scheduled fault time
 
 The 1 kHz probe template in [gate_template.c](../c99_layered_core/gate_template.c) runs a three-point
 median followed by a cascaded high-pass innovation envelope and fits in a 32 B `LayeredProbe_t`.
-Its `blanking_active` input freezes every probe state and returns 0.0f during a scheduled stimulation
-pulse or commutation edge, so an elevated residual cannot hold the OOD veto through a hardware blanking
-window; the device masks the gate for the same window and the probe resumes afterwards.
+Its `blanking_active` input freezes every internal filter state and holds the pre-blanking residual
+(`return p->residual`) during a scheduled stimulation pulse or commutation edge instead of returning
+0.0f: a normal periodic pulse cannot raise the residual, a sustained fault spanning periodic
+blanking keeps one OOD latch episode instead of being fragmented into several, and outside the
+blanking window the residual decays along the release envelope; no device-side masking of the
+gating output is required.
 
 [gate_template.c](../c99_layered_core/gate_template.c) 提供 1 kHz 探针模板：先做三点中值滤波，
-再串联高通预测残差包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部状态
-并输出 0.0f，这样计划内的刺激脉冲或换向边沿不会把已经抬高的残差带过硬件消隐窗口，也不会在消隐期内持续锁死
-OOD 否决状态；设备侧在同一窗口内屏蔽门控输出，消隐结束后探针自动恢复工作。
+再串联高通预测残差包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部
+滤波器状态并保持消隐前的残差（`return p->residual`），而不是输出 0.0f：正常周期性脉冲不会
+抬升残差；跨越多个消隐窗口的持续真实异常只计为一次 OOD 锁存事件，不会被切碎成多次；消隐
+窗口之外，残差按释放包络自然衰减。设备侧无需在同一窗口内屏蔽门控输出。
 
 ## Gate decisions and audit bits / 门控决策与审计位
 
@@ -179,6 +183,6 @@ Level-2 S-Function 回放 1,100 帧，全部 7 路输出 max diff = 0.0。
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).
 
-> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。
+> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。应用映射是适配方向，不是硬件、临床或功能安全验证或认证，亦不替代 IEC 61508、ISO 13849、ISO 26262 或 IEC 62304 等标准下的认证与生命周期过程要求。
 
-> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)). The application mappings are directions for adaptation, not hardware, clinical or functional-safety verification or certification, and they do not replace certification or lifecycle processes under IEC 61508, ISO 13849, ISO 26262 or IEC 62304.

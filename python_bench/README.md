@@ -93,10 +93,14 @@ core enters `GATE_SAFE_ZERO` and ramps the command to zero in steps of
 legal slew budget is below one representable step, so a sub-ULP budget still de-energises in finite
 time. On timeout the adapter sends R4 with zero confidence while retaining the real age; malformed
 slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`. The
-`blanking_active` input of the probe template freezes every probe state and returns 0.0f during a
-scheduled stimulation pulse or commutation edge, so a blanked disturbance cannot hold the OOD veto
-open. Three safety/OOD veto episodes latch `GATE_LATCHED_SAFE` permanently until acknowledged;
-count safety violations from the true/measured state, independently of gate activity.
+`blanking_active` input of the probe template freezes every internal filter state and holds the
+pre-blanking residual (`return p->residual`) during a scheduled stimulation pulse or commutation
+edge instead of returning 0.0f: a normal periodic pulse cannot raise the residual, and during a
+sustained fault periodic blanking cannot reset the OOD latch and fragment one anomaly into several
+latch episodes that would falsely trip the three-episode permanent latch; outside the blanking
+window the residual decays along the release envelope. Three safety/OOD veto episodes latch
+`GATE_LATCHED_SAFE` permanently until acknowledged; count safety violations from the true/measured
+state, independently of gate activity.
 
 ## Verification summary
 
@@ -111,7 +115,7 @@ For interface adaptation order, multi-axis ownership and timeout behavior, see [
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md). Full numerical evidence is maintained in
 the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
-> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)). The application mappings are directions for adaptation, not hardware, clinical or functional-safety verification or certification, and they do not replace certification or lifecycle processes under IEC 61508, ISO 13849, ISO 26262 or IEC 62304.
 
 ---
 
@@ -198,7 +202,9 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成能量泄放归零。
 超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环通信帧字段畸形或现场旋钮非法时，
 以 `corrupted=1` 运行闭环 R4。探针模板的 `blanking_active` 输入在计划内刺激脉冲或换向边沿期间
-冻结全部探针状态并返回 0.0f，被消隐的扰动因此不会在消隐期内持续锁死 OOD 否决状态。安全/OOD 否决累计三次即
+冻结全部内部滤波器状态并保持消隐前的残差（`return p->residual`），而不是返回 0.0f：正常周期性
+脉冲不会抬升残差；真实异常持续期间，周期性消隐也不会重置 OOD 锁存、把单次异常切碎为多次锁存
+事件而误触发三次故障永久锁存；消隐窗口之外，残差按释放包络自然衰减。安全/OOD 否决累计三次即
 永久锁存 `GATE_LATCHED_SAFE`，直到确认解除；安全违规的统计以真实/实测状态为准，与门控动作无关。
 
 ## 基准验证摘要
@@ -213,4 +219,4 @@ S-Function 回放 1,100 帧，7 路输出 max diff = 0.0；编译目标代码体
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md)。完整数值证据维护在根目录
 [README.md](../README.md) 与 [README_zh.md](../README_zh.md) 中。
 
-> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。
+> **适用范围：** 本仓库为个人开发者维护的非认证工程参考架构；真实设备集成须由部署方独立完成危险分析与安全验证，并保留独立于本软件的硬件安全保护（E-stop、STO、硬件电荷平衡限制器，详见根目录 [README_zh.md 许可与引用](../README_zh.md#许可与引用)）。应用映射是适配方向，不是硬件、临床或功能安全验证或认证，亦不替代 IEC 61508、ISO 13849、ISO 26262 或 IEC 62304 等标准下的认证与生命周期过程要求。

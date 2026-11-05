@@ -121,8 +121,11 @@ forged or frozen; without local evidence the loop cannot tell a quiet plant from
 
 **Mechanism:** A 32-byte probe runs at 1 kHz: a three-point median rejects single-tick glitches, a
 cascaded high-pass extracts broadband innovation, and attack/release envelopes normalize it into a
-dimensionless residual. During a scheduled artifact, `blanking_active` freezes every probe state and
-returns 0.0f, so an already elevated residual cannot hold the veto through the blanking window. The
+dimensionless residual. During a scheduled artifact, `blanking_active` freezes every internal filter
+state and holds the pre-blanking residual (`return p->residual`) instead of returning 0.0f: a normal
+periodic pulse cannot raise the residual, periodic blanking cannot fragment one sustained fault into
+several latch episodes and falsely trip the three-episode permanent latch, and outside the blanking
+window the residual decays along the release envelope. The
 96-byte core adds three further layers: a 25 ms state safety envelope with phase-plane look-ahead,
 an independent residual veto, and a local clock lease on `outer_seq` so a frozen transported age
 cannot mask a stalled mailbox. Native HOLD is bounded: past `max_hold_ticks` (100 ticks in the
@@ -233,4 +236,4 @@ Reproducible results and resource measurements are maintained in [README.md](../
 [AGENTS.md](../AGENTS.md) defines the implementation contract, and
 [the domain guide](domain_mapping_guide.md) defines how to map it.
 
-> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)).
+> **Scope:** This repository is an uncertified engineering reference architecture maintained by an independent developer; real-equipment integration requires deployer-owned hazard validation and independent hardware safety protection (E-stop, STO, hardware charge-balance limiters; see the root [README.md License and citation](../README.md#license-and-citation)). The application mappings are directions for adaptation, not hardware, clinical or functional-safety verification or certification, and they do not replace certification or lifecycle processes under IEC 61508, ISO 13849, ISO 26262 or IEC 62304.

@@ -194,8 +194,9 @@ in the device adapter. Adaptations may instead revise the core and validate the 
 The MIT copyright and permission notice in `LICENSE` must accompany copies or substantial portions.
 Commission the nominal model, the deterministic feedforward and the independent innovation probe.
 The MCU template in `gate_template.c` is the 1 kHz integration reference: it derives a 32 B probe
-from a measured signal, freezes probe and HAL during `blanking_active`, and commits each slow frame
-by incrementing `outer_seq` after the payload is visible.
+from a measured signal, freezes probe and HAL and holds the pre-blanking residual while
+`blanking_active`, and commits each slow frame by incrementing `outer_seq` after the payload is
+visible.
 Verify the command magnitude/slew bounds, corruption handling, gate priorities, the HOLD → `SAFE_ZERO`
 escalation, the cumulative latch and the acknowledgement path.
 Measure target execution time separately from host ctypes call time.
