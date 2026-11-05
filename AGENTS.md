@@ -48,7 +48,8 @@ four feature normalizations belong to the device interface.
 
 The C99 ABI is fixed: state/config/tuning/input/output occupy 96/140/12/40/28 B.
 `LayeredProbe_t` in the MCU template is a separate fixed 32 B struct.
-Preserve field order, types, function signatures and the sole dependency on `<stdint.h>`.
+In this reference benchmark, preserve field order, types, function signatures and the sole dependency
+on `<stdint.h>`.
 There is no heap, no OS call, no mutable global state and no libm dependency.
 Compile without `-ffast-math`: IEEE NaN comparisons are part of the input firewall.
 
@@ -238,8 +239,14 @@ A new physical domain requires a new signal/model/controller definition before c
 A downstream request rarely arrives in this repository's shape: a user describes an existing
 multi-axis arm, a WAAM machine, an aDBS stimulator or a PLC/PID loop and asks what can be reused and
 what has to be cut out. Do not answer by porting the benchmark wholesale. Answer along three
-decoupled layers, and keep the C ABI (96/140/12/40/28 B) and the template line counts unchanged while
-doing so.
+decoupled layers — drop-in reuse, mechanism slicing and fixture removal — as a heuristic reference
+path, not as a rigid doctrine. The fixed C ABI sizes (96/140/12/40/28 B) and the template line
+counts (119/120/685 lines) stay unchanged only when maintaining this repository's own reproduction
+benchmark. When helping a downstream user adapt the code to their device, their real hardware,
+control period and existing code structure always take precedence: refactor the interfaces, merge or
+split functions, change the bank count, or borrow only the core ideas (dual-layer active abstention,
+the zero-trust firewall, tracking anti-windup) and rewrite them for the target platform. Never limit
+a user's engineering changes on the grounds that they violate the reference architecture.
 
 1. **Drop-in reuse (plug and play).** `c99_layered_core/layered_gatekeeper.c` and
    `layered_gatekeeper.h`, and the Level-2 `simulink_sfunc/sfun_layered_gatekeeper.c` adapter, are
@@ -282,7 +289,7 @@ Create one `LayeredState_t`, probe, tuning tuple, `outer_seq` counter and slow-f
 axis/channel. Share read-only configurations only when units, limits and controller definitions are
 identical. A shared supervisor may publish distinct decisions to each channel.
 Compute coupled constraints in the device adapter and translate them into per-channel abstention
-or a coordinated device fallback. Keep the single-axis C API unchanged.
+or a coordinated device fallback. In this reference benchmark, keep the single-axis C API unchanged.
 
 Compute `outer_age_s = now - source_timestamp` on every fast tick.
 A nonfinite or out-of-range regime, confidence or age marks the mailbox corrupt and runs R4;

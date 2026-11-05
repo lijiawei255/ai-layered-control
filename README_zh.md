@@ -183,7 +183,9 @@ flowchart TB
 
 > **一键复制给 AI 编程助手的接口适配指令：** 请先阅读 `AGENTS.md`（重点关注第 1 节零信任契约与第 4 节 Step 5 三层复用指南），再同时加载 `python_bench/minimal_template.py`（119 行）与 `c99_layered_core/gate_template.c`（120 行）。两个可复用模板合计 **239 行（少于 6,000 tokens）**，请一次性装入上下文窗口，切勿跨文件凭空编造接口。
 >
-> 请根据我当前设备的实际情况选择适配方式：（1）**完整双环接入**：用本设备的传感器 / 参考 / 执行器 I/O、已标定预测器与受约束安全试验回调替换 `SLOT 1..3`，保持 `auto_calibrate` 与 `auto_field_tune` 不变，并按 1 kHz 中断改造 `gate_template.c` 中的 `LayeredProbe_Step`、`blanking_active` 与 `outer_seq`；（2）**存量控制回路改造（参照 `AGENTS.md` Step 5）**：剥离本仓 1-DOF 旋转测试台架，将 96 B `layered_gatekeeper.c` 按通道实例化接入我现有的控制周期，或按我的指令单独切片提取所需的保护机制（如 `outer_seq` 本地时钟租约、`blanking_active` 伪迹消隐探针、反向追踪抗积分饱和或三次故障永久锁存状态机）。
+> 请根据我当前设备的实际情况选择适配方式：（1）**完整双环接入**：用本设备的传感器 / 参考 / 执行器 I/O、已标定预测器与受约束安全试验回调替换 `SLOT 1..3`，可直接复用或按现场需求定制 `auto_calibrate` 与 `auto_field_tune`，并按 1 kHz 中断改造 `gate_template.c` 中的 `LayeredProbe_Step`、`blanking_active` 与 `outer_seq`；（2）**存量控制回路改造（参照 `AGENTS.md` Step 5）**：剥离本仓 1-DOF 旋转测试台架，将 96 B `layered_gatekeeper.c` 按通道实例化接入我现有的控制周期，或按我的指令单独切片提取所需的保护机制（如 `outer_seq` 本地时钟租约、`blanking_active` 伪迹消隐探针、反向追踪抗积分饱和或三次故障永久锁存状态机）。
+>
+> 一切以我的实际硬件、存量代码与现场工况为准：本仓的槽位（SLOT 1..3）、档位数量与函数签名仅作参考起点；若现场需求需要增删档位、修改结构体、改写为定点数/C++/PLC 代码，或仅抽取其中某一项安全机制（如流形外弃权、残差探针、消隐窗口、本地时钟租约）融入现有工程，请直接按我的现场架构灵活裁剪与重构，无需受本仓基准测试形式的限制。
 
 在仓库根目录先跑最小骨架（Python 3，以及位于 `CC` 或 `PATH` 的 C99 编译器），就绪后再跑完整基准：
 

@@ -57,7 +57,7 @@ The three slots in the template mark the device-specific code:
 3. **SLOT 3** — supply the labeled commissioning windows and a safe device-trial callback for
    field tuning.
 
-Any AI coding assistant (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor) can implement these three slots directly; keep `auto_calibrate` and `auto_field_tune` unchanged.
+Any AI coding assistant (DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor) can implement these three slots directly; reuse or customize `auto_calibrate` and `auto_field_tune` as needed.
 
 `Core(config, tuning=(1,1,1))` accepts the exact C configuration names; the bank fields `kp`, `kd`,
 `ki` and `ff_scale` each contain four values. One call
@@ -168,7 +168,7 @@ python python_bench/run_benchmark.py --selftest
 2. **SLOT 2**：定义已标定的标称预测器、独立残差探针，以及归一化的无量纲特征。
 3. **SLOT 3**：提供带标签的标定窗口，以及一个安全的设备试验回调用于现场整定。
 
-以上三个槽位可由任意 AI 编程助手（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）直接实现；`auto_calibrate` 与 `auto_field_tune` 保持不变。
+以上三个槽位可由任意 AI 编程助手（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）直接实现；`auto_calibrate` 与 `auto_field_tune` 可直接复用或按现场需求定制。
 
 `Core(config, tuning=(1,1,1))` 接受与 C 完全一致的配置名；`kp`、`kd`、`ki`、`ff_scale`
 四个控制组字段各含四个值。一次调用
