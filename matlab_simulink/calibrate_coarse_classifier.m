@@ -13,7 +13,10 @@ for s=0:2
         'drift',0,'ood',false,'fixed_regime',s+1,'auto_calibrate',false);
     z=sim_core_engine(P,opts);
     windows=z.b3.macro(11:end,2:end);
-    ix=floor(linspace(0,size(windows,1)-1,nPerClass))+1;
+    % numpy's linspace(a,b,1) returns a while MATLAB returns b, so the single
+    % sample case has to start at the first window to keep both calibrations equal.
+    if nPerClass==1, pos=0; else, pos=linspace(0,size(windows,1)-1,nPerClass); end
+    ix=floor(pos)+1;
     samples(s*nPerClass+(1:nPerClass),:)=windows(ix,:);
 end
 labels=repelem((1:3)',nPerClass);
@@ -25,11 +28,12 @@ d=sort(d,2);
 gamma=1/max(linear_quantile(d(:,1),.95),1e-6);
 score=(d(:,2)-d(:,1))./(d(:,2)+d(:,1)+1e-9).*exp(-gamma*d(:,1));
 % The Python supervisor returns twice the helper's 0.15x quantile trip; the
-% clear level is 1.25x the trip.  The caps only bound pathological scores and
-% stay inactive for the calibrated benchmark values.
+% clear level is 1.25x the trip.  The caps only bound pathological small-sample
+% scores and stay inactive for the calibrated benchmark values; the Python
+% calibration applies the same two caps to the same uncapped pair.
 trip=2.0*0.15*linear_quantile(score,.01);
-trip=min(trip,0.25);
 clear=1.25*trip;
+trip=min(trip,0.25);
 clear=min(clear,0.35);
 classifier=struct('prototypes',prototypes,'gamma',gamma,'trip',trip,'clear',clear);
 end

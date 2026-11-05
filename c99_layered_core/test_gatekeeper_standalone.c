@@ -491,7 +491,7 @@ static void test_mission(void)
                 if (!prev_hold) {
                     hold_episodes++;
                 }
-                if (t_absf(out.u - u_last_nonhold) > 1e-6f) {
+                if (out.u != u_last_nonhold) {
                     hold_violations++;
                 }
             } else {
@@ -802,6 +802,8 @@ static int run_safety_ramp(const LayeredConfig_t *cfg, const FieldTuning_t *tun)
             trip = k;
         }
     }
+    check(inv.violations == 0,
+          "stage 5: the actuator invariants hold through the whole safety ramp");
     return trip;
 }
 
@@ -860,7 +862,7 @@ static void test_dwell(void)
     for (k = 0; k < 10000; ++k) {
         float r;
         float r_dot;
-        int wanted = (((k / 20) % 2) == 0) ? 1 : 2; /* 100 Hz ping-pong */
+        int wanted = (((k / 10) % 2) == 0) ? 1 : 2; /* 50 Hz square wave (100 transitions/s) */
 
         sine_gen_next(&ref, &r, &r_dot);
         in.ai_regime = (float)wanted;
@@ -994,6 +996,8 @@ static void test_recovery_cooldown(void)
           switched_at);
     check(st.recovery_ticks == 0u,
           "stage 6 cooldown: recovery_ticks is down to 0 once the AI is re-armed");
+    check(inv.violations == 0,
+          "stage 6 cooldown: the actuator invariants hold through the whole recovery window");
 }
 
 /* ========================================================================= */
@@ -1108,12 +1112,12 @@ static void test_firewall(void)
     /* the core must recover: healthy frames still produce a sane command */
     for (i = 0; i < 200; ++i) {
         out = step_checked(&inv, &st, &cfg, &tun, &good);
-        if (!(out.u == out.u) || t_absf(out.u) > cfg.u_max) {
+        if (!t_is_finite(out.u) || t_absf(out.u) > cfg.u_max) {
             finite_ok = 0;
         }
     }
-    i_finite = (int)(st.integ[0] == st.integ[0]) && (int)(st.integ[1] == st.integ[1]) &&
-               (int)(st.integ[2] == st.integ[2]) && (int)(st.integ[3] == st.integ[3]);
+    i_finite = t_is_finite(st.integ[0]) && t_is_finite(st.integ[1]) &&
+               t_is_finite(st.integ[2]) && t_is_finite(st.integ[3]);
 
     check(finite_ok && i_finite,
           "stage 7 firewall: after %d corrupt frames the core keeps producing a finite command",
@@ -1440,7 +1444,7 @@ static void test_feedforward(void)
     inv_reset(&inv);
     u_ff_small = run_ff_steady(&cfg, &tun, 0.15f, 600, &st, &out, &inv);
     check(t_absf((u_ff_small - u_no_ff) - 0.15f) <= 1e-5f,
-          "stage 10 feedforward: u_ff=0.15 is reproduced exactly (offset %.6f, error %.8f <= 1e-5)",
+          "stage 10 feedforward: u_ff=0.15 shifts the steady command by %.6f (error %.8f <= 1e-5)",
           (double)(u_ff_small - u_no_ff), (double)t_absf((u_ff_small - u_no_ff) - 0.15f));
 
     /* run C: u_ff needs two slew-limited ticks -> the integrator absorbs that
@@ -1608,6 +1612,8 @@ static void test_first_control_step(void)
           out.regime == REGIME_SAFE_FALLBACK,
           "stage 12 first step: the first clean tick snaps to zero-state R4 during recovery (u=%.6f)",
           (double)out.u);
+    check(inv.violations == 0,
+          "stage 12 first step: the actuator invariants hold on the first recovered tick");
 
     /* A normal first frame also snaps. */
     Layered_Init(&st, &cfg, &tun);
@@ -1702,6 +1708,8 @@ static void test_cooldown_latency(void)
     check(switched_at == (int)cfg.ood_recovery_cooldown_ticks,
           "stage 12b cooldown: the AI bank is re-armed on tick %d after the last stale tick",
           switched_at);
+    check(inv.violations == 0,
+          "stage 12b cooldown: the actuator invariants hold across the stale-frame recovery");
 }
 
 /* ========================================================================= */
@@ -1756,6 +1764,8 @@ static void test_ff_scale(void)
     check(t_absf(out.u - 0.10f) < 0.02f,
           "stage 12c ff_scale: bank 2 applies 0.25*u_ff=0.10 (u=%.5f)",
           (double)out.u);
+    check(inv.violations == 0,
+          "stage 12c ff_scale: the actuator invariants hold across the per-bank scaling");
 }
 
 /* Finite configuration / field tuning and NaN arithmetic at the clamp. */
@@ -1814,8 +1824,13 @@ static void test_settings_and_clamp(void)
     cfg.kp[0] = 1.0e38f; cfg.kd[0] = -1.0e38f;
     in.r = 100.0f; in.r_dot = 100.0f;
     out = Layered_Step(&st, &cfg, &tun, &in);
-    check(out.u_target == 0.0f && out.u == out.u && t_absf(out.u - 0.8f) < 1.0e-6f,
-          "NaN arithmetic: clamp selects a finite command inside the slew interval");
+    /* Inf - Inf in the bank sum is not a value the core may store: the bank
+     * output is sanitized to 0, the blend keeps the target finite and the slew
+     * limit still decides the applied command. */
+    check(t_is_finite(out.u_target) && t_is_finite(out.u) &&
+          out.u == out.u_target && t_absf(out.u_target - 0.98f) <= 1.0e-6f,
+          "NaN arithmetic: an overflowing bank sum keeps a finite target (%.6f) and command (%.6f)",
+          (double)out.u_target, (double)out.u);
     build_config(&cfg);
     in.r = 0.1f; in.r_dot = 0.0f;
     out = Layered_Step(&st, &cfg, &tun, &in);
@@ -2623,6 +2638,246 @@ static void test_outer_sequence_lease(void)
 }
 
 /* ========================================================================= */
+/* Phase A5: numerical-domain bounds                                         */
+/* ========================================================================= */
+
+/* The slow-frame lease is timed on the fast clock, so an unusable fast frame
+ * must not pause it: alternating corrupt frames must still trip the 250 ms
+ * timeout after 250 ms of wall time, not after twice as many ticks. */
+static void test_lease_under_corrupt_frames(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    int first_clean_hold = -1;
+
+    build_config(&cfg); /* dt = 1 ms, outer_timeout = 0.250 s */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.0f; /* forged: only the local lease may time the frame */
+    in.physics_residual = 0.10f;
+    in.x = 0.10f;
+    in.x_dot = 0.0f;
+    in.r = 0.10f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    in.outer_seq = 1u;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && st.outer_age_ticks == 0u,
+          "A5 lease: a first live sequence frame opens the local lease at age 0");
+
+    for (i = 0; i < 400; ++i) {
+        in.x = ((i % 2) == 0) ? make_nan() : 0.10f;
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (out.corrupted == 0 && out.gate == GATE_HOLD_LATENCY && first_clean_hold < 0) {
+            first_clean_hold = i;
+        }
+    }
+    check(first_clean_hold >= 249 && first_clean_hold <= 253,
+          "A5 lease: the 250 ms timeout trips at fast tick %d although every second "
+          "frame has an unusable fast sensor",
+          first_clean_hold + 2);
+    check(st.outer_age_ticks == 400u && st.last_outer_seq == 1u,
+          "A5 lease: the corrupt frames still advanced the lease to %u ticks",
+          (unsigned)st.outer_age_ticks);
+    check(st.corrupted_frame_count == 200u,
+          "A5 lease: all 200 alternating corrupt fast frames stay audited (%u)",
+          (unsigned)st.corrupted_frame_count);
+}
+
+/* A legal but tiny ki_eff * windup_tau_s underflows to 0.0f in binary32.  The
+ * tracking anti-windup must skip that correction instead of dividing by zero,
+ * which would drive every integrator into the clamp. */
+static void test_antiwindup_underflow(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    int finite = 1;
+
+    build_config(&cfg);
+    cfg.ki[0] = 1.0e-30f;
+    cfg.ki[1] = 1.0e-30f;
+    cfg.ki[2] = 1.0e-30f;
+    cfg.ki[3] = 0.0f;
+    cfg.windup_tau_s = 1.0e-20f; /* ki_eff * windup_tau underflows to 0.0f */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.0f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.r = 0.1f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    for (i = 0; i < 200; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (!t_is_finite(out.u) || !t_is_finite(out.u_target) ||
+            !t_is_finite(st.integ[0]) || !t_is_finite(st.integ[1]) ||
+            !t_is_finite(st.integ[2]) || !t_is_finite(st.integ[3])) {
+            finite = 0;
+        }
+    }
+    /* Without the guard the integral would have pinned at the clamp; the pure
+     * accumulator only sees dt * e = 1e-4 per tick. */
+    check(finite != 0 && t_absf(st.integ[0] - 0.02f) < 1.0e-3f,
+          "A5 underflow: an underflowed ki*windup_tau_s skips the back-calculation "
+          "(integ[0]=%.6f, all states finite)",
+          (double)st.integ[0]);
+    check(t_is_finite(out.u) && t_absf(out.u) <= cfg.u_max,
+          "A5 underflow: the command stays finite and inside u_max (u=%.6f)",
+          (double)out.u);
+}
+
+/* Extreme but legal parameters can overflow an intermediate product.  The
+ * published target must stay finite, a saturated local lease must still trip the
+ * timeout, and a slew budget below one ULP must still walk the command to zero. */
+static void test_extreme_numeric_domain(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+    float previous;
+
+    /* (a) kp * gain_scale * e overflows binary32: kp[0] = 3e38, scale = 4. */
+    build_config(&cfg);
+    cfg.kp[0] = 3.0e38f;
+    cfg.kd[0] = 0.0f;
+    cfg.ki[0] = 0.0f;
+    build_tuning(&tun, 4.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.0f;
+    in.x = 0.0f;
+    in.x_dot = 0.0f;
+    in.r = 0.1f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(t_is_finite(out.u_target) && out.u_target == cfg.u_max &&
+          t_is_finite(out.u) && t_absf(out.u) <= cfg.u_max,
+          "A5 overflow: an overflowing bank product clamps the published target to u_max "
+          "(target=%.6f, u=%.6f)",
+          (double)out.u_target, (double)out.u);
+
+    /* (b) outer_age_ticks * dt overflows: the saturated lease must still time out. */
+    build_config(&cfg);
+    cfg.dt_s = 3.0e38f;
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    in.outer_age_s = 0.0f;
+    in.outer_seq = 5u;
+    out = Layered_Step(&st, &cfg, &tun, &in); /* lease opens, age 0 */
+    check(out.gate == GATE_NORMAL && st.outer_age_ticks == 0u,
+          "A5 overflow: the extreme-period lease starts at age 0 (%s)",
+          Layered_GateName(out.gate));
+    out = Layered_Step(&st, &cfg, &tun, &in); /* age = 3.0e38 s */
+    check(out.gate == GATE_HOLD_LATENCY,
+          "A5 overflow: the extreme-period lease is stale on its first aged tick");
+    out = Layered_Step(&st, &cfg, &tun, &in); /* product overflows to +Inf */
+    check(out.gate == GATE_HOLD_LATENCY && st.outer_age_ticks == 2u,
+          "A5 overflow: an overflowing lease age saturates instead of releasing the HOLD "
+          "(gate=%s, age_ticks=%u)",
+          Layered_GateName(out.gate), (unsigned)st.outer_age_ticks);
+
+    /* (c) du_max = slew * dt below one ULP of the remaining command. */
+    build_config(&cfg);
+    cfg.u_slew_max_per_s = 1.0e-6f; /* du_max = 1e-9 s^-1, far below ULP(1.0f) */
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+    st.u_applied = 1.0f;
+    st.u_target = 1.0f;
+    st.control_started = 1;
+    in.outer_age_s = cfg.outer_timeout_s + 10.0f * cfg.dt_s; /* heartbeat gone for good */
+    in.outer_seq = 0u;
+    for (i = 0; i <= (int)cfg.max_hold_ticks; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_SAFE_ZERO && st.u_applied < 1.0f && st.u_applied > 0.0f,
+          "A5 sub-ULP: the first de-energise tick moves the command below 1.0 (u=%.9f)",
+          (double)st.u_applied);
+    previous = st.u_applied;
+    for (i = 0; i < 200; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+        if (!(st.u_applied < previous && st.u_applied > 0.0f)) {
+            break;
+        }
+        previous = st.u_applied;
+    }
+    check(i == 200 && st.u_applied < 0.99999f && st.u_applied > 0.9999f,
+          "A5 sub-ULP: 200 further ticks decrease the command by one ULP each (u=%.9f)",
+          (double)st.u_applied);
+}
+
+/* A corrupt fast frame advances hold_ticks without being a latency timeout, so
+ * the following slow-mailbox timeout must still count exactly one episode. */
+static void test_mixed_hold_episode(void)
+{
+    LayeredState_t st;
+    LayeredConfig_t cfg;
+    FieldTuning_t tun;
+    LayeredInput_t in = zero_input();
+    LayeredOutput_t out;
+    int i;
+
+    build_config(&cfg);
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+    Layered_Init(&st, &cfg, &tun);
+
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 0.95f;
+    in.outer_age_s = 0.005f;
+    in.physics_residual = 0.10f;
+    in.x = 0.10f;
+    in.x_dot = 0.0f;
+    in.r = 0.10f;
+    in.r_dot = 0.0f;
+    in.u_ff = 0.0f;
+    for (i = 0; i < 200; ++i) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    check(out.gate == GATE_NORMAL && st.latency_hold_count == 0u,
+          "A5 mixed HOLD: healthy frames open no latency episode (count=%u)",
+          (unsigned)st.latency_hold_count);
+
+    in.x = make_nan();
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted == 1 && out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 1u &&
+          st.latency_hold_count == 0u,
+          "A5 mixed HOLD: one corrupt fast frame advances hold_ticks to %u without "
+          "counting a latency episode", (unsigned)st.hold_ticks);
+
+    in.x = 0.10f;
+    in.outer_age_s = cfg.outer_timeout_s + 0.5f * cfg.dt_s;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.corrupted == 0 && out.gate == GATE_HOLD_LATENCY && st.hold_ticks == 2u &&
+          st.latency_hold_count == 1u,
+          "A5 mixed HOLD: the following slow-mailbox timeout counts one latency episode "
+          "(hold_ticks=%u, count=%u)",
+          (unsigned)st.hold_ticks, (unsigned)st.latency_hold_count);
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(st.latency_hold_count == 1u && st.hold_ticks == 3u,
+          "A5 mixed HOLD: the continued stale frame does not count a second episode");
+}
+
+/* ========================================================================= */
 /* Phase A4: emergency R4 entry bypasses the slow blend filter               */
 /* ========================================================================= */
 
@@ -2753,6 +3008,12 @@ int main(void)
     test_permanent_latch();
     test_outer_sequence_lease();
     test_emergency_r4_bypass();
+
+    printf("\n-- phase A5: numerical-domain bounds --\n");
+    test_lease_under_corrupt_frames();
+    test_antiwindup_underflow();
+    test_extreme_numeric_domain();
+    test_mixed_hold_episode();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

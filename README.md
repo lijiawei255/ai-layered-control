@@ -4,7 +4,7 @@
 [![Core: ANSI C99 (Zero-Heap)](https://img.shields.io/badge/Core-ANSI%20C99%20%28Zero--Heap%29-blue)](c99_layered_core/layered_gatekeeper.h)
 [![Bench: Python | MATLAB/Simulink](https://img.shields.io/badge/Bench-Python%20%7C%20MATLAB%2FSimulink-orange)](#36-reproduce)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23911916.svg)](https://doi.org/10.5281/zenodo.23911916)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23911915.svg)](https://doi.org/10.5281/zenodo.23911915)
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent guide](AGENTS.md)
@@ -20,14 +20,14 @@ An MIT-licensed reference design, comparison benchmark and AI adaptation templat
 - **[1] [python_bench/minimal_template.py](python_bench/minimal_template.py) — 119 lines.** A 10 Hz qualitative slow loop with small-sample commissioning (`auto_calibrate`: 36 labeled windows, 15 scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, a 20-line pair of helpers) and a `SLOT 1..3` device skeleton.
 - **[2] [c99_layered_core/gate_template.c](c99_layered_core/gate_template.c) — 120 lines.** A 1 kHz bare-metal MCU interrupt integration sample with a **32 B zero-heap physics-residual probe** (`LayeredProbe_Step`: median spike rejection plus a cascaded high-pass innovation envelope), the `blanking_active` hardware blanking window for stimulation pulses and commutation-edge artifacts, and the `outer_seq` commit-marker pattern.
 - **[3] [c99_layered_core/layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h) / [.c](c99_layered_core/layered_gatekeeper.c) — 96 B state.** A zero-dependency ANSI C99 safety arbiter and four-bank anti-windup control microkernel for 1 kHz cyclic tasks.
-- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 535 lines.** A Level-2 C-MEX S-Function for model-based design: `DWork` holds the 96 B state, zero globals, zero dynamic memory, **11 inputs** (10 ABI inputs plus the `ack` rising edge) and **7 outputs** around the same frozen core.
+- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 613 lines.** A Level-2 C-MEX S-Function for model-based design: `DWork` holds the 96 B state, zero globals, zero dynamic memory, **11 inputs** (10 ABI inputs plus the `ack` rising edge) and **7 outputs** around the same frozen core.
 
 **Headline numbers.**
 
 - **Small-sample calibration, no GPU required.** The slow supervisor is calibrated on CPU from **36 labeled macro-windows** and stores **15 scalars / 60 B (FP32)**, versus **16,000 action labels / 20,596 B (FP32)** for B2.
 - **96 B deterministic C99 fallback.** A zero-heap ANSI C99 core owns the **1 kHz** actuator command with **ten input fields**, a 32 B independent physics-residual probe and nine core protection duties. In this compound-fault benchmark, the first spike triggers a veto and closed-loop R4 fallback within the same **1 ms control tick**.
 - **Frozen AI, physical field tuning.** Three knobs occupy **12 B** and support constrained adaptation to forward overload, cross mismatch, reverse light load and compound unit drift without retraining the supervisor.
-- **Cross-language replay and a 119-line skeleton.** **211 C regression checks** pass; Python/C replay is bit-exact (**max|du| = 0**), MATLAB/C replay is within **5e-8**, and the Level-2 S-Function reproduces all seven outputs over 1,100 frames with **max diff = 0.0**. The **119-line template** is ready to run; the Simulink model illustrates the architecture.
+- **Cross-language replay and a 119-line skeleton.** **233 C regression checks** pass; Python/C replay is bit-exact (**max|du| = 0**), MATLAB/C replay is within **5e-8**, and the Level-2 S-Function reproduces all seven outputs over 1,100 frames with **max diff = 0.0**. The **119-line template** is ready to run; the Simulink model illustrates the architecture.
 
 **Human readers:** [§1](#1-ai-can-be-slow-control-authority-must-be-clear) explains the division of control authority through six field problems; [§2](#2-what-to-reuse-human--agent-quickstart) covers the four reusable modules and three-step porting; [§3.2](#32-four-stage-comparison) / [§3.3](#33-frozen-ai-field-tuned-hardware) / [§3.4](#34-mode-ablation-and-independent-protection) present the measured comparisons, the new gating and abstention experiments, and the figures.
 
@@ -41,7 +41,7 @@ Bringing AI into industrial arms, CNC / additive manufacturing (WAAM), or closed
 
 2. **Rigid and compliant conditions conflict.** A single fixed-parameter white-box loop (B1) trades disturbance rejection against contact compliance. Its high gain breaks stiction well and still drives S3 contact to **64.59 N** at a 20 N budget. The fast loop owns a four-bank deterministic library — R1 nominal, R2 high load, R3 compliant contact and R4 fixed-gain fallback — with per-bank reverse tracking anti-windup on every tick and an **emergency R4 bypass (`blend = 1.0`)** that removes the first-order smoothing lag from the braking response.
 
-3. **Unknown manifolds and sub-healthy oscillation.** A dead rule tree or a fuzzy controller has no notion of distance from the data that produced it; it keeps issuing the nearest rule while the plant oscillates. The prototype classifier carries a distance-based **confidence** and abstains to R4 damping when the operating point leaves the calibrated manifold and enters the **`OFF_MANIFOLD`** regime — the unmodeled transmission dead zone plus a 4 Hz lightly damped mounting mode used in §3.4.
+3. **Unknown manifolds and sub-healthy oscillation.** The fixed-threshold rule tree compared in this benchmark (with no explicitly embedded manifold-distance or density model) and a fuzzy controller have no notion of distance from the data that produced them; they keep issuing the nearest rule while the plant oscillates. The prototype classifier carries a distance-based **confidence** and abstains to R4 damping when the operating point leaves the calibrated manifold and enters the **`OFF_MANIFOLD`** regime — the unmodeled transmission dead zone plus a 4 Hz lightly damped mounting mode used in §3.4.
 
 4. **Cross-machine, batch and unit drift without retraining compute.** Joint inertia, damping, friction and contact stiffness move between units, and a field site has no GPU. The architecture keeps the **frozen AI manifold topology** orthogonal to a **12 B physical knob tuple** (`FieldTuning_t`); `auto_field_tune` runs six bounded, constrained trials and calibrates forward overload (+35% / +50%), cross mismatch (J +40%, b −30%) and reverse light load (−25%) without touching the classifier.
 
@@ -74,7 +74,7 @@ flowchart TB
         bank["R1 nominal · R2 load/stiction · R3 contact<br/>R4: fixed gains, zero reference, zero feedforward<br/>Emergency bypass: blend = 1.0<br/>Tracking anti-windup + first-order smoothing<br/>Magnitude/slew limits + 7-bit fault audit"]
         firewall --> gates --> bank
     end
-    subgraph mbd["Simulink model-based design · 535 lines"]
+    subgraph mbd["Simulink model-based design · 613 lines"]
         direction TB
         sfun["Level-2 C-MEX S-Function<br/>DWork 96 B state · zero globals<br/>11 inputs (10 ABI + ack) / 7 outputs"]
     end
@@ -145,7 +145,7 @@ The sticky **7-bit fault audit mask** records the root causes: latency timeout, 
 | **[1] [minimal_template.py](python_bench/minimal_template.py)** | 119 lines | Standalone 10 Hz supervisor + 1 kHz C binding: `auto_calibrate`, `auto_field_tune`, low-confidence abstention and `SLOT 1..3` |
 | **[2] [gate_template.c](c99_layered_core/gate_template.c)** | 120 lines | 1 kHz MCU integration sample: 32 B `LayeredProbe_t`, `blanking_active`, `outer_seq` lease and a PASS self-check |
 | **[3] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [.h](c99_layered_core/layered_gatekeeper.h)** | 96 / 140 / 12 / 40 / 28 B | Zero-dependency ANSI C99 control and safety gatekeeper for an MCU, PLC or RTOS cyclic task |
-| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 535 lines | Level-2 C-MEX S-Function around the same frozen core: 11 inputs, 7 outputs, no mutable globals |
+| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 613 lines | Level-2 C-MEX S-Function around the same frozen core: 11 inputs, 7 outputs, no mutable globals |
 
 When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
 
@@ -235,6 +235,8 @@ See [AGENTS.md](AGENTS.md), the [domain mapping guide](docs/domain_mapping_guide
 All branches share actuator magnitude and slew limits, sensor processing, noise, reference, plant and fault realization. B1 has no `blend_alpha` smoother. Latency applies only to B2's context; its policy contains no integrator input or external PD stabilizer. B3's first-order command smoothing operates on every tick.
 
 Learning-based fast-slow systems are an active engineering direction; [Helix 02](https://www.figure.ai/news/helix-02) is one example. The design horizon is **2027+ deployment across constrained devices**.
+
+All main-table metrics, the five holdout runs and the four field-tuning conditions agree exactly between the two engines for B3; the B2 ridge-regression weights differ by about 1.9e-6 in double precision between NumPy and MATLAB LAPACK, which can shift the fourth decimal of broad-band sensitivity metrics.
 
 ### 3.2 Four-stage comparison
 
@@ -358,7 +360,7 @@ The fixed-bank results expose the load/contact tradeoff: the nominal bank pays 2
 | `envelope_only_dual` (position envelope only) | 0 | 20.0 | 9,085 | 9,242.8 |
 | full B3 (envelope + 1 kHz residual) | 0 | **3.33** | 0 | 9,069.3 |
 
-**Manifold-external abstention (`off_manifold_abstention`, Seeds 0–4).** The fixture adds an **18 mN·m transmission dead zone** and a **4 Hz lightly damped mounting mode** with `noise_scale = 0.05`. In the B3 branch the fast-loop single-step residual stays at or below **0.223**; the `B3_no_conf` and `rules` variants reach **0.828 / 0.825**. All three stay below the **1.0** OOD threshold, so the residual probe cannot see the oscillation. The fixed rule tree and the variant with the confidence gate knocked out keep tracking and oscillate. The prototype distance confidence trips **900–1600 low-confidence 1 kHz gate ticks**, abstains into R4 damping, and cuts RMSE by more than 50% relative to the rule tree (48.3%–56.5% relative to `B3_no_conf`):
+**Manifold-external abstention (`off_manifold_abstention`, Seeds 0–4).** The fixture adds an **18 mN·m transmission dead zone** and a **4 Hz lightly damped mounting mode** with `noise_scale = 0.05`. In the B3 branch the fast-loop single-step residual stays at or below **0.223**; the `B3_no_conf` and `rules` variants reach **0.828 / 0.825**. All three stay below the **1.0** OOD threshold, so the residual probe cannot see the oscillation. The fixed rule tree and the variant with the confidence gate knocked out keep tracking and oscillate. The prototype distance confidence trips **900–1600 low-confidence 1 kHz gate ticks**, abstains into R4 damping, and cuts RMSE by more than 50% relative to the rule tree (48.3%–56.6% relative to `B3_no_conf`):
 
 | Seed | `B3` RMSE / rad | `B3_no_conf` RMSE / rad | `rules` RMSE / rad | `B3` low-confidence ticks |
 | :---: | ---: | ---: | ---: | ---: |
@@ -368,7 +370,7 @@ The fixed-bank results expose the load/contact tradeoff: the nominal bank pays 2
 | 3 | **0.012797** | 0.029453 | 0.029453 | 900 |
 | 4 | 0.013187 | 0.029454 | 0.029454 | 1600 |
 
-Every configuration keeps zero state-envelope violations; the difference is oscillation amplitude under an unmodeled mode. This is the evidence for the slow-interface design: without hand-written mode-specific rule branches, a conventional dead rule tree with no distance concept only outputs the nearest rule, whereas the prototype classifier with manifold-distance confidence can directly recognise out-of-distribution drift and abstain.
+Every configuration keeps zero state-envelope violations; the difference is oscillation amplitude under an unmodeled mode. This is the evidence for the slow-interface design: without hand-written mode-specific rule branches, the fixed-threshold rule tree compared in this benchmark, which embeds no explicit manifold-distance or density model, only outputs the nearest rule, whereas the prototype classifier with manifold-distance confidence can directly recognise out-of-distribution drift and abstain.
 
 **Contact-memory asymmetry.** The fourth feature accumulates signed nominal-model residual power with an activation threshold and release memory, so intermittent contact does not chatter between R3 and R1. The memory drains as fast as the contact evidence disappears:
 
@@ -389,7 +391,7 @@ The independent physics probe monitors spikes and broadband innovation; the fast
 | Noise std / rad | Supervisor | S3 R3 fraction | S3 peak / N | S3 veto fraction | S3 R4 fraction |
 |---|---|---|---|---|---|
 | 0.006 | dynamic | 94.99% | 19.47 | 0% | 0% |
-| 0.0015 | dynamic | 94.99% | 17.40 | 0% | 0% |
+| 0.0015 | dynamic | 90.88% | 17.40 | 1.11% | 4.11% |
 | 0.0015 | rules | 93.49% | 17.40 | 0% | 0% |
 | 0.006; no wall | dynamic | 0% | 0.00 | 1.52% | 4.52% |
 | 0.006; no wall | rules | 0% | 0.00 | 0% | 0% |
@@ -402,7 +404,7 @@ The full compound fault's first spike triggers a veto in the same control tick. 
 
 The main run uses R1 throughout S1, R2 for 96.8% of S2 and R3 for 94.99% of S3; normal stages have no vetoes. S4 remains in R4 after fault onset. Persistent `ai_confidence = NaN` from 22 s produces **18,000 corrupted frames**, continued R4 command updates and **zero violations**, with whole-mission maximum **|x| = 0.5159 rad**. Corruption remains visible in flags and counters while valid sensors keep the fallback closed loop running.
 
-Five independent noise/phase runs give B1/B2 S4 violations of **777–899 / 622–753 ticks** and zero for B3. Factory B3's S3 force spans **16.94–26.14 N** while every phase preserves the state envelope. The 10 Hz frame rate and normal-regime dwell delay switching, so the first collision can precede completed selection of R3 (19.47 N in the main run). Across the phase scan the per-run B3-to-B1 peak-force ratio is near one third in most runs and reaches **0.94** in an outlier seed. The accepted tuning table validates the commissioned wall phase with independent noise. With one/two/four physical substeps, B3's peak force is **20.03 / 19.47 / 19.35 N**, with zero state violations. Removing context jitter changes B2's main S3 peak from **12.52 to 10.22 N**. Contact force, state safety and asynchronous-context sensitivity are separate outcomes.
+Five independent noise/phase runs give B1/B2 S4 violations of **777–899 / 622–753 ticks** and zero for B3. Factory B3's S3 force spans **16.94–26.14 N** while every phase preserves the state envelope. The 10 Hz frame rate and normal-regime dwell delay switching, so the first collision can precede completed selection of R3 (19.47 N in the main run). Across the five runs the per-run B3-to-B1 S3 peak-force ratio stays between **0.24x and 0.35x of B1 (at most 0.35x)**. The accepted tuning table validates the commissioned wall phase with independent noise. With one/two/four physical substeps, B3's peak force is **20.03 / 19.47 / 19.35 N**, with zero state violations. Removing context jitter changes B2's main S3 peak from **12.52 to 10.22 N**. Contact force, state safety and asynchronous-context sensitivity are separate outcomes.
 
 #### Interface, multi-axis and timeout conventions
 
@@ -426,7 +428,7 @@ Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share rea
 | Prototype classifier | 15 scalars; FP32 storage 60 B |
 | C99 state / configuration / field knobs / input / output | **96 / 140 / 12 / 40 / 28 B** |
 | `LayeredProbe_t` (1 kHz residual probe, gate template) | **32 B** |
-| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 5,112 B; `-O2`: 6,592 B |
+| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 6,144 B; `-O2`: 7,172 B |
 
 FP32 bytes are a storage calculation; numerical RBF runs use FP64. State RAM, model storage and code size are separate quantities. Python reports RBF and C-call host times, including ctypes overhead; they are not target WCET. The core uses only `<stdint.h>`, fixed-size arithmetic and no heap, I/O, libm or mutable globals.
 
@@ -448,7 +450,7 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/gate_template.exe c
 .\c99_layered_core\gate_template.exe
 ```
 
-The template requires all ten input fields and recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **211 passes, zero failures**. The MCU template's own self-check exits zero after exercising HOLD → `SAFE_ZERO`, three OOD episodes → `GATE_LATCHED_SAFE`, blanking freeze, `outer_seq` commit and a successful acknowledgement. Python/C replay: **6,000 frames** covering R1 = 901, R2 = 900, R3 = 304 and R4 = 3,895 ticks, including ack re-arming and a 7→5→3→1→0 slew-shaped return to zero on both trigger paths; discrete outputs are exact and the continuous command agrees bit for bit (**max|du| = 0**). Compilers are found through `CC` or `PATH`.
+The template requires all ten input fields and recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **233 passes, zero failures**. The MCU template's own self-check exits zero after exercising HOLD → `SAFE_ZERO`, three OOD episodes → `GATE_LATCHED_SAFE`, blanking freeze, `outer_seq` commit and a successful acknowledgement. Python/C replay: **6,000 frames** covering R1 = 901, R2 = 900, R3 = 304 and R4 = 3,895 ticks, including ack re-arming and a 7→5→3→1→0 slew-shaped return to zero on both trigger paths; discrete outputs are exact and the continuous command agrees bit for bit (**max|du| = 0**). Compilers are found through `CC` or `PATH`.
 
 MATLAB R2024b + Simulink, built-in functions and blocks. Full acceptance requires a C99 compiler; its absence is an error:
 

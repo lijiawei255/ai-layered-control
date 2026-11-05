@@ -25,10 +25,16 @@ for j=1:numel(E.samples)
     E.nominal(j)=a.metrics.rmse(2,1); E.frozen(j)=b.metrics.rmse(2,2);
     E.retrained(j)=c.metrics.rmse(2,2);
 end
-for j=1:2
-    drift=[.35 .5]; drift=drift(j); started=tic;
-    [candidates,knobs]=search(P,drift,3);
-    [b1_candidates,b1_knobs]=search(P,drift,1);
+% The four mismatches of the Python tuning_study: two loaded-stage drift
+% levels, an inertia/damping cross mismatch and a reversed
+% inertia/damping/friction mismatch, the latter two without drift.
+conds=struct('drift',{.35,.5,0,0},'j_scale',{1,1,1.4,.75}, ...
+    'b_scale',{1,1,.7,.75},'f_scale',{1,1,1,.75}, ...
+    'label',{'+35% drift','+50% drift','cross J+40% b-30%','reverse J/b/fc/fs-25%'});
+for j=1:numel(conds)
+    fx=conds(j); started=tic;
+    [candidates,knobs]=search(P,fx,3);
+    [b1_candidates,b1_knobs]=search(P,fx,1);
     % Equal six-candidate budget for B1.  The deployment knobs are only
     % updated by a candidate that satisfies the same joint constraints as B3,
     % so with no feasible candidate the commissioned (1,1,1) is retained
@@ -39,14 +45,19 @@ for j=1:2
     b1_costs=cellfun(@(a) a.score,b1_candidates); [~,best_b1]=min(b1_costs);
     b1_best_knobs=b1_candidates{best_b1}.knobs;
     valid=struct('branches',[1 3],'scenario',1,'duration',6,'seed',811, ...
-        'drift',drift,'ood',false,'amplitude',.43);
+        'drift',fx.drift,'ood',false,'amplitude',.43, ...
+        'j_scale',fx.j_scale,'b_scale',fx.b_scale,'f_scale',fx.f_scale);
     before=sim_core_engine(P,valid); valid.branches=3; valid.tuning=knobs; after=sim_core_engine(P,valid);
     Q=P; Q.baseline=P.baseline.*b1_best_knobs([1 2 1]); valid.branches=1;
     b1_best=sim_core_engine(Q,valid);
-    mission=sim_core_engine(P,struct('branches',3,'seed',811,'drift',drift,'tuning',knobs));
-    b1_mission=sim_core_engine(Q,struct('branches',1,'seed',811,'drift',drift));
-    E.tuning(j)=struct('drift',drift,'knobs',knobs,'b1_deployment_knobs',b1_knobs, ...
-        'b1_best_knobs',b1_best_knobs,'b1_best_feasible',b1_candidates{best_b1}.valid, ...
+    mission=sim_core_engine(P,struct('branches',3,'seed',811,'drift',fx.drift, ...
+        'tuning',knobs,'j_scale',fx.j_scale,'b_scale',fx.b_scale,'f_scale',fx.f_scale));
+    b1_mission=sim_core_engine(Q,struct('branches',1,'seed',811,'drift',fx.drift, ...
+        'j_scale',fx.j_scale,'b_scale',fx.b_scale,'f_scale',fx.f_scale));
+    E.tuning(j)=struct('drift',fx.drift,'label',fx.label,'j_scale',fx.j_scale, ...
+        'b_scale',fx.b_scale,'f_scale',fx.f_scale,'knobs',knobs, ...
+        'b1_deployment_knobs',b1_knobs,'b1_best_knobs',b1_best_knobs, ...
+        'b1_best_feasible',b1_candidates{best_b1}.valid, ...
         'before_rmse',before.metrics.rmse(3,2),'after_rmse',after.metrics.rmse(3,2), ...
         'b1_rmse',before.metrics.rmse(1,2),'b1_best_rmse',b1_best.metrics.rmse(1,2), ...
         'before_tv',before.metrics.tv(3,2),'after_tv',after.metrics.tv(3,2), ...
@@ -73,18 +84,19 @@ assert(all(isfinite([E.tuning.after_rmse])) && all([E.tuning.after_breach]==0),'
 if opts.make_figure, draw_efficiency(E,opts.assets_dir); end
 end
 
-function [candidates,knobs]=search(P,drift,branch)
+function [candidates,knobs]=search(P,fx,branch)
 grid=[.75 1;1 1;1.25 1;2 1;1.25 .5;1.25 .75];
 knobs=[1 1 1]; best=Inf; candidates=cell(1,6);
 for k=1:6
     trial=[grid(k,:) 1];
-    a=evaluate(P,drift,branch,trial); candidates{k}=a;
+    a=evaluate(P,fx,branch,trial); candidates{k}=a;
     if a.valid && a.score<best, best=a.score; knobs=trial; end
 end
 end
 
-function a=evaluate(P,drift,branch,knobs)
-opts=struct('branches',branch,'drift',drift,'seed',7,'tuning',knobs);
+function a=evaluate(P,fx,branch,knobs)
+opts=struct('branches',branch,'drift',fx.drift,'seed',7,'tuning',knobs, ...
+    'j_scale',fx.j_scale,'b_scale',fx.b_scale,'f_scale',fx.f_scale);
 if branch==1, P.baseline=P.baseline.*knobs([1 2 1]); end
 z=sim_core_engine(P,opts); b=z.(sprintf('b%d',branch)); q=z.stage==1;
 c=constraints(z,branch); score=sqrt(mean((z.r(q)-b.log(q,11)).^2));
@@ -110,15 +122,16 @@ nexttile; semilogx(E.samples,E.nominal,'o-','LineWidth',1.6); hold on;
 semilogx(E.samples,E.frozen,'s-','LineWidth',1.6); semilogx(E.samples,E.retrained,'^-','LineWidth',1.6);
 set(gca,'YScale','log'); grid on; xlabel('Action labels'); ylabel('Closed-loop RMSE [rad]');
 title('A  Conditional RBF sample budget'); legend('Nominal unit','Frozen +35% unit drift','Retrained +35% unit drift','Location','best');
-nexttile; scores=[[E.tuning.before_rmse]' [E.tuning.after_rmse]' [E.tuning.b1_rmse]' [E.tuning.b1_best_rmse]']; bar(scores);
-set(gca,'XTickLabel',{'+35% unit drift','+50% unit drift'}); xlabel('Unit Drift: Inertia + Stiction');
+nexttile; labels={E.tuning.label};
+scores=[[E.tuning.before_rmse]' [E.tuning.after_rmse]' [E.tuning.b1_rmse]' [E.tuning.b1_best_rmse]']; bar(scores);
+set(gca,'XTickLabel',labels); xlabel('Device mismatch condition');
 ylabel('S2 validation RMSE [rad]'); ylim([0 1.6*max(scores,[],'all')]); grid on;
 title('B  Equal six-candidate search budget');
 legend('B3 factory','B3 feasible tuning','B1 factory','B1 S2-best (infeasible)','Location','northwest');
-nexttile; force=zeros(2,2);
-for j=1:2, force(j,:)=[E.tuning(j).mission.peak_contact(3,3),E.tuning(j).b1_best_mission.peak_contact(1,3)]; end
+nexttile; force=zeros(numel(E.tuning),2);
+for j=1:numel(E.tuning), force(j,:)=[E.tuning(j).mission.peak_contact(3,3),E.tuning(j).b1_best_mission.peak_contact(1,3)]; end
 bar(force); hold on; yline(20,':r','Contact budget','HandleVisibility','off'); grid on;
-set(gca,'XTickLabel',{'+35% unit drift','+50% unit drift'}); xlabel('Unit Drift: Inertia + Stiction');
+set(gca,'XTickLabel',labels); xlabel('Device mismatch condition');
 ylabel('S3 peak contact force [N]'); ylim([0 100]); title('C  Independent full-mission validation');
 legend('B3 feasible tuning','B1 S2-best (infeasible)','Location','northwest');
 nexttile; bar([E.model_fp32_bytes,4*E.classifier_scalars,E.state_bytes,E.config_bytes,E.tuning_bytes]);

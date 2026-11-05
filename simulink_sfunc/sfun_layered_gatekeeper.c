@@ -49,12 +49,15 @@
  *
  * ACKNOWLEDGEMENT PATH
  *   The eleventh input `ack` is the external release of the cumulative fault
- *   latch (Layered_AcknowledgeFaultLatch).  A rising edge - a finite, non-zero
- *   value on a sample whose previous sample was zero - calls the API once,
- *   BEFORE Layered_Step() of the same tick, so that tick already runs with the
- *   latch released and the recovery cooldown re-armed.  A level held at
- *   non-zero does not repeat the call; non-finite (NaN/Inf) values are treated
- *   as not asserted.  Feed a constant 0 when the model does not need it.
+ *   latch (Layered_AcknowledgeFaultLatch).  A finite level above zero is HIGH;
+ *   every other finite value, including zero and negatives, is LOW.  A rising
+ *   edge - HIGH on a sample whose previous sample was LOW - calls the API
+ *   once, BEFORE Layered_Step() of the same tick, so that tick already runs
+ *   with the latch released and the recovery cooldown re-armed.  A level held
+ *   HIGH does not repeat the call.  A non-finite sample (NaN or +/-Inf) is
+ *   ignored entirely and the stored previous level is kept, so forcing NaN
+ *   between two HIGH samples cannot forge a second rising edge.  Feed a
+ *   constant 0 when the model does not need it.
  *
  * BLOCK PARAMETERS (eight non-tunable vectors, in struct field order):
  *   P1  cfg_float  15 values: dt_s, outer_timeout_s, max_physics_residual,
@@ -74,7 +77,7 @@
  *   Example "S-function parameters" string, entered as one line (the wrap
  *   below is only for page width), using the benchmark configuration:
  *     [0.001 0.35 1 .5 .01 .02 1 .9 .75 .025 20 2000 .3 .5 .1],[150 300],
- *     [25 35 12 2],[8 10 8 2],[2 8 1 0],[1 1 1 0],[100 3],[1 1 1]
+ *     [60 110 8 2],[1.2 1.5 0.8 0.35],[60 300 2 0],[1 1 1 0],[100 3],[1 1 1]
  *
  *   The block sample time is taken from cfg_float(1) (dt_s) so the core's
  *   period and the Simulink step cannot drift apart.  If dt_s is not finite
@@ -86,8 +89,26 @@
  *   represented in float32 saturates to +/-FLT_MAX, which the frozen firewall
  *   already classifies as non-finite (its limit is 3.0e38), so the core's
  *   NaN/Inf corruption semantics are preserved instead of invoking undefined
- *   double->float behaviour.  NaN passes through unchanged.  uint32 fields
- *   (outer_seq and the tick parameters) saturate to [0, UINT32_MAX].
+ *   double->float behaviour.  NaN passes through unchanged.
+ *
+ *   The tick-count parameters P2 and P7 are counts, not measurements, and are
+ *   validated when the adapter reads its block parameters: every element must
+ *   be a finite integer in [0, 4294967295] or the parameter is rejected.
+ *   A NaN, -Inf or +Inf element is a configuration error, never a silent 0 or
+ *   UINT32_MAX: a silently zeroed max_fault_vetoes_before_latch would disable
+ *   the permanent safety latch, and a silently zeroed max_hold_ticks would
+ *   disable the HOLD -> SAFE_ZERO budget.  Fractional and out-of-range values
+ *   are refused for the same reason.  An explicit legal 0 stays legal: zero
+ *   vetoes is the documented way to disable the cumulative latch.  Every
+ *   parameter vector must also be a real 1-D array, so a matrix with the right
+ *   element count is refused instead of being read in column-major order.
+ *   `mdlCheckParameters` runs the same readers, so an invalid vector is
+ *   reported when the block is configured or the model is updated, and again
+ *   in `mdlStart` before the first step.
+ *   The uint32 conversion helper remains for the `outer_seq` input port, which
+ *   is a runtime signal: a NaN or non-positive level becomes 0 (the core then
+ *   falls back to the transported outer_age_s), a level above UINT32_MAX
+ *   saturates and a fractional level truncates.
  *
  * STORAGE (no mutable global state, no malloc/free)
  *   DW_STATE  : LayeredState_t (96 B) held in a uint32-typed DWork vector,
@@ -210,6 +231,10 @@ static float lg_sfun_to_float(real_T v)
     return (float)v;
 }
 
+/* Runtime-signal conversion only (the `outer_seq` input port).  Block
+ * parameters never take this path: they are validated element by element in
+ * lg_sfun_read_u32_vector, so the saturating behaviour below cannot hide a
+ * bad tick budget. */
 static uint32_t lg_sfun_to_u32(real_T v)
 {
     if (v != v) {
@@ -231,14 +256,29 @@ static int_T lg_sfun_is_finite(real_T v)
     return (v == v) && ((v - v) == 0.0);
 }
 
+/* HIGH = finite and strictly positive.  A negative level is LOW, never a
+ * release, and a non-finite sample is not a level at all: the caller keeps the
+ * stored previous level so NaN cannot fabricate a rising edge. */
 static int_T lg_sfun_ack_asserted(real_T v)
 {
-    return lg_sfun_is_finite(v) && (v != 0.0);
+    return lg_sfun_is_finite(v) && (v > 0.0);
 }
 
 /* ========================================================================= */
 /* Block-parameter readers                                                   */
 /* ========================================================================= */
+
+/* A block-parameter vector is accepted only as a real, full, double, 1-D
+ * array of exactly n elements.  A scalar is 1x1 and still passes; a matrix
+ * with the right element count does not, because its column-major layout would
+ * not match the documented field order. */
+static int_T lg_sfun_param_is_vector(const mxArray *p, int_T n)
+{
+    return (p != NULL) && !mxIsEmpty(p) && mxIsDouble(p) && !mxIsComplex(p) &&
+           !mxIsSparse(p) && (int_T)mxGetNumberOfElements(p) == n &&
+           mxGetNumberOfDimensions(p) == 2 &&
+           (mxGetM(p) == 1 || mxGetN(p) == 1);
+}
 
 static int_T lg_sfun_read_float_vector(SimStruct *S, int_T pidx, int_T n,
                                        float *dst, const char *msg)
@@ -247,8 +287,7 @@ static int_T lg_sfun_read_float_vector(SimStruct *S, int_T pidx, int_T n,
     const real_T *v;
     int_T i;
 
-    if (p == NULL || mxIsEmpty(p) || !mxIsDouble(p) || mxIsComplex(p) ||
-        mxIsSparse(p) || (int_T)mxGetNumberOfElements(p) != n) {
+    if (!lg_sfun_param_is_vector(p, n)) {
         ssSetErrorStatus(S, msg);
         return 0;
     }
@@ -266,14 +305,24 @@ static int_T lg_sfun_read_u32_vector(SimStruct *S, int_T pidx, int_T n,
     const real_T *v;
     int_T i;
 
-    if (p == NULL || mxIsEmpty(p) || !mxIsDouble(p) || mxIsComplex(p) ||
-        mxIsSparse(p) || (int_T)mxGetNumberOfElements(p) != n) {
+    if (!lg_sfun_param_is_vector(p, n)) {
         ssSetErrorStatus(S, msg);
         return 0;
     }
     v = mxGetPr(p);
+    /* Validate every element before converting.  A tick budget is a safety
+     * number: a NaN or -Inf must not decay to 0 (that would disable the
+     * permanent latch or the HOLD budget) and +Inf must not become
+     * UINT32_MAX.  The range test also makes the uint32 cast well defined,
+     * since a double outside [0, UINT32_MAX] cannot be converted in C. */
     for (i = 0; i < n; ++i) {
-        dst[i] = lg_sfun_to_u32(v[i]);
+        const real_T t = v[i];
+        if (!lg_sfun_is_finite(t) || t < 0.0 || t > 4294967295.0 ||
+            (real_T)(uint32_t)t != t) {
+            ssSetErrorStatus(S, msg);
+            return 0;
+        }
+        dst[i] = (uint32_t)t;
     }
     return 1;
 }
@@ -289,31 +338,31 @@ static int_T lg_sfun_load_config(SimStruct *S, LayeredConfig_t *cfg)
     uint32_t tb[N_CFG_TICKS_B];
 
     if (!lg_sfun_read_float_vector(S, P_CFG_FLOAT, N_CFG_FLOAT, f,
-            "S-function parameter 1 (cfg_float) must be a real 15-element vector.")) {
+            "S-function parameter 1 (cfg_float) must be a real 1-D 15-element vector.")) {
         return 0;
     }
     if (!lg_sfun_read_u32_vector(S, P_CFG_TICKS_A, N_CFG_TICKS_A, ta,
-            "S-function parameter 2 (cfg_ticks_a) must be a real 2-element vector.")) {
+            "S-function parameter 2 (cfg_ticks_a) must be a real 1-D 2-element vector of integers in [0, 4294967295].")) {
         return 0;
     }
     if (!lg_sfun_read_float_vector(S, P_KP, N_BANK, kp,
-            "S-function parameter 3 (kp) must be a real 4-element vector.")) {
+            "S-function parameter 3 (kp) must be a real 1-D 4-element vector.")) {
         return 0;
     }
     if (!lg_sfun_read_float_vector(S, P_KD, N_BANK, kd,
-            "S-function parameter 4 (kd) must be a real 4-element vector.")) {
+            "S-function parameter 4 (kd) must be a real 1-D 4-element vector.")) {
         return 0;
     }
     if (!lg_sfun_read_float_vector(S, P_KI, N_BANK, ki,
-            "S-function parameter 5 (ki) must be a real 4-element vector.")) {
+            "S-function parameter 5 (ki) must be a real 1-D 4-element vector.")) {
         return 0;
     }
     if (!lg_sfun_read_float_vector(S, P_FF_SCALE, N_BANK, ff,
-            "S-function parameter 6 (ff_scale) must be a real 4-element vector.")) {
+            "S-function parameter 6 (ff_scale) must be a real 1-D 4-element vector.")) {
         return 0;
     }
     if (!lg_sfun_read_u32_vector(S, P_CFG_TICKS_B, N_CFG_TICKS_B, tb,
-            "S-function parameter 7 (cfg_ticks_b) must be a real 2-element vector.")) {
+            "S-function parameter 7 (cfg_ticks_b) must be a real 1-D 2-element vector of integers in [0, 4294967295].")) {
         return 0;
     }
 
@@ -364,7 +413,7 @@ static int_T lg_sfun_load_tuning(SimStruct *S, FieldTuning_t *tune)
     float t[N_TUNING];
 
     if (!lg_sfun_read_float_vector(S, P_TUNING, N_TUNING, t,
-            "S-function parameter 8 (tuning) must be a real 3-element vector.")) {
+            "S-function parameter 8 (tuning) must be a real 1-D 3-element vector.")) {
         return 0;
     }
     /* Assignment in frozen field order: gain, damping, safety margin. */
@@ -396,6 +445,23 @@ static real_T lg_sfun_sample_time(SimStruct *S)
 /* Simulink callbacks                                                        */
 /* ========================================================================= */
 
+#ifdef MDL_CHECK_PARAMETERS
+#define MDL_CHECK_PARAMETERS
+static void mdlCheckParameters(SimStruct *S)
+{
+    LayeredConfig_t cfg;
+    FieldTuning_t tune;
+
+    /* The same readers used at start validate the block parameters here, so a
+     * matrix-shaped vector or a non-finite/fractional tick budget is reported
+     * when the block is configured or the model is updated, not only when the
+     * simulation runs.  The readers raise the error message themselves. */
+    if (!lg_sfun_load_config(S, &cfg) || !lg_sfun_load_tuning(S, &tune)) {
+        return;
+    }
+}
+#endif
+
 static void mdlInitializeSizes(SimStruct *S)
 {
     int_T i;
@@ -405,6 +471,12 @@ static void mdlInitializeSizes(SimStruct *S)
         /* Simulink reports the parameter-count mismatch with its own dialog. */
         return;
     }
+#ifdef MDL_CHECK_PARAMETERS
+    mdlCheckParameters(S);
+    if (ssGetErrorStatus(S) != NULL) {
+        return;
+    }
+#endif
     for (i = 0; i < P_NUM_PARAMS; ++i) {
         ssSetSFcnParamTunable(S, i, 0);
     }
@@ -500,15 +572,21 @@ static void mdlOutputs(SimStruct *S, int_T tid)
     in.u_ff = lg_sfun_to_float(ssGetInputPortRealSignal(S, IN_U_FF)[0]);
     in.outer_seq = lg_sfun_to_u32(ssGetInputPortRealSignal(S, IN_OUTER_SEQ)[0]);
 
-    /* External acknowledgement: rising edge, applied before this tick's step
-     * so the release takes effect immediately.  The API validates the
-     * configuration itself and ignores the call when it is corrupt. */
+    /* External acknowledgement: a finite level above zero is HIGH, every other
+     * finite level (zero, negatives) is LOW, and a rising edge is applied
+     * before this tick's step so the release takes effect immediately.  A
+     * non-finite sample is ignored and the stored level is left untouched, so
+     * a forced 1 -> NaN -> 1 sequence cannot re-trigger the API.  The API
+     * validates the configuration itself and ignores the call when it is
+     * corrupt. */
     sig = ssGetInputPortRealSignal(S, IN_ACK);
-    ack_on = lg_sfun_ack_asserted(sig[0]);
-    if (ack_on != 0 && book[0] == 0.0) {
-        (void)Layered_AcknowledgeFaultLatch(state, cfg);
+    if (lg_sfun_is_finite(sig[0])) {
+        ack_on = lg_sfun_ack_asserted(sig[0]);
+        if (ack_on != 0 && book[0] == 0.0) {
+            (void)Layered_AcknowledgeFaultLatch(state, cfg);
+        }
+        book[0] = (ack_on != 0) ? 1.0 : 0.0;
     }
-    book[0] = (ack_on != 0) ? 1.0 : 0.0;
 
     out = Layered_Step(state, cfg, tune, &in);
 

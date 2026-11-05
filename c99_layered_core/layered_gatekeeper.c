@@ -92,6 +92,112 @@ static uint32_t lg_inc_sat(uint32_t value)
     return (value < UINT32_MAX) ? value + 1u : value;
 }
 
+/* Saturation value for a locally measured slow-frame age whose tick count times
+ * the inner period overflows binary32.  The saturated age must still read as
+ * "older than any timeout": clamping it to the finite-test limit instead would
+ * release the latency HOLD exactly when the local lease says the mailbox died. */
+#define LAYERED_AGE_SATURATION 3.402823466e+38f
+
+/* Keep a binary32 value that an extreme but legal gain product made non-finite
+ * inside the finite actuator domain: NaN -> 0, +Inf -> +limit, -Inf -> -limit.
+ * A finite value above the firewall limit is treated the same way, so the target
+ * published for diagnostics never leaves the domain the core reasons about. */
+static float lg_guard_value(float v, float limit)
+{
+    if (v != v) {
+        return 0.0f;
+    }
+    if (v > LAYERED_FINITE_LIMIT) {
+        return limit;
+    }
+    if (v < -LAYERED_FINITE_LIMIT) {
+        return -limit;
+    }
+    return v;
+}
+
+/* One IEEE-754 binary32 step toward zero, taken on the stored encoding so the
+ * subnormal range is walked exactly as well.  GATE_SAFE_ZERO needs it when the
+ * legal slew budget is below one ULP of the remaining command: plain
+ * subtraction would round back to the same value and the de-energise would
+ * never finish. */
+static float lg_next_toward_zero(float v)
+{
+    union {
+        float f;
+        uint32_t u;
+    } bits;
+    uint32_t magnitude;
+
+    if (v == 0.0f || v != v) {
+        return 0.0f;
+    }
+    bits.f = v;
+    magnitude = bits.u & 0x7FFFFFFFu;
+    if (magnitude <= 1u) {
+        return 0.0f;
+    }
+    bits.u = (bits.u & 0x80000000u) | (magnitude - 1u);
+    return bits.f;
+}
+
+/* Slew-limited walk of the applied command to zero.  A slew budget below one ULP
+ * of the remaining command still makes progress, so the de-energise terminates
+ * for every legal positive configuration instead of holding a non-zero command. */
+static float lg_ramp_toward_zero(float u_applied, float du_max)
+{
+    float next = lg_clampf(0.0f, u_applied - du_max, u_applied + du_max);
+
+    if (u_applied != 0.0f && next == u_applied) {
+        next = lg_next_toward_zero(u_applied);
+    }
+    return next;
+}
+
+/* The `initialized` field is an int that only needs one bit to record that
+ * Layered_Init() ran.  The next bit is private bookkeeping: it remembers that
+ * the previous tick was already inside a native latency HOLD, so the episode
+ * counter can distinguish a continued HOLD from a new one without adding a
+ * field to the frozen 96 B ABI. */
+#define LAYERED_STATE_INIT_BIT 1
+#define LAYERED_STATE_LATENCY_EPISODE_BIT 2
+
+static int lg_latency_episode_open(const LayeredState_t *state)
+{
+    return (state->initialized & LAYERED_STATE_LATENCY_EPISODE_BIT) != 0;
+}
+
+static void lg_set_latency_episode(LayeredState_t *state, int open)
+{
+    if (open != 0) {
+        state->initialized |= LAYERED_STATE_LATENCY_EPISODE_BIT;
+    } else {
+        state->initialized &= ~LAYERED_STATE_LATENCY_EPISODE_BIT;
+    }
+}
+
+/* The L1 slow-frame lease lives on the fast clock, so it must keep advancing on
+ * a frame whose fast sensors are unusable: alternating bad frames would
+ * otherwise stretch the slow-loop timeout to twice its configured length.  A
+ * live sequence opens or ages the lease, and a sequence that fell back to zero
+ * keeps the established lease ageing while the corruption path reports the
+ * anomaly. */
+static void lg_age_lease_while_holding(LayeredState_t *state,
+                                       const LayeredInput_t *input)
+{
+    if (input->outer_seq != 0u) {
+        if (state->last_outer_seq == 0u ||
+            input->outer_seq != state->last_outer_seq) {
+            state->last_outer_seq = input->outer_seq;
+            state->outer_age_ticks = 0u;
+        } else {
+            state->outer_age_ticks = lg_inc_sat(state->outer_age_ticks);
+        }
+    } else if (state->last_outer_seq != 0u) {
+        state->outer_age_ticks = lg_inc_sat(state->outer_age_ticks);
+    }
+}
+
 static int lg_config_is_corrupt(const LayeredConfig_t *c)
 {
     int i;
@@ -219,12 +325,13 @@ static float lg_pid_output(const LayeredConfig_t *config,
                            float u_ff)
 {
     if (bank == 3) {
-        return config->kp[3] * e + config->kd[3] * ed + config->ki[3] * integ;
+        return lg_guard_value(config->kp[3] * e + config->kd[3] * ed +
+                              config->ki[3] * integ, config->u_max);
     }
-    return (config->kp[bank] * tuning->gain_scale) * e
-         + (config->kd[bank] * tuning->damping_scale) * ed
-         + (config->ki[bank] * tuning->gain_scale) * integ
-         + config->ff_scale[bank] * u_ff;
+    return lg_guard_value((config->kp[bank] * tuning->gain_scale) * e
+                        + (config->kd[bank] * tuning->damping_scale) * ed
+                        + (config->ki[bank] * tuning->gain_scale) * integ
+                        + config->ff_scale[bank] * u_ff, config->u_max);
 }
 
 /* Tracking anti-windup (back-calculation) for ONE integrator.
@@ -235,7 +342,10 @@ static float lg_pid_output(const LayeredConfig_t *config,
  * an inactive controller can never store hidden windup and a later switch
  * releases no energy.  When ki_eff == 0 (or the time constant is disabled) the
  * back-calculation term has no defined gain and is skipped: the integrator is
- * then a pure accumulator and still clamped. */
+ * then a pure accumulator and still clamped.  The same holds when the legal
+ * product ki_eff * windup_tau_s underflows to zero in binary32: dividing by it
+ * would turn the integral into +/-Inf, so a denominator that is not strictly
+ * positive and finite simply contributes no correction term. */
 static void lg_integrate(float *integ,
                          float ki_eff,
                          float e,
@@ -248,7 +358,11 @@ static void lg_integrate(float *integ,
     float next = *integ + e * dt;
 
     if (ki_eff != 0.0f && windup_tau > 0.0f) {
-        next += (u_actual - u_pid) * dt / (ki_eff * windup_tau);
+        float denom = ki_eff * windup_tau;
+
+        if (denom > 0.0f && lg_is_finite(denom)) {
+            next += (u_actual - u_pid) * dt / denom;
+        }
     }
     *integ = lg_clampf(next, -limit, limit);
 }
@@ -268,7 +382,7 @@ void Layered_Init(LayeredState_t *state,
         return;
     }
 
-    state->initialized = 1;
+    state->initialized = LAYERED_STATE_INIT_BIT;
     state->u_applied = 0.0f;
     state->u_target = 0.0f;
     state->integ[0] = 0.0f;
@@ -358,6 +472,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     int fast_input_bad;
     int config_bad;
     int seq_mailbox_bad;
+    int age_usable;
     layered_gate_state_t gate;
     layered_regime_t regime;
     layered_regime_t mailbox_regime;
@@ -410,6 +525,13 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         state->recovery_ticks = config->ood_recovery_cooldown_ticks;
         state->step_count = lg_inc_sat(state->step_count);
 
+        /* An unusable fast frame must still advance the slow-frame lease.  The
+         * latency timeout is timed on that clock, so pausing it would stretch
+         * the effective slow-loop timeout under alternating bad fast frames. */
+        if (!config_bad) {
+            lg_age_lease_while_holding(state, input);
+        }
+
         /* The hold budget always advances.  An invalid configuration must not
          * hold the last command forever: that would leave a non-zero actuator
          * command alive with no trustworthy control law behind it. */
@@ -436,9 +558,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
                  * commissioned rate instead of stepping it in one tick. */
                 float corrupt_du_max = lg_absf(config->u_slew_max_per_s) *
                                        lg_absf(config->dt_s);
-                state->u_applied = lg_clampf(0.0f,
-                                             state->u_applied - corrupt_du_max,
-                                             state->u_applied + corrupt_du_max);
+                state->u_applied = lg_ramp_toward_zero(state->u_applied,
+                                                       corrupt_du_max);
             }
 
             out.u = state->u_applied;
@@ -488,6 +609,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
      * mailbox.  A sequence that was active and then reads 0 is a mailbox
      * anomaly and forces closed-loop R4. */
     outer_age_eff = input->outer_age_s;
+    age_usable = lg_is_finite(outer_age_eff);
     seq_mailbox_bad = 0;
     if (input->outer_seq != 0u) {
         if (state->last_outer_seq == 0u ||
@@ -498,6 +620,13 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             state->outer_age_ticks = lg_inc_sat(state->outer_age_ticks);
         }
         outer_age_eff = (float)state->outer_age_ticks * dt_eff;
+        /* A legal but extreme inner period can overflow that product.  Saturate
+         * it instead of treating the lease as invalid input: the timeout must
+         * still trip when the locally timed frame is that old. */
+        if (!lg_is_finite(outer_age_eff)) {
+            outer_age_eff = LAYERED_AGE_SATURATION;
+        }
+        age_usable = 1;
     } else if (state->last_outer_seq != 0u) {
         seq_mailbox_bad = 1;
     }
@@ -588,8 +717,10 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
 
     /* ---------------- 4. heartbeat watchdog ----------------------------- */
     /* Sequenced mailboxes are timed by the local lease (0b); legacy ones by
-     * the transported age.  Both are held to exactly one rule here. */
-    latency_hold = lg_is_finite(outer_age_eff) &&
+     * the transported age.  Both are held to exactly one rule here.  An age
+     * that the core cannot interpret (non-finite transport, outside the
+     * firewall domain) is not a timeout: it is already handled as corruption. */
+    latency_hold = (age_usable != 0) &&
                    (outer_age_eff > config->outer_timeout_s);
     if (latency_hold) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_LATENCY_TIMEOUT;
@@ -656,19 +787,23 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
      * are cut and the command is ramped to zero under the commissioned slew
      * limit (a single-frame step would itself violate u_slew_max_per_s). */
     if (gate == GATE_HOLD_LATENCY) {
-        /* Diagnostics only: count one hold EPISODE on the exact 0 -> 1 entry
-         * edge of hold_ticks, not one count per held tick and not one per
-         * age window.  hold_ticks is cleared on every non-HOLD tick, so this
-         * edge is the native-HOLD entry itself. */
-        if (state->hold_ticks == 0u) {
+        /* Diagnostics only: count one latency-HOLD EPISODE when the core enters
+         * the hold, not one count per held tick and not one per age window.  The
+         * episode bookkeeping lives in the high bit of `initialized` because a
+         * corrupt fast frame also advances hold_ticks without being a latency
+         * timeout: a mixed bad-frame -> stale-mailbox sequence must still count
+         * the slow-loop timeout that follows. */
+        if (!lg_latency_episode_open(state)) {
             state->latency_hold_count = lg_inc_sat(state->latency_hold_count);
+            lg_set_latency_episode(state, 1);
         }
         state->hold_ticks = lg_inc_sat(state->hold_ticks);
         if (state->hold_ticks > config->max_hold_ticks) {
-            gate = GATE_SAFE_ZERO;
+            gate = GATE_SAFE_ZERO; /* the episode stays open through the ramp */
         }
     } else {
         state->hold_ticks = 0u;
+        lg_set_latency_episode(state, 0);
     }
     if (gate == GATE_SAFE_ZERO) {
         state->fault_audit_bitmask |= LAYERED_FAULT_BIT_HOLD_TIMEOUT;
@@ -682,9 +817,7 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
         regime = REGIME_SAFE_FALLBACK;
         /* Only a valid configuration reaches this path (the input firewall
          * above rejects invalid settings), so du_max is trustworthy. */
-        state->u_applied = lg_clampf(0.0f,
-                                     state->u_applied - du_max,
-                                     state->u_applied + du_max);
+        state->u_applied = lg_ramp_toward_zero(state->u_applied, du_max);
     }
 
     /* ---------------- 6. controller bank -------------------------------- */
@@ -745,8 +878,10 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             state->u_target += config->blend_alpha * (u_active - state->u_target);
             state->blend = lg_clampf(state->blend + config->blend_alpha, 0.0f, 1.0f);
         }
-        if (state->u_target != state->u_target) {
-            state->u_target = 0.0f;
+        if (!lg_is_finite(state->u_target)) {
+            /* An extreme but legal gain product must not publish or store a
+             * non-finite target: clamp it by sign into the actuator range. */
+            state->u_target = lg_guard_value(state->u_target, u_max);
         }
 
         /* Hard actuator limits: magnitude first, then slew rate. */

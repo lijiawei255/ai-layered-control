@@ -14,7 +14,9 @@ defaults = struct('branches',[1 2 3],'mode','dynamic','fixed_regime',[], ...
     'noise_scale',1,'s3_noise',.006,'fault_f',[12 24],'zeta',.012,'wallk',300,'wallx',.43, ...
     'tuning',[1 1 1],'ood_gate',true,'conf_gate',true, ...
     'auto_calibrate',true,'log_core',false,'amplitude',[],'probe_spikes',true, ...
-    'corrupt_slow_at',Inf,'smoothing',false,'seq_mode',false);
+    'corrupt_slow_at',Inf,'smoothing',false,'seq_mode',false, ...
+    'j_scale',1,'b_scale',1,'f_scale',1, ...
+    'act_gain',1,'act_f',0,'act_zeta',1,'act_dz',0);
 keys = fieldnames(defaults);
 for j=1:numel(keys)
     if ~isfield(opts,keys{j}), opts.(keys{j})=defaults.(keys{j}); end
@@ -68,8 +70,18 @@ end
 drift=(stage>=1)*o.drift; p=zeros(n,5);
 p(:,1)=P.nominal.J*(1+drift); p(:,2)=P.nominal.b*(1+.3*drift);
 p(:,3)=P.nominal.k; p(:,4)=P.nominal.fc; p(:,5)=P.nominal.fs;
-p(stage==1,4)=1.2*(1+4.5*o.drift);
-p(stage==1,5)=2.5*(1+4.3*o.drift);
+% A negative drift would drive the raw stiction scale through zero, so the
+% positive scale keeps a physical friction floor (the Python fixture clamps the
+% same 1+4.5*drift and 1+4.3*drift factors at 0.25).
+p(stage==1,4)=1.2*max(.25,1+4.5*o.drift);
+p(stage==1,5)=2.5*max(.25,1+4.3*o.drift);
+% Per-parameter device mismatch on the loaded/contact stages only, so every
+% physical parameter stays positive and S1 remains the commissioned plant.
+loaded=stage>=1;
+p(loaded,1)=p(loaded,1)*o.j_scale;
+p(loaded,2)=p(loaded,2)*o.b_scale;
+p(loaded,4)=p(loaded,4)*o.f_scale;
+p(loaded,5)=p(loaded,5)*o.f_scale;
 ran=reshape(lcg(o.seed+11,6*n),n,6)';
 white=(ran(1,:)+ran(2,:)+ran(3,:)-1.5)'*2;
 sigma=repmat(.0015,n,1); sigma(stage==2)=o.s3_noise;
@@ -209,6 +221,7 @@ end
 function B=run_branch(P,c,o,mode)
 n=numel(c.t); dt=P.dt; nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
 x=c.r(1); v=0.; xm=x; vm=0.; wasflex=false; u0=0.; integ=0.; target=0.; pr=probe_init(x);
+act=0.; act_v=0.;
 ctx=zeros(1,4); frames=zeros(ceil(n/100),4); last_stamp=0.; cfg=P.cfg;
 if ~isempty(P.classifier)
     cfg.min_ai_confidence=P.classifier.trip; cfg.confidence_clear_ratio=P.classifier.clear;
@@ -306,14 +319,26 @@ for k=1:n
     end
     sx=x; sxm=xm; p=c.p(k,:); peak=0.; stuck=0;
     if c.fault(k) && ~wasflex, xm=x; vm=v; wasflex=true; end
+    % Unmodelled slow actuator: a lightly damped compliance mode, a force-scale
+    % error and a linkage dead zone act on the real effort, while the nominal
+    % predictor keeps seeing the commanded force.
+    if o.act_f~=0
+        w=2*pi*o.act_f;
+        act_v=act_v+dt*(w*w*(u-act)-2*o.act_zeta*w*act_v);
+        act=act+dt*act_v;
+    else
+        act=u;
+    end
+    u_dev=u+o.act_gain*(act-u);
+    if o.act_dz~=0, u_dev=u_dev-clamp(u_dev,-o.act_dz,o.act_dz); end
     for j=1:c.substeps
         h=dt/c.substeps; delta=x-c.wall(k); contact=0.;
         if delta>0 && c.wc(k)>0, contact=max(0,c.wc(k)*delta+.8*(v-c.wv(k))); end
         peak=max(peak,contact/.25);
         if c.fault(k)
-            [x,v,xm,vm,stuck]=flex_advance(x,v,xm,vm,u,p,h,c.freq(k),c.zeta,contact);
+            [x,v,xm,vm,stuck]=flex_advance(x,v,xm,vm,u_dev,p,h,c.freq(k),c.zeta,contact);
         else
-            [x,v,stuck]=advance(x,v,u,p,h,contact);
+            [x,v,stuck]=advance(x,v,u_dev,p,h,contact);
         end
     end
     logs(k,:)=[sx,u,gate,reg,peak,stuck,res,conf,pr.hf,ai,ym,sxm,yd,integ]; u0=u;
@@ -460,6 +485,64 @@ assert(isequal([st.fault,st.step_count,st.ood_veto_count],history),'Acknowledgem
 assert(st.recovery==q.ood_recovery_cooldown_ticks,'Acknowledgement did not re-arm the recovery cooldown.');
 for k=1:q.ood_recovery_cooldown_ticks+1, [st,out]=core_step(st,q,t,single([1 1 .005 0 0 0 0 0 0])); end
 assert(out(3)==0 && out(4)==1,'Acknowledged core did not return to the nominal regime.');
+% Numerical-domain bounds: the local lease keeps ageing on frames whose fast
+% sensor is unusable, an underflowed anti-windup denominator is skipped, an
+% overflowed target stays finite, a saturated lease still times out, a sub-ULP
+% slew budget still de-energises, and a corrupt frame followed by a slow-mailbox
+% timeout counts exactly one latency episode.
+q=c; q.min_dwell_ticks=dwell0; st=core_init();
+lease=single([1 .95 0 .1 .1 0 .1 0 0 10]);
+st=core_step(st,q,t,lease);
+first_hold=0;
+for k=1:400
+    f=lease; if mod(k,2)==1, f(5)=single(NaN); else, f(5)=single(.1); end
+    [st,out]=core_step(st,q,t,f);
+    if out(7)==0 && out(3)==1 && first_hold==0, first_hold=k; end
+end
+assert(st.outer_age_ticks==uint32(400) && first_hold>=348 && first_hold<=352, ...
+    'Alternating corrupt fast frames paused the local lease clock.');
+q=c; q.ki(:)=single(1e-30); q.ki(4)=single(0); q.windup_tau_s=single(1e-20);
+st=core_init();
+for k=1:200, st=core_step(st,q,t,single([1 .95 .005 0 0 0 .1 0 0])); end
+assert(abs(double(st.integ(1))-.02)<1e-3 && all(isfinite(st.integ)), ...
+    'An underflowed anti-windup denominator corrupted the integral.');
+q=c; q.kp(1)=single(3e38); q.kd(1)=single(0); q.ki(1)=single(0);
+[~,out]=core_step(core_init(),q,single([4 1 1]),single([1 .95 .005 0 0 0 .1 0 0]));
+assert(isfinite(out(2)) && out(2)==c.u_max, ...
+    'An overflowed bank product published a non-finite target.');
+q=c; q.dt_s=single(3e38); st=core_init();
+overflow_lease=single([1 .95 0 0 0 0 .1 0 0 5]);
+st=core_step(st,q,t,overflow_lease);
+[st,out]=core_step(st,q,t,overflow_lease);
+assert(out(3)==1,'An extreme inner period did not time the lease out.');
+[st,out]=core_step(st,q,t,overflow_lease);
+assert(out(3)==1 && st.outer_age_ticks==uint32(2), ...
+    'An overflowing lease age released the HOLD.');
+q=c; q.u_slew_max_per_s=single(1e-6); st=core_init();
+st.u_applied=single(1); st.u_target=single(1); st.started=true;
+sub_ulp=single([1 .95 c.outer_timeout_s+10*c.dt_s 0 .2 0 .4 0 0]);
+for k=1:101, [st,out]=core_step(st,q,t,sub_ulp); end
+assert(out(3)==5 && st.u_applied<single(1) && st.u_applied>single(0), ...
+    'A sub-ULP slew budget did not start the de-energise.');
+previous=st.u_applied;
+for k=1:200
+    [st,out]=core_step(st,q,t,sub_ulp);
+    assert(st.u_applied<previous && st.u_applied>single(0), ...
+        'A sub-ULP slew budget stalled the de-energise.');
+    previous=st.u_applied;
+end
+q=c; q.min_dwell_ticks=dwell0; st=core_init();
+good=single([1 .95 .005 .1 .1 0 .1 0 0]);
+for k=1:200, st=core_step(st,q,t,good); end
+corrupt_fast=good; corrupt_fast(5)=single(NaN);
+[st,out]=core_step(st,q,t,corrupt_fast);
+assert(out(3)==1 && out(7)==1 && st.hold_ticks==uint32(1) && ...
+    st.latency_hold_count==uint32(0),'A corrupt fast frame counted latency episode.');
+mixed_hold=good; mixed_hold(3)=c.outer_timeout_s+c.dt_s/2;
+[st,out]=core_step(st,q,t,mixed_hold);
+assert(out(3)==1 && out(7)==0 && st.hold_ticks==uint32(2) && ...
+    st.latency_hold_count==uint32(1), ...
+    'A slow-mailbox timeout after a corrupt frame was not counted.');
 passed=true;
 end
 
@@ -473,7 +556,7 @@ st=struct('u_applied',single(0),'u_target',single(0),'integ',zeros(4,1,'single')
     'ood_veto_count',uint32(0),'low_confidence_veto_count',uint32(0), ...
     'latency_hold_count',uint32(0),'corrupted_frame_count',uint32(0), ...
     'hold_ticks',uint32(0),'last_outer_seq',uint32(0),'outer_age_ticks',uint32(0), ...
-    'latch_episode_count',uint32(0));
+    'latch_episode_count',uint32(0),'latency_open',false);
 end
 
 function [st,released]=core_ack(st,c)
@@ -530,6 +613,20 @@ if fast_bad || config_bad
     st.corrupted_frame_count=st.corrupted_frame_count+uint32(1);
     st.recovery=uint32(c.ood_recovery_cooldown_ticks);
     st.step_count=st.step_count+uint32(1);
+    % An unusable fast frame must still advance the local slow-frame lease:
+    % the latency timeout is timed on that clock, so pausing it would stretch
+    % the effective slow-loop timeout under alternating bad fast frames.
+    if ~config_bad
+        if seq~=0
+            if st.last_outer_seq==0 || seq~=st.last_outer_seq
+                st.last_outer_seq=seq; st.outer_age_ticks=uint32(0);
+            else
+                st.outer_age_ticks=st.outer_age_ticks+uint32(1);
+            end
+        elseif st.last_outer_seq~=0
+            st.outer_age_ticks=st.outer_age_ticks+uint32(1);
+        end
+    end
     % A rejected configuration has no trustworthy hold budget: use the fixed
     % fail-safe budget.  hold_ticks always advances so a broken sensor or a
     % broken configuration can never hold the last command forever.
@@ -543,7 +640,7 @@ if fast_bad || config_bad
             % The slew limit belongs to the rejected configuration.
             st.u_applied=single(0);
         else
-            st.u_applied=clamp(single(0),st.u_applied-du,st.u_applied+du);
+            st.u_applied=ramp_toward_zero(st.u_applied,du);
         end
         out=[double(st.u_applied),0,5,4,double(st.blend),double(st.fault),1];
         return;
@@ -564,6 +661,7 @@ snap=~st.started;
 conf_before=st.conf; safety_before=st.safety; ood_before=st.ood;
 % ---- 0c. L1 slow-frame lease -------------------------------------------
 age_eff=in(3); seq_bad=false;
+age_ok=abs(age_eff)<=single(3e38);
 if seq~=0
     if st.last_outer_seq==0 || seq~=st.last_outer_seq
         st.last_outer_seq=seq; st.outer_age_ticks=uint32(0);
@@ -571,6 +669,11 @@ if seq~=0
         st.outer_age_ticks=st.outer_age_ticks+uint32(1);
     end
     age_eff=single(st.outer_age_ticks)*dt;
+    % A legal but extreme inner period can overflow that product.  Saturating
+    % it keeps the lease readable as "older than any timeout" instead of
+    % releasing the HOLD exactly when the mailbox died.
+    if abs(age_eff)>single(3e38), age_eff=single(3.402823466e+38); end
+    age_ok=true;
 elseif st.last_outer_seq~=0
     seq_bad=true;
 end
@@ -621,7 +724,7 @@ if double(veto_threshold)>0 && ...
     st.permanent=true; st.fault=bitor(st.fault,uint32(64));
 end
 % ---- 4. heartbeat watchdog ---------------------------------------------
-stale=isfinite(age_eff) && abs(age_eff)<=single(3e38) && age_eff>c.outer_timeout_s;
+stale=age_ok && age_eff>c.outer_timeout_s;
 if stale
     st.fault=bitor(st.fault,uint32(1));
     st.recovery=uint32(c.ood_recovery_cooldown_ticks);
@@ -658,21 +761,24 @@ if st.permanent
 end
 % ---- 5b. bounded native HOLD -------------------------------------------
 if gate==1
-    % Diagnostics only: one count per HOLD episode, on the entry tick of a
-    % native hold, never one per held tick or per overshooting age window.
-    if st.hold_ticks==uint32(0)
+    % Diagnostics only: one count per latency-HOLD episode.  The open episode
+    % is tracked separately from hold_ticks because a corrupt fast frame also
+    % advances hold_ticks without being a latency timeout.
+    if ~st.latency_open
         st.latency_hold_count=st.latency_hold_count+uint32(1);
+        st.latency_open=true;
     end
     st.hold_ticks=st.hold_ticks+uint32(1);
     if st.hold_ticks>hold_budget, gate=5; end
 else
     st.hold_ticks=uint32(0);
+    st.latency_open=false;
 end
 if gate==5
     st.fault=bitor(st.fault,uint32(32));
     st.u_target=single(0); st.integ(:)=single(0); st.blend=single(0);
     st.regime=4; reg=4;
-    st.u_applied=clamp(single(0),st.u_applied-du,st.u_applied+du);
+    st.u_applied=ramp_toward_zero(st.u_applied,du);
 end
 % ---- 6. controller bank, tracking anti-windup, bumpless transfer -------
 do_control=(gate~=1) && (gate~=5);
@@ -682,6 +788,7 @@ if do_control
     bank(1:3)=(c.kp(1:3)*t(1))*e+(c.kd(1:3)*t(2))*ed+ ...
         (c.ki(1:3)*t(1)).*st.integ(1:3)+c.ff_scale(1:3)*in(9);
     bank(4)=c.kp(4)*(-in(5))+c.kd(4)*(-in(6))+c.ki(4)*st.integ(4);
+    bank=guard_value(bank,u_max);
     idx=reg; if idx<1, idx=1; elseif idx>4, idx=4; end
     u_active=bank(idx);
     if snap
@@ -696,7 +803,11 @@ if do_control
         st.u_target=st.u_target+c.blend_alpha*(u_active-st.u_target);
         st.blend=clamp(st.blend+c.blend_alpha,single(0),single(1));
     end
-    if isnan(st.u_target), st.u_target=single(0); end
+    if ~isfinite(st.u_target) || abs(st.u_target)>single(3e38)
+        % An extreme but legal gain product must never store a non-finite
+        % target: clamp it by sign into the actuator range.
+        st.u_target=guard_value(st.u_target,u_max);
+    end
     command=clamp(st.u_target,-u_max,u_max);
     command=clamp(command,st.u_applied-du,st.u_applied+du);
     for j=1:4
@@ -704,7 +815,12 @@ if do_control
         else, ki=c.ki(j)*t(1); err=e; end
         next=st.integ(j)+err*dt;
         if ki~=0 && c.windup_tau_s>0
-            next=next+(command-bank(j))*dt/(ki*c.windup_tau_s);
+            % A legal product that underflows to zero would divide by zero and
+            % drive the integral into the clamp, so skip it instead.
+            denom=ki*c.windup_tau_s;
+            if denom>single(0) && denom<=single(3e38)
+                next=next+(command-bank(j))*dt/denom;
+            end
         end
         st.integ(j)=clamp(next,-integ_limit,integ_limit);
     end
@@ -726,4 +842,29 @@ end
 function y=clamp(x,lo,hi)
 if isnan(x), x=0; end
 y=min(max(x,lo),hi);
+end
+
+function v=guard_value(v,limit)
+% Mirror of lg_guard_value(): NaN -> 0, a value beyond the firewall limit by
+% sign -> +/-limit, so an overflowed intermediate never becomes a published
+% non-finite target.
+nan=isnan(v); pos=~nan & v>single(3e38); neg=~nan & v<single(-3e38);
+v(nan)=single(0); v(pos)=limit; v(neg)=-limit;
+end
+
+function v=next_toward_zero(v)
+% Mirror of lg_next_toward_zero(): one binary32 step toward zero taken on the
+% stored encoding, so a slew budget below one ULP still de-energises.
+if v==single(0) || isnan(v), v=single(0); return; end
+bits=typecast(single([v 0]),'uint32'); b=bits(1);
+magnitude=bitand(b,uint32(hex2dec('7FFFFFFF')));
+if magnitude<=uint32(1), v=single(0); return; end
+b=bitor(bitand(b,uint32(hex2dec('80000000'))),magnitude-uint32(1));
+bits=typecast(uint32([b 0]),'single'); v=bits(1);
+end
+
+function v=ramp_toward_zero(u,du)
+% Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.
+v=clamp(single(0),u-du,u+du);
+if u~=single(0) && v==u, v=next_toward_zero(u); end
 end

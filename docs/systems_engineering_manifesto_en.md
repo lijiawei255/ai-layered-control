@@ -21,9 +21,11 @@ the same contract.
 ### 1. Scarce samples, expensive trials
 
 **Problem.** A continuous action model needs dense labeled rollouts. The conditioned RBF action head
-(B2) consumes 16,000 action labels before its mapping is usable. Those labels are synthesized in
-simulation from the nominal model; the number quantifies the machine time and the collision/wear cost
-that collecting the same scale of trajectories on real hardware would incur.
+(B2) is trained on 16,000 nominal simulation samples in this benchmark. Figure 2 Panel A shows that its
+nominal RMSE has already converged at 64-1,024 samples, yet without fast-loop safety gating it still
+cannot remove the S4 envelope violations. The sample count illustrates how high the engineering
+threshold of dense trial-and-error sampling plus retraining remains on real hardware; it is not a
+measured machine-time or wear budget.
 
 **Where the alternatives fail.** Retraining on the target machine is the natural response, but the
 data cost and the trial risk scale with every unit and every operating condition. A fixed rule tree
@@ -56,11 +58,12 @@ R4, the blend filter is bypassed and blend = 1.0, so the emergency damping acts 
 zone plus a 4 Hz mounting mode is one evaluated benchmark case. The loop must not keep applying a
 confident-looking command while the structure oscillates.
 
-**Where the alternatives fail.** A fixed rule tree or a fuzzy controller encodes decision boundaries but
-no notion of distance from the calibrated distribution. The physical rule supervisor agrees with the
-prototype classifier on the main S1/S2 decisions and the 19.47 N S3 contact peak, yet in the off-manifold
-case it cannot abstain, because abstention requires a measure of how far the current feature point lies
-from known operation.
+**Where the alternatives fail.** The fixed-threshold rule tree compared in this benchmark, or a fuzzy
+controller, encodes decision boundaries but - without an explicitly embedded manifold-distance or
+density model - carries no notion of distance from the calibrated distribution. The physical rule
+supervisor agrees with the prototype classifier on the main S1/S2 decisions and the 19.47 N S3 contact
+peak, yet in the off-manifold case it cannot abstain, because abstention requires a measure of how far
+the current feature point lies from known operation.
 
 **Mechanism.** The prototype model exposes `ai_confidence` as a distance-based measure. Outside the
 manifold the confidence collapses, the 1 kHz core registers GATE_VETO_LOW_CONFIDENCE and runs R4 with
@@ -113,7 +116,7 @@ jitter and untraceable state. A veto without persistent evidence cannot answer t
 question.
 
 **Mechanism.** The core is ANSI C99 with zero dynamic memory, statically sized state and object text of
-5,112 bytes at `-Os` and 6,592 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
+6,144 bytes at `-Os` and 7,172 bytes at `-O2` (GCC 4.9.2 TDM64, x86-64). Its ABI occupies
 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe. The 7-bit
 `fault_audit_bitmask` records latency, residual OOD, low confidence, envelope breach, NaN corruption,
 HOLD timeout and permanent latch. Three cumulative safety/OOD episodes latch GATE_LATCHED_SAFE
@@ -171,7 +174,7 @@ differs by 150 ticks (93.49% versus 94.99%), visible in the third decimal of the
 TV 1545.01 N·m, while B1 keeps the lower raw S2 error and B2 keeps its S3 contact advantage; these
 observations define the interpretation of the benchmark.
 
-Cross-language replay closes the verification loop. The C99 standalone regression passes 211 checks with
+Cross-language replay closes the verification loop. The C99 standalone regression passes 233 checks with
 zero failures, and the 120-line `gate_template.c` self-check prints PASS. The Python/C `--selftest`
 replays 6,000 frames (R1 = 901, R2 = 900, R3 = 304, R4 = 3,895, including acknowledgement re-arming and
 the 7→5→3→1→0 ramp-down) with identical discrete outputs and max |du| = 0, bit-exact in binary32. The

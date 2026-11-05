@@ -39,8 +39,18 @@ OFF_MANIFOLD = dict(scenario=0, ood=False, amplitude=0.03, act_f=4.0, act_zeta=0
                     act_gain=0.6, act_dz=0.018, noise_scale=0.05)
 USE_PYTHON = False
 
+_F32_MAX = 3.4028234663852886e+38
+# The frozen core tests finiteness with LAYERED_FINITE_LIMIT = 3.0e38f, i.e. the
+# binary32 value below; comparing against the double 3e38 would disagree for the
+# few representable values between 3e38 and 3.0e38f.
+_FINITE_LIMIT = float(np.float32(3.0e38))
+
 def _f32(v):
     """Round one host float to the binary32 value carried by the C ABI."""
+    if v > _F32_MAX:
+        return float('inf')
+    if v < -_F32_MAX:
+        return float('-inf')
     return float(np.float32(v))
 
 def make_core(cfg, tuning):
@@ -56,7 +66,7 @@ class PythonGatekeeper:
     proves gate/regime/fault and episode-counter equality on 6,000 shared frames
     plus the fault-path scenarios below.
     """
-    __slots__ = ('cfg', 'tune', 'u_applied', 'u_target', 'integ', 'blend', 'control_started', 'regime', 'ood_latched', 'safety_latched', 'conf_latched', 'permanent_latched', 'dwell_ticks', 'recovery_ticks', 'fault_audit_bitmask', 'step_count', 'safety_veto_count', 'ood_veto_count', 'low_confidence_veto_count', 'latency_hold_count', 'corrupted_frame_count', 'hold_ticks', 'last_outer_seq', 'outer_age_ticks', 'latch_episode_count')
+    __slots__ = ('cfg', 'tune', 'u_applied', 'u_target', 'integ', 'blend', 'control_started', 'regime', 'ood_latched', 'safety_latched', 'conf_latched', 'permanent_latched', 'dwell_ticks', 'recovery_ticks', 'fault_audit_bitmask', 'step_count', 'safety_veto_count', 'ood_veto_count', 'low_confidence_veto_count', 'latency_hold_count', 'corrupted_frame_count', 'hold_ticks', 'last_outer_seq', 'outer_age_ticks', 'latch_episode_count', 'latency_open')
 
     def __init__(self, cfg: dict, tune: dict):
         # The C ABI carries binary32 only, so quantize every host value before
@@ -70,6 +80,8 @@ class PythonGatekeeper:
         self.u_applied = self.u_target = self.blend = 0.0
         self.integ = [0.0, 0.0, 0.0, 0.0]
         self.regime = REGIME_NOMINAL
+        # No native latency HOLD is open before the first tick.
+        self.latency_open = False
         # Every integer state starts at zero: latches, counters, lease clocks.
         for name in ('control_started', 'ood_latched', 'safety_latched', 'conf_latched',
                      'permanent_latched', 'dwell_ticks', 'recovery_ticks', 'fault_audit_bitmask',
@@ -101,6 +113,38 @@ class PythonGatekeeper:
         return v
 
     @staticmethod
+    def _guard(v, limit):
+        """Mirror of lg_guard_value(): keep an overflowed binary32 value finite."""
+        if v != v:
+            return 0.0
+        if v > _FINITE_LIMIT:
+            return limit
+        if v < -_FINITE_LIMIT:
+            return -limit
+        return v
+
+    @staticmethod
+    def _next_toward_zero(v):
+        """Mirror of lg_next_toward_zero(): one binary32 step toward zero."""
+        if v == 0.0 or v != v:
+            return 0.0
+        bits = int(np.float32(v).view(np.uint32))
+        magnitude = bits & 0x7FFFFFFF
+        if magnitude <= 1:
+            return 0.0
+        bits = (bits & 0x80000000) | (magnitude - 1)
+        return float(np.uint32(bits).view(np.float32))
+
+    @staticmethod
+    def _ramp_toward_zero(u_applied, du_max):
+        """Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0."""
+        nxt = PythonGatekeeper._clampf(0.0, _f32(u_applied - du_max),
+                                       _f32(u_applied + du_max))
+        if u_applied != 0.0 and nxt == u_applied:
+            nxt = PythonGatekeeper._next_toward_zero(u_applied)
+        return nxt
+
+    @staticmethod
     def _mailbox_regime(ai_regime):
         if ai_regime < 1.5:
             return REGIME_NOMINAL
@@ -116,7 +160,7 @@ class PythonGatekeeper:
 
     @staticmethod
     def _config_corrupt(cfg):
-        finite = 3e+38
+        finite = _FINITE_LIMIT
         values = [x for v in cfg.values() for x in (v if isinstance(v, list) else [v])]
         if any(not -finite <= v <= finite for v in values):
             return True
@@ -135,7 +179,7 @@ class PythonGatekeeper:
         return any(cfg[k] < 0 for k in ('integ_limit', 'windup_tau_s', 'safety_predict_s'))
 
     @staticmethod
-    def _pid(kp, kd, ki, ff, gain_scale, damping_scale, e, ed, integ, u_ff):
+    def _pid(kp, kd, ki, ff, gain_scale, damping_scale, e, ed, integ, u_ff, u_max):
         """Normal-bank law, rounded exactly where the C expression rounds.
 
         C evaluates ``(kp*gain)*e + (kd*damp)*ed + (ki*gain)*integ + ff*u_ff``
@@ -145,19 +189,28 @@ class PythonGatekeeper:
         term_d = _f32(_f32(kd * damping_scale) * ed)
         term_i = _f32(_f32(ki * gain_scale) * integ)
         term_f = _f32(ff * u_ff)
-        return _f32(_f32(_f32(term_p + term_d) + term_i) + term_f)
+        return PythonGatekeeper._guard(
+            _f32(_f32(_f32(term_p + term_d) + term_i) + term_f), u_max)
 
     @staticmethod
-    def _pid_safe(kp, kd, ki, e, ed, integ):
+    def _pid_safe(kp, kd, ki, e, ed, integ, u_max):
         """R4 law: fixed gains, no field scaling and no feedforward term."""
-        return _f32(_f32(_f32(kp * e) + _f32(kd * ed)) + _f32(ki * integ))
+        return PythonGatekeeper._guard(
+            _f32(_f32(_f32(kp * e) + _f32(kd * ed)) + _f32(ki * integ)), u_max)
 
     @staticmethod
     def _integrate(integ, ki_eff, e, dt, u_pid, u_actual, windup_tau, limit):
-        """Tracking anti-windup with the binary32 rounding of ``lg_integrate``."""
+        """Tracking anti-windup with the binary32 rounding of ``lg_integrate``.
+
+        A legal ki_eff * windup_tau_s that underflows to zero in binary32 would
+        make the back-calculation a division by zero, so only a strictly
+        positive finite denominator contributes a correction term.
+        """
         nxt = _f32(integ + _f32(e * dt))
         if ki_eff != 0.0 and windup_tau > 0.0:
-            nxt = _f32(nxt + _f32(_f32(_f32(u_actual - u_pid) * dt) / _f32(ki_eff * windup_tau)))
+            denom = _f32(ki_eff * windup_tau)
+            if denom > 0.0 and denom <= _FINITE_LIMIT:
+                nxt = _f32(nxt + _f32(_f32(_f32(u_actual - u_pid) * dt) / denom))
         return PythonGatekeeper._clampf(nxt, -limit, limit)
 
     def step(self, ai_regime, ai_confidence, outer_age_s, physics_residual, x, x_dot, r, r_dot, u_ff, outer_seq):
@@ -173,7 +226,7 @@ class PythonGatekeeper:
         outer_seq = int(outer_seq)
         cfg = self.cfg
         tune = self.tune
-        finite = 3e+38
+        finite = _FINITE_LIMIT
         fast_bad = (any(not -finite <= v <= finite for v in (physics_residual, x, x_dot, r, r_dot, u_ff))
                     or physics_residual < 0)
         config_bad = self._config_corrupt(cfg)
@@ -183,6 +236,19 @@ class PythonGatekeeper:
             self.corrupted_frame_count = self._inc_sat(self.corrupted_frame_count)
             self.recovery_ticks = cfg['ood_recovery_cooldown_ticks']
             self.step_count = self._inc_sat(self.step_count)
+            # An unusable fast frame must still advance the slow-frame lease:
+            # the latency timeout is timed on this clock, so pausing it would
+            # stretch the effective slow-loop timeout under alternating bad
+            # fast frames.
+            if not config_bad:
+                if outer_seq != 0:
+                    if self.last_outer_seq == 0 or outer_seq != self.last_outer_seq:
+                        self.last_outer_seq = outer_seq
+                        self.outer_age_ticks = 0
+                    else:
+                        self.outer_age_ticks = self._inc_sat(self.outer_age_ticks)
+                elif self.last_outer_seq != 0:
+                    self.outer_age_ticks = self._inc_sat(self.outer_age_ticks)
             # The hold budget always advances; a rejected configuration has no
             # trustworthy slew budget, so it gets the fixed corrupt-config budget.
             hold_budget = 100 if config_bad else cfg['max_hold_ticks']
@@ -197,8 +263,7 @@ class PythonGatekeeper:
                 if config_bad:
                     self.u_applied = 0.0
                 else:
-                    self.u_applied = self._clampf(0.0, _f32(self.u_applied - firewall_du_max),
-                                                  _f32(self.u_applied + firewall_du_max))
+                    self.u_applied = self._ramp_toward_zero(self.u_applied, firewall_du_max)
                 return (self.u_applied, GATE_SAFE_ZERO, REGIME_SAFE, self.blend,
                         self.fault_audit_bitmask, 1, 0.0)
             return (self.u_applied, GATE_HOLD_LATENCY, self.regime, self.blend, self.fault_audit_bitmask, 1, self.u_target)
@@ -223,6 +288,7 @@ class PythonGatekeeper:
 
         # L1 slow-frame lease: a live outer_seq is timed by the fast core itself.
         outer_age_eff = outer_age_s
+        age_usable = -_FINITE_LIMIT <= outer_age_eff <= _FINITE_LIMIT
         seq_mailbox_bad = False
         if outer_seq != 0:
             if self.last_outer_seq == 0 or outer_seq != self.last_outer_seq:
@@ -231,6 +297,12 @@ class PythonGatekeeper:
             else:
                 self.outer_age_ticks = self._inc_sat(self.outer_age_ticks)
             outer_age_eff = _f32(float(self.outer_age_ticks) * dt_eff)
+            # A legal but extreme inner period can overflow that product.  It
+            # saturates instead of reading as invalid input, so the timeout still
+            # trips when the locally timed frame is that old.
+            if not (-_FINITE_LIMIT <= outer_age_eff <= _FINITE_LIMIT):
+                outer_age_eff = 3.402823466e+38
+            age_usable = True
         elif self.last_outer_seq != 0:
             seq_mailbox_bad = True
         # A live sequence that falls back to zero is corruption of the same
@@ -280,7 +352,7 @@ class PythonGatekeeper:
             self.permanent_latched = 1
             self.fault_audit_bitmask |= FAULT_PERMANENT_LATCH
 
-        latency_hold = -finite <= outer_age_eff <= finite and outer_age_eff > cfg['outer_timeout_s']
+        latency_hold = age_usable and outer_age_eff > cfg['outer_timeout_s']
         if latency_hold:
             self.fault_audit_bitmask |= FAULT_LATENCY
             self.recovery_ticks = cfg['ood_recovery_cooldown_ticks']
@@ -315,16 +387,20 @@ class PythonGatekeeper:
             gate = GATE_LATCHED_SAFE
             regime = REGIME_SAFE
         # Bounded native HOLD: past max_hold_ticks the command is de-energised.
-        # latency_hold_count counts one episode on the exact 0 -> 1 hold_ticks
-        # entry edge, never one count per held tick or per age window.
+        # latency_hold_count counts one latency-HOLD episode when the core enters
+        # the hold, never one count per held tick or per age window.  The open
+        # episode is tracked separately from hold_ticks because a corrupt fast
+        # frame also advances hold_ticks without being a latency timeout.
         if gate == GATE_HOLD_LATENCY:
-            if self.hold_ticks == 0:
+            if not self.latency_open:
                 self.latency_hold_count = self._inc_sat(self.latency_hold_count)
+                self.latency_open = True
             self.hold_ticks = self._inc_sat(self.hold_ticks)
             if self.hold_ticks > cfg['max_hold_ticks']:
                 gate = GATE_SAFE_ZERO
         else:
             self.hold_ticks = 0
+            self.latency_open = False
         if gate == GATE_SAFE_ZERO:
             self.fault_audit_bitmask |= FAULT_HOLD_TIMEOUT
             self.u_target = 0.0
@@ -334,8 +410,7 @@ class PythonGatekeeper:
             regime = REGIME_SAFE
             # Only a valid configuration reaches this path, so du_max is
             # trustworthy and the command ramps to zero instead of stepping.
-            self.u_applied = self._clampf(0.0, _f32(self.u_applied - du_max),
-                                          _f32(self.u_applied + du_max))
+            self.u_applied = self._ramp_toward_zero(self.u_applied, du_max)
         do_control = gate != GATE_HOLD_LATENCY and gate != GATE_SAFE_ZERO
         kp = cfg['kp']
         kd = cfg['kd']
@@ -347,10 +422,10 @@ class PythonGatekeeper:
         if do_control:
             e = _f32(r - x)
             ed = _f32(r_dot - x_dot)
-            u_pid0 = self._pid(kp[0], kd[0], ki[0], ff_scale[0], gain_scale, damping_scale, e, ed, self.integ[0], u_ff)
-            u_pid1 = self._pid(kp[1], kd[1], ki[1], ff_scale[1], gain_scale, damping_scale, e, ed, self.integ[1], u_ff)
-            u_pid2 = self._pid(kp[2], kd[2], ki[2], ff_scale[2], gain_scale, damping_scale, e, ed, self.integ[2], u_ff)
-            u_pid3 = self._pid_safe(kp[3], kd[3], ki[3], -x, -x_dot, self.integ[3])
+            u_pid0 = self._pid(kp[0], kd[0], ki[0], ff_scale[0], gain_scale, damping_scale, e, ed, self.integ[0], u_ff, u_max)
+            u_pid1 = self._pid(kp[1], kd[1], ki[1], ff_scale[1], gain_scale, damping_scale, e, ed, self.integ[1], u_ff, u_max)
+            u_pid2 = self._pid(kp[2], kd[2], ki[2], ff_scale[2], gain_scale, damping_scale, e, ed, self.integ[2], u_ff, u_max)
+            u_pid3 = self._pid_safe(kp[3], kd[3], ki[3], -x, -x_dot, self.integ[3], u_max)
             bank = regime - 1
             if bank < 0:
                 bank = 0
@@ -369,8 +444,10 @@ class PythonGatekeeper:
                     self.blend = 0.0
                 self.u_target = _f32(self.u_target + _f32(alpha * _f32(u_active - self.u_target)))
                 self.blend = self._clampf(_f32(self.blend + alpha), 0.0, 1.0)
-            if self.u_target != self.u_target:
-                self.u_target = 0.0
+            if not (-_FINITE_LIMIT <= self.u_target <= _FINITE_LIMIT):
+                # An extreme but legal gain product must never store a
+                # non-finite target: clamp it by sign into the actuator range.
+                self.u_target = self._guard(self.u_target, u_max)
             u_cmd = self._clampf(self.u_target, -u_max, u_max)
             u_cmd = self._clampf(u_cmd, _f32(self.u_applied - du_max), _f32(self.u_applied + du_max))
             self.integ[0] = self._integrate(self.integ[0], _f32(ki[0] * gain_scale), e, dt_eff,
@@ -778,8 +855,10 @@ def calibrate(groups, n=12):
     from minimal_template import auto_calibrate
     X = np.vstack([g[10:, 1:][np.linspace(0, len(g) - 11, n).astype(int)] for g in groups])
     protos, gamma, trip, clear = auto_calibrate(X, np.repeat(np.arange(1, 4), n))
-    # Twice the helper's 0.15x quantile trip still sits below the 0.11 nominal minimum.
-    return protos, gamma, 2.0 * trip, 2.0 * clear
+    # Twice the helper's 0.15x quantile trip still sits below the 0.11 nominal
+    # minimum.  The same two caps bound pathological small-sample scores on both
+    # engines and stay inactive for the calibrated benchmark values.
+    return protos, gamma, min(2.0 * trip, 0.25), min(2.0 * clear, 0.35)
 
 def train_policy(n=16000, centers=512, drift=0.0):
     X = lcg(933, 9 * n).reshape(n, 9) * 2 - 1
@@ -1158,6 +1237,76 @@ def selftest():
     assert a[5] == b[5] == 1
     assert a[4] & FAULT_NAN and b[4] & FAULT_NAN
     assert c.state.corrupted_frame_count == p.corrupted_frame_count == 1
+    # A5: numerical-domain bounds.  The local lease keeps ageing through
+    # alternating corrupt fast frames, an underflowed anti-windup denominator is
+    # skipped, an overflowing product stays finite, a saturated lease still times
+    # out, a sub-ULP slew budget still de-energises and a corrupt frame followed
+    # by a slow-mailbox timeout counts exactly one latency episode.
+    c = Core(sat_cfg); p = PythonGatekeeper(sat_cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    a, b = c.step(1, .95, 0., .1, .1, 0., .1, 0., 0., 10), p.step(1, .95, 0., .1, .1, 0., .1, 0., 0., 10)
+    assert a[1] == b[1] == GATE_NORMAL
+    first_clean_hold = None
+    for k in range(1, 401):
+        frame = (1., .95, 0., .1, math.nan if k % 2 else .1, 0., .1, 0., 0., 10)
+        a, b = c.step(*frame), p.step(*frame)
+        assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
+        if a[5] == 0 and a[1] == GATE_HOLD_LATENCY and first_clean_hold is None:
+            first_clean_hold = k
+    assert c.state.outer_age_ticks == p.outer_age_ticks == 400
+    assert 348 <= first_clean_hold <= 352, first_clean_hold
+    q = dict(sat_cfg, ki=[1e-30, 1e-30, 1e-30, 0.], windup_tau_s=1e-20)
+    c = Core(q); p = PythonGatekeeper(q, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    under = (1., .95, .005, 0., 0., 0., .1, 0., 0., 0)
+    for _ in range(200):
+        a, b = c.step(*under), p.step(*under)
+        assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
+    assert abs(c.state.integ[0] - .02) < 1e-3 and list(c.state.integ) == p.integ
+    q = dict(cfg, kp=[3e38] + cfg['kp'][1:], kd=[0.] + cfg['kd'][1:], ki=[0.] + cfg['ki'][1:])
+    c = Core(q, (4., 1., 1.)); p = PythonGatekeeper(q, dict(gain_scale=4., damping_scale=1., safety_margin_scale=1.))
+    a, b = c.step(1, .95, .005, 0., 0., 0., .1, 0., 0., 0), p.step(1, .95, .005, 0., 0., 0., .1, 0., 0., 0)
+    assert a == b and a[6] == cfg['u_max'] == 20.0, (a, b, cfg['u_max'])
+    q = dict(cfg, dt_s=3e38)
+    c = Core(q); p = PythonGatekeeper(q, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    slow = (1., .95, 0., 0., 0., 0., .1, 0., 0., 5)
+    a, b = c.step(*slow), p.step(*slow)
+    assert a == b and a[1] == GATE_NORMAL
+    a, b = c.step(*slow), p.step(*slow)
+    assert a == b and a[1] == GATE_HOLD_LATENCY
+    a, b = c.step(*slow), p.step(*slow)
+    assert a == b and a[1] == GATE_HOLD_LATENCY
+    assert c.state.outer_age_ticks == p.outer_age_ticks == 2
+    q = dict(cfg, u_slew_max_per_s=1e-6)
+    c = Core(q); p = PythonGatekeeper(q, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    c.state.u_applied = p.u_applied = 1.0
+    c.state.u_target = p.u_target = 1.0
+    c.state.control_started = p.control_started = 1
+    sub_ulp = (1., .95, cfg['outer_timeout_s'] + 10*cfg['dt_s'], 0., .2, 0., .4, 0., 0., 0)
+    for _ in range(101):
+        a, b = c.step(*sub_ulp), p.step(*sub_ulp)
+        assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
+    assert a[1] == b[1] == GATE_SAFE_ZERO and a[0] == b[0] and 0.0 < a[0] < 1.0
+    previous = a[0]
+    for _ in range(200):
+        a, b = c.step(*sub_ulp), p.step(*sub_ulp)
+        assert a[0] == b[0] and 0.0 < a[0] < previous and a[6] == b[6] == 0.0
+        previous = a[0]
+    c = Core(sat_cfg); p = PythonGatekeeper(sat_cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
+    good = (1., .95, .005, .1, .1, 0., .1, 0., 0., 0)
+    for _ in range(200):
+        a, b = c.step(*good), p.step(*good)
+    assert c.state.latency_hold_count == p.latency_hold_count == 0
+    a, b = c.step(1., .95, .005, .1, math.nan, 0., .1, 0., 0., 0), p.step(1., .95, .005, .1, math.nan, 0., .1, 0., 0., 0)
+    assert a[1] == b[1] == GATE_HOLD_LATENCY and a[5] == b[5] == 1
+    assert c.state.hold_ticks == p.hold_ticks == 1
+    assert c.state.latency_hold_count == p.latency_hold_count == 0
+    mixed = (1., .95, cfg['outer_timeout_s'] + .5*cfg['dt_s'], .1, .1, 0., .1, 0., 0., 0)
+    a, b = c.step(*mixed), p.step(*mixed)
+    assert a[1] == b[1] == GATE_HOLD_LATENCY and a[5] == b[5] == 0
+    assert c.state.hold_ticks == p.hold_ticks == 2
+    assert c.state.latency_hold_count == p.latency_hold_count == 1
+    a, b = c.step(*mixed), p.step(*mixed)
+    assert c.state.latency_hold_count == p.latency_hold_count == 1
+    assert c.state.hold_ticks == p.hold_ticks == 3
     # A1: bounded HOLD -> de-energised zero at the exact hold-budget boundary.
     c = Core(sat_cfg); p = PythonGatekeeper(sat_cfg, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
     for _ in range(101):
@@ -1263,6 +1412,7 @@ def selftest():
     print('PASS: four mid-run tuning faults; zero HOLD/breaches, finite integrators, six-candidate search')
     print('PASS: A1 bounded HOLD / A2 latch+ack+episode quota / A3 outer_seq lease parity vs C99 core')
     print('PASS: config_bad budget, UINT32_MAX rejection and slew-limited SAFE_ZERO agree with the C core')
+    print('PASS: A5 numerical-domain bounds (lease ageing, underflow, overflow, sub-ULP, mixed HOLD)')
 
 def physics_checks():
     for drive in (0.5, 1.01):

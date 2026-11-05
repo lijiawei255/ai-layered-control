@@ -244,7 +244,7 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-C regression reports 211 passes and zero failures with exit code zero, and the MCU template prints PASS.
+C regression reports 233 passes and zero failures with exit code zero, and the MCU template prints PASS.
 Replay compares gate, regime, fault bits and corruption flags exactly.
 Python/C command agreement is bit-exact (max|du| = 0 over 6,000 frames); MATLAB/C agreement is
 max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays,
