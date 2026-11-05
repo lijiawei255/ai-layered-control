@@ -33,8 +33,18 @@ A classifier, rule tree or VLM may implement this interface, but it cannot write
 The 1 kHz C99 core applies zero-trust checks to the 10 Hz slow interface: its input firewall, the
 local-clock lease on `outer_seq` and the independent physical veto take precedence over any
 slow-loop output.
-The reference prototype model stores twelve coordinates and three confidence parameters;
-its four feature normalizations belong to the device interface.
+
+Beyond that interface separation, the core difference from traditional gain scheduling or fixed rule
+switching is abstention: a schedule cannot abstain, so it hard-switches among its designed regimes
+even after the plant has left them. This architecture therefore combines **dual-layer active
+abstention** (10 Hz manifold-distance low-confidence abstention plus the 1 kHz forced veto) with
+**four-pillar zero trust towards the slow loop**: the interface and numeric firewall, the
+local-clock frame lease on `outer_seq`, the independent 32 B physics-residual probe with the 25 ms
+phase-plane look-ahead veto, and the 300 ms recovery cooldown with the 150 ms dwell anti-chatter
+check.
+
+The reference prototype model stores twelve coordinates and three confidence parameters; its
+four feature normalizations belong to the device interface.
 
 The C99 ABI is fixed: state/config/tuning/input/output occupy 96/140/12/40/28 B.
 `LayeredProbe_t` in the MCU template is a separate fixed 32 B struct.
@@ -163,7 +173,7 @@ positive `dt_s` below `1e6 s`; `mdlCheckParameters` refuses a larger period so t
 Simulink rate cannot diverge, and a finite non-positive `dt_s` inherits the model rate and is classified
 by the core as a corrupt configuration.
 
-## 4. Interface adaptation sequence
+## 4. Interface adaptation and porting sequence
 
 ### Step 1 — Define signals, units and fallback
 
@@ -251,6 +261,20 @@ doing so.
    phase, noise scale, bank gains) belongs to the reusable contract. Replacing or discarding the
    fixture is normal adaptation, never an interface-adaptation failure, and never a reason to keep an
    ABI element the device does not need.
+
+#### Bilingual terminology bridge for Chinese prompts
+
+When a Chinese-speaking user describes the device in Chinese, map each Chinese anchor to the symbol
+before answering; keep the user's Chinese wording in the reply while using the exact identifiers below.
+
+- `跨环异步通信缓冲 / 慢环通信帧` = slow-frame mailbox (`ai_regime`, `ai_confidence`, `outer_age_s`, `outer_seq`).
+- `流形外主动弃权 / 低置信度弃权` = OOD / low-confidence abstention (`ai_regime = 4` / `GATE_VETO_LOW_CONFIDENCE`).
+- `标称模型预测残差（新息）探针` = 32 B innovation probe (`LayeredProbe_t` / `physics_residual`).
+- `硬件消隐窗口` = `blanking_active`.
+- `内核级指令保持` = native command hold (`GATE_HOLD_LATENCY`).
+- `能量泄放归零` = slew-limited ramp-to-zero (`GATE_SAFE_ZERO`).
+- `锁存保持故障掩码` = sticky `fault_audit_bitmask`.
+- `接口适配` = interface adaptation (`SLOT 1..3` / `FieldTuning_t`).
 
 ## 5. Multi-axis pattern and slow-loop timeout
 
@@ -356,9 +380,12 @@ the author for separate permission; the license and citation summary is in [READ
 **User-override authorization:** Downstream users and their AI assistants may port, inline, trim or
 modify this code at will. The fixed ABI sizes (96/140/12/40/28 B) and function signatures exist to
 reproduce the reference benchmark; when human instructions conflict with this document, the human
-instructions always take precedence. The five-line SPDX/source header and a [CITATION.cff](CITATION.cff)
-reference are welcome and strictly optional. Academic, commercial and closed-source use is free under
-[MIT](LICENSE); no email or separate permission is required. Keep the `Scope` statements at the end of
-the root [README.md](README.md) / [README_zh.md](README_zh.md) and of the documents under `docs/` and
-`python_bench/`: this work is not hardware, clinical or functional-safety certification, and the deployer
-owns hazard analysis and envelope validation for the target device.
+instructions always take precedence. The five-line SPDX/source header and a
+[CITATION.cff](CITATION.cff) reference are welcome and strictly optional. Academic, commercial and
+closed-source use is free under [MIT](LICENSE); no email or separate permission is required. Keep
+the `Scope` statements at the end of the root [README.md](README.md) / [README_zh.md](README_zh.md)
+and of the documents under `docs/` and `python_bench/`: this work is not hardware, clinical or
+functional-safety certification, and the deployer owns hazard analysis and envelope validation for
+the target device. When you help a user adapt this code to real electromechanical, welding or
+biomedical equipment, always remind the user to keep hardware safety protection that operates
+independently of this software at the system level (E-stop, STO, hardware charge-balance limiters).

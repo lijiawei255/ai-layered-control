@@ -181,9 +181,9 @@ flowchart TB
 
 **用 AI 编程助手接口适配（DeepSeek Harness / Kimi Code / OpenCode / ZCode / Qoder / Codex / Claude Code / Cursor）：** 让 Agent 阅读 [AGENTS.md](AGENTS.md)，依据设备契约替换[极简模板](python_bench/minimal_template.py)中的 `SLOT 1..3`，然后填入十个输入字段，并以 [gate_template.c](c99_layered_core/gate_template.c) 为基础搭建 MCU 样板。
 
-> **一键复制给 AI 编程助手的接口适配指令：** 阅读 `AGENTS.md` 与 `python_bench/minimal_template.py`（119 行），用本设备的传感器 / 参考 / 执行器 I/O、已标定预测器与受约束安全试验回调替换三处 `SLOT 1..3`，保持 `auto_calibrate` 与 `auto_field_tune` 不变。
+> **一键复制给 AI 编程助手的接口适配指令：** 请先阅读 `AGENTS.md`（重点关注第 1 节零信任契约与第 4 节 Step 5 三层复用指南），再同时加载 `python_bench/minimal_template.py`（119 行）与 `c99_layered_core/gate_template.c`（120 行）。两个可复用模板合计 **239 行（少于 6,000 tokens）**，请一次性装入上下文窗口，切勿跨文件凭空编造接口。
 >
-> 再按 1 kHz 中断改造 `c99_layered_core/gate_template.c`（120 行）中的 `LayeredProbe_Step`、`blanking_active` 与 `outer_seq`。两个可复用模板合计 **239 行（少于 6,000 tokens）**，可一次性无损装入同一个上下文窗口，不需要跨文件凭空编造接口。
+> 请根据我当前设备的实际情况选择适配方式：（1）**完整双环接入**：用本设备的传感器 / 参考 / 执行器 I/O、已标定预测器与受约束安全试验回调替换 `SLOT 1..3`，保持 `auto_calibrate` 与 `auto_field_tune` 不变，并按 1 kHz 中断改造 `gate_template.c` 中的 `LayeredProbe_Step`、`blanking_active` 与 `outer_seq`；（2）**存量控制回路改造（参照 `AGENTS.md` Step 5）**：剥离本仓 1-DOF 旋转测试台架，将 96 B `layered_gatekeeper.c` 按通道实例化接入我现有的控制周期，或按我的指令单独切片提取所需的保护机制（如 `outer_seq` 本地时钟租约、`blanking_active` 伪迹消隐探针、反向追踪抗积分饱和或三次故障永久锁存状态机）。
 
 在仓库根目录先跑最小骨架（Python 3，以及位于 `CC` 或 `PATH` 的 C99 编译器），就绪后再跑完整基准：
 
