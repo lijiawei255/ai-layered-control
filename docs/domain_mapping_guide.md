@@ -40,17 +40,15 @@ No deployed mode decision may use benchmark stage labels or scheduled fault time
 The 1 kHz probe template in [gate_template.c](../c99_layered_core/gate_template.c) runs a three-point
 median followed by a cascaded high-pass innovation envelope and fits in a 32 B `LayeredProbe_t`.
 Its `blanking_active` input freezes every internal filter state and holds the pre-blanking residual
-(`return p->residual`) during a scheduled stimulation pulse or commutation edge instead of returning
-0.0f: a normal periodic pulse cannot raise the residual, a sustained fault spanning periodic
-blanking keeps one OOD latch episode instead of being fragmented into several, and outside the
-blanking window the residual decays along the release envelope; no device-side masking of the
-gating output is required.
+(`return p->residual`) during a scheduled stimulation pulse or commutation edge: a healthy periodic
+pulse cannot raise the residual, a sustained fault spanning periodic blanking keeps one OOD latch
+episode, and the residual decays along the release envelope outside the blanking window; no
+device-side gating masking is needed.
 
 [gate_template.c](../c99_layered_core/gate_template.c) 提供 1 kHz 探针模板：先做三点中值滤波，
 再串联高通预测残差包络，全部状态只占 32 B。`blanking_active` 输入有效时，探针冻结全部内部
-滤波器状态并保持消隐前的残差（`return p->residual`），而不是输出 0.0f：正常周期性脉冲不会
-抬升残差；跨越多个消隐窗口的持续真实异常只计为一次 OOD 锁存事件，不会被切碎成多次；消隐
-窗口之外，残差按释放包络自然衰减。设备侧无需在同一窗口内屏蔽门控输出。
+滤波器状态并保持消隐前的残差（`return p->residual`）：正常周期性脉冲不会抬升残差；跨越多个
+消隐窗口的持续异常只计一次 OOD 锁存事件；消隐窗口之外，残差按释放包络自然衰减。设备侧无需屏蔽门控输出。
 
 ## Gate decisions and audit bits / 门控决策与审计位
 

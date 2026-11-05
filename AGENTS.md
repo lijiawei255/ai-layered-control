@@ -50,7 +50,7 @@ The C99 ABI is fixed: state/config/tuning/input/output occupy 96/140/12/40/28 B.
 `LayeredProbe_t` in the MCU template is a separate fixed 32 B struct.
 In this reference benchmark, preserve field order, types, function signatures and the sole dependency
 on `<stdint.h>`.
-There is no heap, no OS call, no mutable global state and no libm dependency.
+There is no heap, no OS call, no mutable global state and no libm dependency (on Linux toolchains that default to stack protection, add `-fno-stack-protector` for bare-metal `nm -u` checks).
 Compile without `-ffast-math`: IEEE NaN comparisons are part of the input firewall.
 
 ```c

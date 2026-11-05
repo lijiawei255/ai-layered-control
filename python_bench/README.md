@@ -95,10 +95,9 @@ time. On timeout the adapter sends R4 with zero confidence while retaining the r
 slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`. The
 `blanking_active` input of the probe template freezes every internal filter state and holds the
 pre-blanking residual (`return p->residual`) during a scheduled stimulation pulse or commutation
-edge instead of returning 0.0f: a normal periodic pulse cannot raise the residual, and during a
-sustained fault periodic blanking cannot reset the OOD latch and fragment one anomaly into several
-latch episodes that would falsely trip the three-episode permanent latch; outside the blanking
-window the residual decays along the release envelope. Three safety/OOD veto episodes latch
+edge: a healthy periodic pulse cannot raise the residual, a sustained fault spanning periodic
+blanking keeps one OOD latch episode, and the residual decays along the release envelope outside
+the blanking window. Three safety/OOD veto episodes latch
 `GATE_LATCHED_SAFE` permanently until acknowledged; count safety violations from the true/measured
 state, independently of gate activity.
 
@@ -202,9 +201,8 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成能量泄放归零。
 超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环通信帧字段畸形或现场旋钮非法时，
 以 `corrupted=1` 运行闭环 R4。探针模板的 `blanking_active` 输入在计划内刺激脉冲或换向边沿期间
-冻结全部内部滤波器状态并保持消隐前的残差（`return p->residual`），而不是返回 0.0f：正常周期性
-脉冲不会抬升残差；真实异常持续期间，周期性消隐也不会重置 OOD 锁存、把单次异常切碎为多次锁存
-事件而误触发三次故障永久锁存；消隐窗口之外，残差按释放包络自然衰减。安全/OOD 否决累计三次即
+冻结全部内部滤波器状态并保持消隐前的残差（`return p->residual`）：正常周期性脉冲不会抬升残差；
+跨越多个消隐窗口的持续异常只计一次 OOD 锁存事件；消隐窗口之外，残差按释放包络自然衰减。安全/OOD 否决累计三次即
 永久锁存 `GATE_LATCHED_SAFE`，直到确认解除；安全违规的统计以真实/实测状态为准，与门控动作无关。
 
 ## 基准验证摘要

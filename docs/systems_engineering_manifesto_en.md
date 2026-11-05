@@ -122,10 +122,9 @@ forged or frozen; without local evidence the loop cannot tell a quiet plant from
 **Mechanism:** A 32-byte probe runs at 1 kHz: a three-point median rejects single-tick glitches, a
 cascaded high-pass extracts broadband innovation, and attack/release envelopes normalize it into a
 dimensionless residual. During a scheduled artifact, `blanking_active` freezes every internal filter
-state and holds the pre-blanking residual (`return p->residual`) instead of returning 0.0f: a normal
-periodic pulse cannot raise the residual, periodic blanking cannot fragment one sustained fault into
-several latch episodes and falsely trip the three-episode permanent latch, and outside the blanking
-window the residual decays along the release envelope. The
+state and holds the pre-blanking residual (`return p->residual`): a healthy periodic pulse cannot
+raise the residual, a sustained fault spanning periodic blanking keeps one OOD latch episode, and the
+residual decays along the release envelope outside the blanking window. The
 96-byte core adds three further layers: a 25 ms state safety envelope with phase-plane look-ahead,
 an independent residual veto, and a local clock lease on `outer_seq` so a frozen transported age
 cannot mask a stalled mailbox. Native HOLD is bounded: past `max_hold_ticks` (100 ticks in the
