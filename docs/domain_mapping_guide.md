@@ -55,7 +55,7 @@ window; the device masks the gate for the same window and the probe resumes afte
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation out of distribution; abstain to R4 |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold or explicit regime 4; abstain to R4 |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | State envelope or look-ahead exceeded; R4 |
-| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero at `u_slew_max_per_s` |
+| 5 | `GATE_SAFE_ZERO` | Native HOLD past `max_hold_ticks = 100`: integrators cleared, command ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor toward zero applies only when the legal slew budget is below one representable step, only reduces \|u\| and never re-energises |
 | 6 | `GATE_LATCHED_SAFE` | Cumulative severe faults (`max_fault_vetoes_before_latch = 3`): permanently in R4 until acknowledged |
 
 | Bit | Fault |
@@ -153,15 +153,15 @@ R4 固定增益、零状态参考和零前馈，不受现场增益旋钮缩放�
 
 ## Verification / 验证
 
-C99 standalone regression passes 235 checks with zero failures; `gate_template.c` prints PASS.
+C99 standalone regression passes 239 checks with zero failures; `gate_template.c` prints PASS.
 Python/C `--selftest` replays 6,000 frames with max |du| = 0 in binary32, MATLAB/C equivalence
 keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 10,000-tick
-`outer_seq` lease replay stays within max |du| = 4.5e-8, and the Level-2
+`outer_seq` lease replay stays within max |du| = 4.19e-8, and the Level-2
 S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
 
-C99 独立回归 235 项全部通过、0 失败；`gate_template.c` 自检输出 PASS。
+C99 独立回归 239 项全部通过、0 失败；`gate_template.c` 自检输出 PASS。
 Python/C `--selftest` 回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、损坏邮箱帧
-与非法旋钮注入下均保持 max |du| = 5e-9；10,000 tick 的 `outer_seq` 租约回放 max |du| = 4.5e-8；Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
+与非法旋钮注入下均保持 max |du| = 5e-9；10,000 tick 的 `outer_seq` 租约回放 max |du| = 4.19e-8；Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).

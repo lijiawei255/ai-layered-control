@@ -44,7 +44,7 @@
 
 **传统与纯 AI 的失效。** 更慢的监督扫描只会把盲区拉得更长。B2 的 1 kHz 连续动作头每毫秒读取快环状态，但其上下文特征 z 仍受 100 ms 慢环周期与传输时延约束。传输帧龄还可能被伪造或冻结；没有本地证据，回路分不清“设备安静”与“邮箱沉默”。
 
-**机制。** 32 B 探针以 1 kHz 运行：三点中值滤掉单 tick 毛刺，级联高通提取宽频新息，攻击／释放包络把它变成无量纲残差。遇到计划内伪迹时，`blanking_active` 冻结探针全部状态并返回 0.0f，已经抬高的残差无法借消隐窗口维持否决。96 B 内核再叠加 25 ms 状态安全包络与相平面前瞻、独立残差否决，以及 `outer_seq` 本地时钟租约，冻结的传输帧龄无法掩盖停滞的邮箱。原生 HOLD 有界：超过 `max_hold_ticks`（参考配置 100 tick）后进入 GATE_SAFE_ZERO，清空积分器，并按 `u_slew_max_per_s` 斜率平滑归零。
+**机制。** 32 B 探针以 1 kHz 运行：三点中值滤掉单 tick 毛刺，级联高通提取宽频新息，攻击／释放包络把它变成无量纲残差。遇到计划内伪迹时，`blanking_active` 冻结探针全部状态并返回 0.0f，已经抬高的残差无法借消隐窗口维持否决。96 B 内核再叠加 25 ms 状态安全包络与相平面前瞻、独立残差否决，以及 `outer_seq` 本地时钟租约，冻结的传输帧龄无法掩盖停滞的邮箱。原生 HOLD 有界：超过 `max_hold_ticks`（参考配置 100 tick）后进入 GATE_SAFE_ZERO，清空积分器，并以 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的每拍步长把指令降到零。正常路径严格满足 `|u(k)-u(k-1)| <= u_slew_max_per_s * dt_s`；唯一书面例外是这条向零「单 ULP 保底」：仅当合法斜率预算小于一个可表示步长时启用，只减小幅度，绝不重新上电。
 
 ### 6. 裸机资源死限与事故追责
 
@@ -52,13 +52,13 @@
 
 **传统与纯 AI 的失效。** Python 或推理运行时带来分配、调度抖动与不可追溯状态；没有持久证据的否决回答不了事后问题。
 
-**机制。** 内核为 ANSI C99、零动态内存、静态定长状态，对象 text 在 `-Os` 下 6,208 B、`-O2` 下 7,252 B（GCC 4.9.2 TDM64，x86-64）。ABI 为 state/config/tuning/input/output 96/140/12/40/28 B，另加 32 B 探针。7 位 `fault_audit_bitmask` 记录延迟、残差流形外、低把握度、包络越界、NaN 损坏、HOLD 超时与永久锁存。累计 3 次安全／残差否决 episode 后永久锁死 GATE_LATCHED_SAFE；唯有人工调用 `Layered_AcknowledgeFaultLatch()` 才能解除锁存，在冷却期后恢复 episode 容限，并保留终身计数。
+**机制。** 内核为 ANSI C99、零动态内存、静态定长状态，对象 text 在 `-Os` 下 6,452 B、`-O2` 下 7,608 B（GCC 4.9.2 TDM64，x86-64）。ABI 为 state/config/tuning/input/output 96/140/12/40/28 B，另加 32 B 探针。7 位 `fault_audit_bitmask` 记录延迟、残差流形外、低把握度、包络越界、NaN 损坏、HOLD 超时与永久锁存。累计 3 次安全／残差否决 episode 后永久锁死 GATE_LATCHED_SAFE；唯有人工调用 `Layered_AcknowledgeFaultLatch()` 才能解除锁存，在冷却期后恢复 episode 容限，并保留终身计数。
 
 ## 带宽与权限是两个独立选择
 
 推理频率说明何时生成指令，指令是否可执行由另一组条件决定。完整架构必须规定状态估计、物理残差、执行器限制和恢复条件如何否决指令。
 
-门控采用固定优先级：状态包络、残差、把握度，最后是原生延迟 HOLD。可观测状态是显式的——GATE_NORMAL、GATE_HOLD_LATENCY、GATE_VETO_OOD_RESIDUAL、GATE_VETO_LOW_CONFIDENCE、GATE_VETO_SAFETY_ENVELOPE、GATE_SAFE_ZERO 与 GATE_LATCHED_SAFE。帧龄始终可观测。驻留与恢复冷却约束重新启用时机，反向追踪抗积分饱和使每个非活动控制器都与实际指令保持一致，每 tick 的幅值与斜率限制属于执行器契约。
+门控采用固定优先级：状态包络、残差、把握度，最后是原生延迟 HOLD。可观测状态是显式的——GATE_NORMAL、GATE_HOLD_LATENCY、GATE_VETO_OOD_RESIDUAL、GATE_VETO_LOW_CONFIDENCE、GATE_VETO_SAFETY_ENVELOPE、GATE_SAFE_ZERO 与 GATE_LATCHED_SAFE。帧龄始终可观测。驻留与恢复冷却约束重新启用时机，反向追踪抗积分饱和使每个非活动控制器都与实际指令保持一致，每 tick 的幅值与斜率限制属于执行器契约，正常路径严格满足 `|u(k)-u(k-1)| <= u_slew_max_per_s * dt_s`；GATE_SAFE_ZERO 的向零单 ULP 保底是唯一书面例外。
 
 安全回退是一种明确的控制模态，其参考目标、阻尼与前馈权限必须按设备定义。原生 HOLD 保持的是上一条执行器指令，不是机械位置或生理状态，物理后果由设备适配层定义。内核 R4 以固定增益、零前馈朝已标定的安全零点调节；慢环决策损坏时，有效快速测量继续运行这条闭环控制律。
 
@@ -74,7 +74,7 @@
 
 对照始终让基线保持满强度。B1 与 B3 共享完全相同的标称逆动力学前馈、抗积分饱和与限幅，B1 的 S2 结果仍是表中最低的原始误差。B2 动作头以 1 kHz 全速运行（40,000 次推理，快环状态零延迟），S3 接触力为全场最低的 12.52 N；但它没有显式积分器与物理门控，S2 误差偏大，S4 越界 589 tick。物理规则树与原型分类器在主表 S1/S2 结果和 19.47 N 的 S3 接触峰值上一致；它们的 S3 R3 占比相差 150 个 tick（93.49% 对 94.99%），表现为 S3/S4 RMSE 第三位小数的差异（0.075100 / 0.540437 对 0.069478 / 0.539985）。分层支路在 S4 记录 RMSE 0.539985 rad、TV 1545.01 N·m，而 B1 保持更低的 S2 原始误差、B2 保持 S3 接触力优势；这些观测共同定义了基准的解读方式。
 
-跨语言回放闭合验证链。C99 独立回归 235 项全部通过、0 失败，120 行的 `gate_template.c` 独立自检输出 PASS。Python/C `--selftest` 回放 6,000 帧（R1 = 901、R2 = 900、R3 = 304、R4 = 3,895，含 ack 重武装随机对拍与 7→5→3→1→0 斜率归零），离散输出完全一致，连续指令差 max |du| = 0，binary32 逐比特精确相等。MATLAB/C `verify_core_equivalence` 覆盖 40,000 正常帧、40,000 损坏邮箱帧，以及 4 组各 40,000 帧的运行中非法旋钮注入，max |du| = 5e-9。另有 10,000 tick 的 `outer_seq` 租约回放，覆盖原生 HOLD → `SAFE_ZERO`、序号跌回 0 的损坏路径与冷却恢复，max |du| = 4.5e-8。Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
+跨语言回放闭合验证链。C99 独立回归 239 项全部通过、0 失败，120 行的 `gate_template.c` 独立自检输出 PASS。Python/C `--selftest` 回放 6,000 帧（R1 = 901、R2 = 900、R3 = 304、R4 = 3,895，含 ack 重武装随机对拍与 7→5→3→1→0 斜率归零），离散输出完全一致，连续指令差 max |du| = 0，binary32 逐比特精确相等。MATLAB/C `verify_core_equivalence` 覆盖 40,000 正常帧、40,000 损坏邮箱帧，以及 4 组各 40,000 帧的运行中非法旋钮注入，max |du| = 5e-9。另有 10,000 tick 的 `outer_seq` 租约回放，覆盖原生 HOLD → `SAFE_ZERO`、序号跌回 0 的损坏路径与冷却恢复，max |du| = 4.19e-8。Level-2 S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
 
 ## 面向受约束设备的通用接口
 

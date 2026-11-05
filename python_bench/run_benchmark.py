@@ -136,6 +136,27 @@ class PythonGatekeeper:
         return float(np.uint32(bits).view(np.float32))
 
     @staticmethod
+    def _next_toward(frm, to):
+        """Mirror of lg_next_toward(): one binary32 step from frm toward to."""
+        if frm == to:
+            return to
+        bits = int(np.float32(frm).view(np.uint32))
+        if frm < to:
+            if bits == 0x80000000:
+                bits = 0x00000001
+            elif bits & 0x80000000:
+                bits -= 1
+            else:
+                bits += 1
+        elif bits == 0x00000000:
+            bits = 0x80000001
+        elif bits & 0x80000000:
+            bits += 1
+        else:
+            bits -= 1
+        return float(np.uint32(bits).view(np.float32))
+
+    @staticmethod
     def _ramp_toward_zero(u_applied, du_max):
         """Mirror of lg_ramp_toward_zero(): slew-limited walk to exactly 0.0.
 
@@ -467,7 +488,17 @@ class PythonGatekeeper:
                 # non-finite target: clamp it by sign into the actuator range.
                 self.u_target = self._guard(self.u_target, u_max)
             u_cmd = self._clampf(self.u_target, -u_max, u_max)
-            u_cmd = self._clampf(u_cmd, _f32(self.u_applied - du_max), _f32(self.u_applied + du_max))
+            # The two slew bounds are binary32; nearest-even rounding of
+            # u_applied +/- du_max can land outside the exact budget, so a
+            # violating bound is pulled one representable value back toward
+            # u_applied (mirror of the C core's inward rounding).
+            u_hi = _f32(self.u_applied + du_max)
+            u_lo = _f32(self.u_applied - du_max)
+            if u_hi - self.u_applied > du_max:
+                u_hi = self._next_toward(u_hi, self.u_applied)
+            if self.u_applied - u_lo > du_max:
+                u_lo = self._next_toward(u_lo, self.u_applied)
+            u_cmd = self._clampf(u_cmd, u_lo, u_hi)
             self.integ[0] = self._integrate(self.integ[0], _f32(ki[0] * gain_scale), e, dt_eff,
                                             u_pid0, u_cmd, windup_tau, integ_limit)
             self.integ[1] = self._integrate(self.integ[1], _f32(ki[1] * gain_scale), e, dt_eff,
@@ -1101,6 +1132,8 @@ def selftest():
     p = PythonGatekeeper(cfg, dict(gain_scale=1.0, damping_scale=1.0, safety_margin_scale=1.0))
     r = lcg(2026, 6000 * 6).reshape(6000, 6)
     maxerr, latched, seen = 0.0, 0, np.zeros(5, int)
+    slew_limit = float(np.float32(cfg['u_slew_max_per_s'] * cfg['dt_s']))
+    prev_u = 0.0
     for k, z in enumerate(r):
         if k % 1000 < 350:
             # Random inputs plus NaN injection keep every gate, bank and latch busy.
@@ -1130,6 +1163,12 @@ def selftest():
             latched = 0
         seen[a[2]] += 1
         assert a[1:3] == b[1:3] and a[4:6] == b[4:6], (k, a, b)
+        # The normal-path slew contract is strict: |u(k)-u(k-1)| must not
+        # exceed the binary32 budget even by half an ULP.  GATE_SAFE_ZERO is the
+        # only documented exception (its single-ULP floor is checked separately).
+        if a[1] != GATE_SAFE_ZERO:
+            assert abs(a[0] - prev_u) <= slew_limit, (k, a[0], prev_u, slew_limit)
+        prev_u = a[0]
         maxerr = max(maxerr, abs(a[0] - b[0]))
     assert maxerr == 0.0, maxerr
     assert all(seen[1:5] >= 300), seen
@@ -1415,6 +1454,30 @@ def selftest():
     assert c_stale[99:105] == p_stale[99:105] == ramp_expected, (c_stale[99:105], p_stale[99:105])
     assert c_stale == p_stale
     print('PASS: 1 kHz SAFE_ZERO ramp 7->5->3->1->0 exact on both trigger paths and both backends')
+    # Normal-path slew-bound regression: the two bounds are rounded inward.  With
+    # a binary32 budget of 7.0e-8 between 0.5 ULP and 1 ULP of 1.0f, the rounded
+    # upper bound 1.0000001192f would allow a 1.1920929e-7 step; the limiter must
+    # hold 1.0f and report a zero step, and the Python mirror must agree.
+    fine_cfg = dict(cfg, u_slew_max_per_s=7e-5, blend_alpha=1.0,
+                    kp=[1.0, 0.0, 0.0, 0.0], kd=[0.0] * 4, ki=[0.0] * 4,
+                    ff_scale=[0.0] * 4)
+    fine_tuning = dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.)
+    fine_du = float(np.float32(fine_cfg['u_slew_max_per_s'] * fine_cfg['dt_s']))
+    assert float(np.float32(1.0 + fine_du)) - 1.0 > fine_du
+    c = Core(fine_cfg); p = PythonGatekeeper(fine_cfg, fine_tuning)
+    up_frame = (1., 1., 0., 0., 0., 0., 2., 0., 0., 0)
+    for _ in range(20):
+        a, b = c.step(*up_frame), p.step(*up_frame)
+    c.state.u_applied = p.u_applied = 1.0
+    a, b = c.step(*up_frame), p.step(*up_frame)
+    assert a == b and a[1] == b[1] == GATE_NORMAL and a[0] == b[0] == 1.0, (a, b)
+    assert abs(a[0] - 1.0) <= fine_du
+    down_frame = (1., 1., 0., 0., 0., 0., -2., 0., 0., 0)
+    c.state.u_applied = p.u_applied = -1.0
+    c.state.u_target = p.u_target = -2.0
+    a, b = c.step(*down_frame), p.step(*down_frame)
+    assert a == b and a[1] == b[1] == GATE_NORMAL and a[0] == b[0] == -1.0, (a, b)
+    print('PASS: normal-path slew bound rounded inward at the 1.0f / 7.0e-8 boundary')
     trials = []
     def evaluate(knobs):
         trials.append(knobs)

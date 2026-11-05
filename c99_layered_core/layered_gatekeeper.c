@@ -141,6 +141,40 @@ static float lg_next_toward_zero(float v)
     return bits.f;
 }
 
+/* One IEEE-754 binary32 step from `from` toward `to`, taken on the stored
+ * encoding so the subnormal range is walked exactly as well.  The normal slew
+ * limiter needs it: nearest-even rounding of u_prev +/- du_max can land outside
+ * the exact budget, and the offending bound is then pulled one representable
+ * value back toward u_prev. */
+static float lg_next_toward(float from, float to)
+{
+    union {
+        float f;
+        uint32_t u;
+    } bits;
+
+    if (from == to) {
+        return to;
+    }
+    bits.f = from;
+    if (from < to) {
+        if (bits.u == 0x80000000u) {
+            bits.u = 0x00000001u; /* -0.0f -> smallest positive subnormal */
+        } else if ((bits.u & 0x80000000u) != 0u) {
+            bits.u -= 1u; /* less negative */
+        } else {
+            bits.u += 1u; /* more positive */
+        }
+    } else if (bits.u == 0x00000000u) {
+        bits.u = 0x80000001u; /* +0.0f -> smallest negative subnormal */
+    } else if ((bits.u & 0x80000000u) != 0u) {
+        bits.u += 1u; /* more negative */
+    } else {
+        bits.u -= 1u; /* less positive */
+    }
+    return bits.f;
+}
+
 /* Slew-limited walk of the applied command to zero.  The effective per-tick
  * step is max(u_slew_max_per_s * dt, 1 binary32 ULP(|u_applied|)): a legal slew
  * budget below one ULP of the remaining command would round back to the same
@@ -475,6 +509,8 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
     float u_pid3;
     float u_active;
     float u_cmd;
+    float u_lo;
+    float u_hi;
     float outer_age_eff;
     int snap;
     int conf_before;
@@ -902,9 +938,24 @@ LayeredOutput_t Layered_Step(LayeredState_t *state,
             state->u_target = lg_guard_value(state->u_target, u_max);
         }
 
-        /* Hard actuator limits: magnitude first, then slew rate. */
+        /* Hard actuator limits: magnitude first, then slew rate.  The two slew
+         * bounds are rounded to binary32; nearest-even rounding of
+         * u_applied +/- du_max can land outside the exact budget (1.0f +
+         * 7.0e-8f rounds up to 1.0000001192f, a full 1.19e-7 step for a 7.0e-8
+         * budget).  A bound that exceeds the budget in double arithmetic is
+         * pulled one representable value back toward u_applied, so every normal
+         * tick honours |u(k) - u(k-1)| <= u_slew_max_per_s * dt_s exactly.
+         * GATE_SAFE_ZERO keeps its separate documented single-ULP floor. */
         u_cmd = lg_clampf(state->u_target, -u_max, u_max);
-        u_cmd = lg_clampf(u_cmd, state->u_applied - du_max, state->u_applied + du_max);
+        u_hi = state->u_applied + du_max;
+        u_lo = state->u_applied - du_max;
+        if ((double)u_hi - (double)state->u_applied > (double)du_max) {
+            u_hi = lg_next_toward(u_hi, state->u_applied);
+        }
+        if ((double)state->u_applied - (double)u_lo > (double)du_max) {
+            u_lo = lg_next_toward(u_lo, state->u_applied);
+        }
+        u_cmd = lg_clampf(u_cmd, u_lo, u_hi);
 
         /* Tracking anti-windup for every controller of the bank. */
         lg_integrate(&state->integ[0],

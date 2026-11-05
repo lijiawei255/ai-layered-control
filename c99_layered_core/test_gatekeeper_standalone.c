@@ -31,7 +31,8 @@
  *   phase A   bounded HOLD -> slew-limited GATE_SAFE_ZERO incl. corrupt-config
  *             de-energise (A1), cumulative latch + explicit acknowledgement and
  *             post-ack episode-quota re-arm (A2), local outer_seq frame lease
- *             (A3), emergency R4 blend bypass (A4)
+ *             (A3), emergency R4 blend bypass (A4), normal-path slew bound
+ *             rounded inward at the 1.0f / 7.0e-8 boundary (A6)
  * ---------------------------------------------------------------------------
  */
 
@@ -80,6 +81,29 @@ static float t_absf(float v)
 static int t_is_finite(float v)
 {
     return (v == v) && ((v - v) == 0.0f);
+}
+
+/* One binary32 step from v toward zero, matching the core's
+ * lg_next_toward_zero(): GATE_SAFE_ZERO uses exactly this step as its
+ * quantisation floor when the legal slew budget is below one ULP. */
+static float t_step_toward_zero(float v)
+{
+    union {
+        uint32_t u;
+        float f;
+    } bits;
+    uint32_t magnitude;
+
+    if (v == 0.0f || v != v) {
+        return 0.0f;
+    }
+    bits.f = v;
+    magnitude = bits.u & 0x7FFFFFFFu;
+    if (magnitude <= 1u) {
+        return 0.0f;
+    }
+    bits.u = (bits.u & 0x80000000u) | (magnitude - 1u);
+    return bits.f;
 }
 
 /* Fully initialised frames: the legacy scenarios fill the nine physical
@@ -260,7 +284,14 @@ static void inv_reset(inv_t *inv)
 }
 
 /* Every single step of every scenario goes through here, so the hard actuator
- * contract is verified on all 40 000+ ticks of the test, not on a sample. */
+ * contract is verified on all 40 000+ ticks of the test, not on a sample.
+ *
+ * The slew bound is the published strict inequality
+ * |u(k) - u(k-1)| <= u_slew_max_per_s * dt_s on every normal tick.  It is
+ * compared in double arithmetic: a binary32 subtraction would round the
+ * difference itself and could hide a sub-ULP overshoot.  GATE_SAFE_ZERO keeps
+ * its separate documented exception, a per-tick step of
+ * max(du_max, 1 binary32 ULP(|u_prev|)) that only ever reduces |u|. */
 static LayeredOutput_t step_checked(inv_t *inv,
                                     LayeredState_t *st,
                                     const LayeredConfig_t *cfg,
@@ -272,6 +303,8 @@ static LayeredOutput_t step_checked(inv_t *inv,
     float du_max = cfg->u_slew_max_per_s * cfg->dt_s;
     float abs_u;
     float abs_du;
+    double exact_du;
+    double budget;
     int bad = 0;
 
     out = Layered_Step(st, cfg, tun, in);
@@ -293,7 +326,25 @@ static LayeredOutput_t step_checked(inv_t *inv,
     if (abs_du > inv->worst_abs_du) {
         inv->worst_abs_du = abs_du;
     }
-    if (!(abs_du <= du_max + 1e-6f)) {
+    exact_du = (double)out.u - (double)prev_u;
+    if (exact_du < 0.0) {
+        exact_du = -exact_du;
+    }
+    if (out.gate == GATE_SAFE_ZERO) {
+        budget = (double)du_max;
+        if (t_step_toward_zero(prev_u) != prev_u) {
+            double floor_step = (double)t_step_toward_zero(prev_u) - (double)prev_u;
+            if (floor_step < 0.0) {
+                floor_step = -floor_step;
+            }
+            if (floor_step > budget) {
+                budget = floor_step;
+            }
+        }
+        if (!(exact_du <= budget) || !(t_absf(out.u) <= t_absf(prev_u))) {
+            bad = 1;
+        }
+    } else if (!(exact_du <= (double)du_max)) {
         bad = 1;
     }
 
@@ -2997,6 +3048,112 @@ static void test_emergency_r4_bypass(void)
           (double)out.blend);
 }
 
+/* ========================================================================= */
+/* Phase A6: normal-path slew bound rounded inward                           */
+/* ========================================================================= */
+
+/* Slew-bound counterexample: with dt = 0.001 s and u_slew_max_per_s = 0.00007 /s
+ * the binary32 per-tick budget is 7.0e-8, between 0.5 ULP and 1 ULP of 1.0f.
+ * Nearest-even rounding puts 1.0f + 7.0e-8f at 1.0000001192f, a 1.1920929e-7
+ * step, so a limiter that clamps to the rounded bound can publish almost twice
+ * the legal budget on an ordinary GATE_NORMAL tick.  The ramp below is driven
+ * from Layered_Init; every tick passes through
+ * step_checked(), so the strict double-arithmetic bound is verified on the
+ * 16.5 million ticks that reach the boundary and on the ticks after it, where
+ * the inward-rounded bound must hold the command instead of overshooting. */
+static void test_normal_slew_rounding(void)
+{
+    LayeredConfig_t cfg;
+    LayeredState_t st;
+    FieldTuning_t tun;
+    LayeredInput_t in;
+    inv_t inv;
+    LayeredOutput_t out;
+    float prev_u;
+    double du_max;
+    long k;
+    int reached = 0;
+    int held = 0;
+    int i;
+
+    build_config(&cfg);
+    cfg.u_slew_max_per_s = 0.00007f; /* 7.0e-8 per 1 ms tick */
+    cfg.u_max = 2.0f;
+    cfg.blend_alpha = 1.0f;
+    cfg.kp[0] = 1.0f;
+    for (i = 1; i < LAYERED_NUM_REGIMES; ++i) {
+        cfg.kp[i] = 0.0f;
+    }
+    for (i = 0; i < LAYERED_NUM_REGIMES; ++i) {
+        cfg.kd[i] = 0.0f;
+        cfg.ki[i] = 0.0f;
+        cfg.ff_scale[i] = 0.0f;
+    }
+    build_tuning(&tun, 1.0f, 1.0f, 1.0f);
+
+    in = zero_input();
+    in.ai_regime = 1.0f;
+    in.ai_confidence = 1.0f;
+    in.outer_age_s = 0.0f;
+    in.r = 2.0f;
+
+    du_max = (double)(cfg.u_slew_max_per_s * cfg.dt_s);
+    Layered_Init(&st, &cfg, &tun);
+    inv_reset(&inv);
+
+    /* Drive the command from rest until it first sits exactly at 1.0f, then
+     * keep stepping: the next representable value above 1.0f is outside the
+     * 7.0e-8 budget, so the strict bound holds the command at 1.0f. */
+    out = zero_output();
+    for (k = 0; k < 20000000L; ++k) {
+        out = step_checked(&inv, &st, &cfg, &tun, &in);
+        if (st.u_applied == 1.0f) {
+            if (reached != 0) {
+                if (++held >= 100) {
+                    break;
+                }
+            } else {
+                reached = 1;
+            }
+        } else if (reached != 0) {
+            break;
+        }
+    }
+
+    check(reached != 0 && st.u_applied == 1.0f && out.gate == GATE_NORMAL,
+          "A6 slew rounding: the 7.0e-8 ramp reaches u=1.0f on a normal tick (u=%.9f after %ld ticks)",
+          (double)st.u_applied, k);
+    check(inv.violations == 0 && inv.nan_count == 0,
+          "A6 slew rounding: every tick honours |du| <= du_max strictly (worst |du|=%.9g, budget=%.9g)",
+          (double)inv.worst_abs_du, du_max);
+
+    /* Direct frame of the counterexample: previous command 1.0f, target
+     * above it.  The rounded upper bound is 1.0000001192f, so the earlier
+     * limiter published |du| = 1.19e-7 against a 7.0e-8 budget; the
+     * inward-rounded bound must instead hold 1.0f. */
+    Layered_Init(&st, &cfg, &tun);
+    for (k = 0; k < 20; ++k) {
+        out = Layered_Step(&st, &cfg, &tun, &in);
+    }
+    st.u_applied = 1.0f;
+    prev_u = 1.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && out.u == prev_u,
+          "A6 slew rounding: u_prev=1.0f holds at 1.0f instead of stepping to 1.0000001192f (u=%.9f)",
+          (double)out.u);
+
+    /* Negative mirror: -1.0f - 7.0e-8f rounds to -1.0000001192f, also outside
+     * the budget, so the lower bound is pulled back to -1.0f as well. */
+    st.u_applied = -1.0f;
+    st.u_target = -2.0f;
+    in.r = -2.0f;
+    prev_u = -1.0f;
+    out = Layered_Step(&st, &cfg, &tun, &in);
+    check(out.gate == GATE_NORMAL && out.u == prev_u,
+          "A6 slew rounding: u_prev=-1.0f holds at -1.0f instead of stepping to -1.0000001192f (u=%.9f)",
+          (double)out.u);
+}
+
 int main(void)
 {
     LayeredConfig_t cfg;
@@ -3054,6 +3211,9 @@ int main(void)
     test_antiwindup_underflow();
     test_extreme_numeric_domain();
     test_mixed_hold_episode();
+
+    printf("\n-- phase A6: normal-path slew bound rounded inward --\n");
+    test_normal_slew_rounding();
 
     printf("\nSUMMARY: n_pass=%d, n_fail=%d\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

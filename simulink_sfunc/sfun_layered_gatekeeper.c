@@ -80,9 +80,12 @@
  *     [60 110 8 2],[1.2 1.5 0.8 0.35],[60 300 2 0],[1 1 1 0],[100 3],[1 1 1]
  *
  *   The block sample time is taken from cfg_float(1) (dt_s) so the core's
- *   period and the Simulink step cannot drift apart.  If dt_s is not finite
- *   and positive the block inherits its sample time and the frozen core
- *   reports the invalid configuration through its own corruption path.
+ *   period and the Simulink step cannot drift apart.  mdlCheckParameters has
+ *   already refused a non-finite element of any floating parameter, so this
+ *   path only sees finite values: a finite but non-positive dt_s (dt_s >= 1e6
+ *   also takes it) inherits the surrounding model rate, and the frozen core
+ *   still classifies a non-positive or non-finite dt_s as a corrupt
+ *   configuration through its own corruption path.
  *
  * NUMERIC CONVERSION AT THE ADAPTER BOUNDARY
  *   The nine fast input signals arrive as double.  A double that cannot be

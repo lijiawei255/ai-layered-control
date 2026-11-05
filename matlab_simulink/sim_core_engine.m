@@ -562,6 +562,21 @@ mixed_hold=good; mixed_hold(3)=c.outer_timeout_s+c.dt_s/2;
 assert(out(3)==1 && out(7)==0 && st.hold_ticks==uint32(2) && ...
     st.latency_hold_count==uint32(1), ...
     'A slow-mailbox timeout after a corrupt frame was not counted.');
+% The normal-path slew bounds are rounded inward.  With a 7.0e-8 binary32
+% budget (between 0.5 ULP and 1 ULP of 1.0f) nearest-even rounding puts
+% 1.0f + 7.0e-8f at 1.0000001192f, outside the exact budget, so the limiter
+% must hold the previous command instead of publishing a 1.19e-7 step.
+q=c; q.min_dwell_ticks=dwell0; q.blend_alpha=single(1);
+q.kp(:)=single(0); q.kp(1)=single(1);
+q.kd(:)=single(0); q.ki(:)=single(0); q.ff_scale(:)=single(0);
+q.u_slew_max_per_s=single(7e-5);
+st=core_init(); for k=1:5, [st,out]=core_step(st,q,t,single([1 1 0 0 0 0 2 0 0])); end
+st.u_applied=single(1);
+[st,out]=core_step(st,q,t,single([1 1 0 0 0 0 2 0 0]));
+assert(out(1)==single(1) && out(3)==0,'The rounded upper slew bound overshot 1.0f.');
+st.u_applied=single(-1); st.u_target=single(-2);
+[st,out]=core_step(st,q,t,single([1 1 0 0 0 0 -2 0 0]));
+assert(out(1)==single(-1) && out(3)==0,'The rounded lower slew bound overshot -1.0f.');
 passed=true;
 end
 
@@ -836,7 +851,14 @@ if do_control
         st.u_target=guard_value(st.u_target,u_max);
     end
     command=clamp(st.u_target,-u_max,u_max);
-    command=clamp(command,st.u_applied-du,st.u_applied+du);
+    % The two slew bounds are binary32; nearest-even rounding of
+    % u_applied +/- du can land outside the exact budget, so a violating bound
+    % is pulled one representable value back toward u_applied.  SAFE_ZERO keeps
+    % its separate documented single-ULP floor.
+    hi=st.u_applied+du; lo=st.u_applied-du;
+    if double(hi)-double(st.u_applied)>double(du), hi=next_toward(hi,st.u_applied); end
+    if double(st.u_applied)-double(lo)>double(du), lo=next_toward(lo,st.u_applied); end
+    command=clamp(command,lo,hi);
     for j=1:4
         if j==4, ki=c.ki(4); err=-in(5);
         else, ki=c.ki(j)*t(1); err=e; end
@@ -887,6 +909,30 @@ bits=typecast(single([v 0]),'uint32'); b=bits(1);
 magnitude=bitand(b,uint32(hex2dec('7FFFFFFF')));
 if magnitude<=uint32(1), v=single(0); return; end
 b=bitor(bitand(b,uint32(hex2dec('80000000'))),magnitude-uint32(1));
+bits=typecast(uint32([b 0]),'single'); v=bits(1);
+end
+
+function v=next_toward(from,to)
+% Mirror of lg_next_toward(): one binary32 step from `from` toward `to`.  The
+% normal slew limiter uses it to pull a bound that nearest-even rounding placed
+% outside the exact per-tick budget back toward the previous command.
+if from==to, v=to; return; end
+bits=typecast(single([from 0]),'uint32'); b=bits(1);
+if from<to
+    if b==uint32(hex2dec('80000000'))
+        b=uint32(1);                      % -0 -> smallest positive subnormal
+    elseif b>=uint32(hex2dec('80000000'))
+        b=b-uint32(1);                    % less negative
+    else
+        b=b+uint32(1);                    % more positive
+    end
+elseif b==uint32(0)
+    b=uint32(hex2dec('80000001'));        % +0 -> smallest negative subnormal
+elseif b>=uint32(hex2dec('80000000'))
+    b=b+uint32(1);                        % more negative
+else
+    b=b-uint32(1);                        % less positive
+end
 bits=typecast(uint32([b 0]),'single'); v=bits(1);
 end
 

@@ -20,14 +20,14 @@ An MIT-licensed reference design, comparison benchmark and AI adaptation templat
 - **[1] [python_bench/minimal_template.py](python_bench/minimal_template.py) — 119 lines.** A 10 Hz qualitative slow loop with small-sample commissioning (`auto_calibrate`: 36 labeled windows, 15 scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, a 20-line pair of helpers) and a `SLOT 1..3` device skeleton.
 - **[2] [c99_layered_core/gate_template.c](c99_layered_core/gate_template.c) — 120 lines.** A 1 kHz bare-metal MCU interrupt integration sample with a **32 B zero-heap physics-residual probe** (`LayeredProbe_Step`: median spike rejection plus a cascaded high-pass innovation envelope), the `blanking_active` hardware blanking window for stimulation pulses and commutation-edge artifacts, and the `outer_seq` commit-marker pattern.
 - **[3] [c99_layered_core/layered_gatekeeper.h](c99_layered_core/layered_gatekeeper.h) / [.c](c99_layered_core/layered_gatekeeper.c) — 96 B state.** A zero-dependency ANSI C99 safety arbiter and four-bank anti-windup control microkernel for 1 kHz cyclic tasks.
-- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 645 lines.** A Level-2 C-MEX S-Function for model-based design: `DWork` holds the 96 B state, zero globals, zero dynamic memory, **11 inputs** (10 ABI inputs plus the `ack` rising edge) and **7 outputs** around the same frozen core.
+- **[4] [simulink_sfunc/sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c) — 648 lines.** A Level-2 C-MEX S-Function for model-based design: `DWork` holds the 96 B state, zero globals, zero dynamic memory, **11 inputs** (10 ABI inputs plus the `ack` rising edge) and **7 outputs** around the same frozen core.
 
 **Headline numbers.**
 
 - **Small-sample calibration, no GPU required.** The slow supervisor is calibrated on CPU from **36 labeled macro-windows** and stores **15 scalars / 60 B (FP32)**, versus **16,000 action labels / 20,596 B (FP32)** for B2.
 - **96 B deterministic C99 fallback.** A zero-heap ANSI C99 core owns the **1 kHz** actuator command with **ten input fields**, a 32 B independent physics-residual probe and nine core protection duties. In this compound-fault benchmark, the first spike triggers a veto and closed-loop R4 fallback within the same **1 ms control tick**.
 - **Frozen AI, physical field tuning.** Three knobs occupy **12 B** and support constrained adaptation to forward overload, cross mismatch, reverse light load and compound unit drift without retraining the supervisor.
-- **Cross-language replay and a 119-line skeleton.** **235 C regression checks** pass; Python/C replay is bit-exact (**max|du| = 0**), MATLAB/C replay is within **5e-8**, and the Level-2 S-Function reproduces all seven outputs over 1,100 frames with **max diff = 0.0**. The **119-line template** is ready to run; the Simulink model illustrates the architecture.
+- **Cross-language replay and a 119-line skeleton.** **239 C regression checks** pass; Python/C replay is bit-exact (**max|du| = 0**), MATLAB/C replay is within **5e-8**, and the Level-2 S-Function reproduces all seven outputs over 1,100 frames with **max diff = 0.0**. The **119-line template** is ready to run; the Simulink model illustrates the architecture.
 
 **Human readers:** [§1](#1-ai-can-be-slow-control-authority-must-be-clear) explains the division of control authority through six field problems; [§2](#2-what-to-reuse-human--agent-quickstart) covers the four reusable modules and three-step porting; [§3.2](#32-four-stage-comparison) / [§3.3](#33-frozen-ai-field-tuned-hardware) / [§3.4](#34-mode-ablation-and-independent-protection) present the measured comparisons, the new gating and abstention experiments, and the figures.
 
@@ -74,7 +74,7 @@ flowchart TB
         bank["R1 nominal · R2 load/stiction · R3 contact<br/>R4: fixed gains, zero reference, zero feedforward<br/>Emergency bypass: blend = 1.0<br/>Tracking anti-windup + first-order smoothing<br/>Magnitude/slew limits + 7-bit fault audit"]
         firewall --> gates --> bank
     end
-    subgraph mbd["Simulink model-based design · 645 lines"]
+    subgraph mbd["Simulink model-based design · 648 lines"]
         direction TB
         sfun["Level-2 C-MEX S-Function<br/>DWork 96 B state · zero globals<br/>11 inputs (10 ABI + ack) / 7 outputs"]
     end
@@ -133,7 +133,7 @@ Diagram timings are benchmark defaults. The device adapter computes `outer_age_s
 | 2 | `GATE_VETO_OOD_RESIDUAL` | Physics innovation above threshold; the residual veto latches until it recedes below the clear ratio. |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | Confidence below threshold, or explicit `ai_regime = 4` abstention; cleared only by a confident normal regime. |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | Measured or predicted state at the envelope; sticky until both state and prediction fall below the clear ratio. |
-| 5 | `GATE_SAFE_ZERO` | Native HOLD ran past `max_hold_ticks = 100`: integrators and target are cleared and the command is ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`; the one-ULP floor keeps the de-energise monotone and finite-time when the legal slew budget is below one representable step, and it never re-energises. A corrupt configuration uses its fixed 100-tick budget, zeroes immediately and latches. |
+| 5 | `GATE_SAFE_ZERO` | Native HOLD ran past `max_hold_ticks = 100`: integrators and target are cleared and the command is ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(\|u_prev\|))`; the one-ULP floor keeps the de-energise monotone and finite-time when the legal slew budget is below one representable step, and it never re-energises. A corrupt configuration uses its fixed 100-tick budget, zeroes immediately and latches. |
 | 6 | `GATE_LATCHED_SAFE` | Three cumulative safety/OOD veto episodes (`max_fault_vetoes_before_latch = 3`) permanently lock R4; only `Layered_AcknowledgeFaultLatch()` releases the core, resets the episode counter and re-arms the cooldown. Lifetime counters and the audit mask survive. |
 
 The sticky **7-bit fault audit mask** records the root causes: latency timeout, OOD residual, low confidence, envelope breach, NaN corruption, HOLD timeout and permanent latch. While a veto is active or the permanent latch is set, and the active regime is R4, the **emergency bypass** skips `blend_alpha` and applies the raw R4 law with `blend = 1.0`; magnitude and slew limits still apply.
@@ -145,7 +145,7 @@ The sticky **7-bit fault audit mask** records the root causes: latency timeout, 
 | **[1] [minimal_template.py](python_bench/minimal_template.py)** | 119 lines | Standalone 10 Hz supervisor + 1 kHz C binding: `auto_calibrate`, `auto_field_tune`, low-confidence abstention and `SLOT 1..3` |
 | **[2] [gate_template.c](c99_layered_core/gate_template.c)** | 120 lines | 1 kHz MCU integration sample: 32 B `LayeredProbe_t`, `blanking_active`, `outer_seq` lease and a PASS self-check |
 | **[3] [layered_gatekeeper.c](c99_layered_core/layered_gatekeeper.c) / [.h](c99_layered_core/layered_gatekeeper.h)** | 96 / 140 / 12 / 40 / 28 B | Zero-dependency ANSI C99 control and safety gatekeeper for an MCU, PLC or RTOS cyclic task |
-| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 645 lines | Level-2 C-MEX S-Function around the same frozen core: 11 inputs, 7 outputs, no mutable globals |
+| **[4] [sfun_layered_gatekeeper.c](simulink_sfunc/sfun_layered_gatekeeper.c)** | 648 lines | Level-2 C-MEX S-Function around the same frozen core: 11 inputs, 7 outputs, no mutable globals |
 
 When copying the C99 core, retain the MIT copyright and permission notice in [LICENSE](LICENSE).
 
@@ -236,7 +236,7 @@ All branches share actuator magnitude and slew limits, sensor processing, noise,
 
 Learning-based fast-slow systems are an active engineering direction; [Helix 02](https://www.figure.ai/news/helix-02) is one example. The design horizon is **2027+ deployment across constrained devices**.
 
-All main-table metrics, the five holdout runs and the four field-tuning conditions agree exactly between the two engines for B3; the B2 ridge-regression weights differ by about 1.9e-6 in double precision between NumPy and MATLAB LAPACK, which can shift the fourth decimal of broad-band sensitivity metrics. In the rejected B1 instability candidates and in the extreme reverse-mismatch counterfactual, a double-precision standard-library `sin`/`cos` mantissa difference of about 1e-14 is amplified chaotically by the repeated rigid-wall collisions, so those B1 counterfactual peaks can differ in the last digits between engines; the difference changes no feasibility verdict and no B3 metric.
+All main-table metrics and every published B3 metric — the five holdout runs and the four field-tuning conditions — agree exactly between the two engines at displayed precision, and their raw binary64 reductions differ by at most 8.6e-15. The B2 ridge-regression weights differ by about 1.9e-6 in double precision between NumPy and MATLAB LAPACK, which can shift the fourth decimal of broad-band sensitivity metrics, and B2's S4 RMSE at seeds 307 and 503 differs in the last displayed digit by 1e-6. In the rejected B1 instability candidates and in the reverse-mismatch counterfactual, an approximately 1e-16–1e-14 double-precision tail difference is amplified chaotically by the repeated rigid-wall collisions, so the contact peaks differ by O(1 N) between engines; the rejected B1 reverse-mismatch counterfactual gives 193.12 N in Python versus 194.02 N in MATLAB. These differences change no feasibility verdict and no published B3 metric.
 
 ### 3.2 Four-stage comparison
 
@@ -400,7 +400,7 @@ Veto and R4 fractions are distinct: recovery cooldown can retain R4 after a veto
 
 The safety probe combines a median-based spike channel with a **broadband high-frequency innovation envelope**: time-aligned nominal acceleration prediction, two-pole 25 Hz low-pass processing, 5 Hz high-pass innovation, an 8 ms energy window, normalization by 500 rad/s² and a 1 s release envelope. No fault frequency enters the deployed probe.
 
-The full compound fault's first spike triggers a veto in the same control tick. **Anomaly detection delay and core response time are different measurements.** With the spike channel disabled, a 0.2 rad sensor oscillation at 12 / 18 / 37 / 83 / 137 Hz is detected after **30 / 6 / 4 / 3 / 3 ms**, following quiet initialization. With spikes, confidence, envelope and timeout vetoes removed from the compound test, the broadband probe detects after **670 ms**, retains zero violations and limits S4 maximum |x| to **0.6984 rad**. Removing only OOD veto also retains zero violations through the remaining gates (no true physical breach, and the maximum |x| stays at **0.8591 rad**, below the 1.0 rad red line), but TV rises to **1,718.48 N·m**; what follows is **three safety-envelope veto episodes** (`GATE_SAFETY_ENVELOPE`, triggered by the 0.9x fractional threshold and the 25 ms look-ahead before |x| reaches the 1.0 rad physical limit), which trip the permanent latch for **9,085 ticks**. Veto episodes and true physical breaches are distinct events and must not be counted one for the other.
+The full compound fault's first spike triggers a veto in the same control tick. **Anomaly detection delay and core response time are different measurements.** With the spike channel disabled, a 0.2 rad sensor oscillation at 12 / 18 / 37 / 83 / 137 Hz is detected after **30 / 6 / 4 / 3 / 3 ms**, following quiet initialization. With spikes, confidence, envelope and timeout vetoes removed from the compound test, the broadband probe detects after **670 ms**, retains zero violations and limits S4 maximum |x| to **0.6984 rad**. Removing only OOD veto also retains zero violations through the remaining gates (no true physical breach, and the maximum |x| stays at **0.8591 rad**, below the 1.0 rad red line), but TV rises to **1,718.48 N·m**; what follows is **three safety-envelope veto episodes** (`GATE_VETO_SAFETY_ENVELOPE`, triggered by the 0.9x fractional threshold and the 25 ms look-ahead before |x| reaches the 1.0 rad physical limit), which trip the permanent latch for **9,085 ticks**. Veto episodes and true physical breaches are distinct events and must not be counted one for the other.
 
 The main run uses R1 throughout S1, R2 for 96.8% of S2 and R3 for 94.99% of S3; normal stages have no vetoes. S4 remains in R4 after fault onset. Persistent `ai_confidence = NaN` from 22 s produces **18,000 corrupted frames**, continued R4 command updates and **zero violations**, with whole-mission maximum **|x| = 0.5159 rad**. Corruption remains visible in flags and counters while valid sensors keep the fallback closed loop running.
 
@@ -428,7 +428,7 @@ Use **one state, probe, tuning tuple and timestamp per axis/channel**. Share rea
 | Prototype classifier | 15 scalars; FP32 storage 60 B |
 | C99 state / configuration / field knobs / input / output | **96 / 140 / 12 / 40 / 28 B** |
 | `LayeredProbe_t` (1 kHz residual probe, gate template) | **32 B** |
-| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 6,208 B; `-O2`: 7,252 B |
+| C99 object text, GCC 4.9.2 x86-64 | `-Os`: 6,452 B; `-O2`: 7,608 B |
 
 FP32 bytes are a storage calculation; numerical RBF runs use FP64. State RAM, model storage and code size are separate quantities. Python reports RBF and C-call host times, including ctypes overhead; they are not target WCET. The core uses only `<stdint.h>`, fixed-size arithmetic and no heap, I/O, libm or mutable globals.
 
@@ -450,7 +450,7 @@ gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/gate_template.exe c
 .\c99_layered_core\gate_template.exe
 ```
 
-The template requires all ten input fields and recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **235 passes, zero failures**. The MCU template's own self-check exits zero after exercising HOLD → `SAFE_ZERO`, three OOD episodes → `GATE_LATCHED_SAFE`, blanking freeze, `outer_seq` commit and a successful acknowledgement. Python/C replay: **6,000 frames** covering R1 = 901, R2 = 900, R3 = 304 and R4 = 3,895 ticks, including ack re-arming and a 7→5→3→1→0 slew-shaped return to zero on both trigger paths; discrete outputs are exact and the continuous command agrees bit for bit (**max|du| = 0**). Compilers are found through `CC` or `PATH`.
+The template requires all ten input fields and recompiles when C source or header changes; compiler failure is explicit. Its PASS checks tracking error, zero true-state violations and zero abnormal gates. The benchmark's `--no-c` path is a complete Python mirror. C regression: **239 passes, zero failures**. The MCU template's own self-check exits zero after exercising HOLD → `SAFE_ZERO`, three OOD episodes → `GATE_LATCHED_SAFE`, blanking freeze, `outer_seq` commit and a successful acknowledgement. Python/C replay: **6,000 frames** covering R1 = 901, R2 = 900, R3 = 304 and R4 = 3,895 ticks, including ack re-arming and a 7→5→3→1→0 slew-shaped return to zero on both trigger paths; discrete outputs are exact and the continuous command agrees bit for bit (**max|du| = 0**). Compilers are found through `CC` or `PATH`.
 
 MATLAB R2024b + Simulink, built-in functions and blocks. Full acceptance requires a C99 compiler; its absence is an error:
 
@@ -460,7 +460,7 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "clearvars; sim('matlab_simulink/ai_layered_control_bench.slx'); disp('standalone model PASS')"
 ```
 
-The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits JSON. MATLAB/C replays cover **40,000 normal and 40,000 persistent-mailbox-fault frames**, with exact discrete outputs and **max|du| = 5e-9**. A further 10,000-tick `outer_seq` lease replay covers the local frame lease, native HOLD → `SAFE_ZERO`, a sequence fallback to zero and cooldown recovery with exact discrete outputs and **max|du| = 4.5e-8**. Four additional 40,000-frame replays inject invalid knobs at 5 s: all have zero HOLD ticks, zero violations and finite integrators. The Level-2 C-MEX S-Function links the same frozen core; a 1,100-frame frame-by-frame comparison reproduces all seven outputs with **max diff = 0.0** across gate codes 0–6. Build it from `simulink_sfunc/` with:
+The acceptance run prints five PASS verdicts, rebuilds the existing model and three 240 dpi figures, and emits JSON. MATLAB/C replays cover **40,000 normal and 40,000 persistent-mailbox-fault frames**, with exact discrete outputs and **max|du| = 5e-9**. A further 10,000-tick `outer_seq` lease replay covers the local frame lease, native HOLD → `SAFE_ZERO`, a sequence fallback to zero and cooldown recovery with exact discrete outputs and **max|du| = 4.19e-8**. Four additional 40,000-frame replays inject invalid knobs at 5 s: all have zero HOLD ticks, zero violations and finite integrators. The Level-2 C-MEX S-Function links the same frozen core; a 1,100-frame frame-by-frame comparison reproduces all seven outputs with **max diff = 0.0** across gate codes 0–6. Build it from `simulink_sfunc/` with:
 
 ```powershell
 mex -v -I../c99_layered_core sfun_layered_gatekeeper.c ../c99_layered_core/layered_gatekeeper.c

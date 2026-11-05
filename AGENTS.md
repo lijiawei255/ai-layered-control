@@ -115,7 +115,7 @@ latches `HOLD_TIMEOUT` but never arms the permanent latch.
 | `c99_layered_core/layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Deterministic safety arbiter and four-bank controller |
 | `c99_layered_core/gate_template.c` | `[REUSABLE CORE / TEMPLATE]` 1 kHz MCU integration sample: 32 B residual probe, `blanking_active`, `outer_seq` commit pattern |
 | `python_bench/minimal_template.py` | `[REUSABLE CORE / TEMPLATE]` 10 Hz supervisor, C binding, `auto_calibrate`, `auto_field_tune` and `[USER-PLUGIN-SLOT] 1..3` |
-| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs, 645 lines |
+| `simulink_sfunc/sfun_layered_gatekeeper.c` | `[REUSABLE CORE / TEMPLATE]` Level-2 C-MEX S-Function around the frozen core: `DWork` 96 B state, 11 inputs, 7 outputs, 648 lines |
 | `python_bench/run_benchmark.py` | `[BENCHMARK HARNESS - DO NOT COPY]` Physical fixture, full Python mirror, training and experiments |
 | `c99_layered_core/test_gatekeeper_standalone.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Core behavioral regression |
 | `c99_layered_core/verify_core_equivalence.c` | `[BENCHMARK HARNESS - DO NOT COPY]` Test-only frame replay |
@@ -298,11 +298,11 @@ matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
 ```
 
-C regression reports 235 passes and zero failures with exit code zero, and the MCU template prints PASS.
+C regression reports 239 passes and zero failures with exit code zero, and the MCU template prints PASS.
 Replay compares gate, regime, fault bits and corruption flags exactly.
 Python/C command agreement is bit-exact (max|du| = 0 over 6,000 frames); MATLAB/C agreement is
 max|du| = 5e-9 over 40,000 normal, 40,000 mailbox-fault and four 40,000-frame tuning-injection replays,
-plus 4.5e-8 over a 10,000-tick `outer_seq` lease replay that covers HOLD → `SAFE_ZERO`, the
+plus 4.19e-8 over a 10,000-tick `outer_seq` lease replay that covers HOLD → `SAFE_ZERO`, the
 zero-sequence corruption path and cooldown recovery.
 The S-Function reproduces seven outputs over 1,100 frames with max diff = 0.0 and all gate codes 0–6.
 Benchmark checks compare stage metrics, true-state envelope violations, contact force and field tuning.
@@ -318,7 +318,7 @@ Serialize writes to the generated model. Preserve unsaved user edits in any open
 ## 8. Repository discipline
 
 Keep the core and templates small: the Python template is 119 lines (within 100–120), the MCU template is
-120 lines (within 110–130), and the S-Function is 645 lines: a thin adapter that never re-implements the
+120 lines (within 110–130), and the S-Function is 648 lines: a thin adapter that never re-implements the
 control law.
 Keep both auto-adaptation helpers together within 20–30 lines.
 Replace superseded mechanisms rather than retaining compatibility switches or unused branches.

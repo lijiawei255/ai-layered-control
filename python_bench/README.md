@@ -11,7 +11,7 @@ harness.
 | [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 20 lines for both helpers) and the SLOT 1..3 integration skeleton |
 | [gate_template.c](../c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU bare-metal ISR template: 32 B `LayeredProbe_t` (median glitch rejection + cascaded high-pass innovation envelope), `blanking_active` hardware blanking window and the `outer_seq` commit-marker pattern |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B state | 1 kHz zero-dependency ANSI C99 safety arbitration and four-bank anti-windup control micro-kernel |
-| [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 645 lines | Level-2 C-MEX S-Function: `DWork` holds the 96 B state, zero global variables, zero dynamic memory, 11 inputs (10-field ABI + ack rising edge) and 7 outputs |
+| [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 648 lines | Level-2 C-MEX S-Function: `DWork` holds the 96 B state, zero global variables, zero dynamic memory, 11 inputs (10-field ABI + ack rising edge) and 7 outputs |
 
 [run_benchmark.py](run_benchmark.py) is the benchmark harness: it builds the shared physical fixture,
 trains B2, runs the branch comparisons and field-tuning experiments, and writes the result tables.
@@ -94,15 +94,15 @@ force, veto fraction and R4 occupancy. Host simulation time is reported separate
 The deployment path reads measured features; stage labels are confined to plant generation and scoring.
 
 The layered branch records S4 RMSE 0.539985 rad and TV 1545.01 N·m in the main comparison.
-C99 standalone regression passes 235 checks with zero failures, and the 120-line `gate_template.c`
+C99 standalone regression passes 239 checks with zero failures, and the 120-line `gate_template.c`
 self-check prints PASS. Python/C `--selftest` replays 6,000 frames (R1 = 901, R2 = 900, R3 = 304,
 R4 = 3,895, including acknowledgement re-arming and the 7→5→3→1→0 ramp-down) with identical discrete
 outputs and max |du| = 0, bit-exact in binary32. MATLAB/C `verify_core_equivalence` covers 40,000 normal
 frames, 40,000 corrupted-mailbox frames and four 40,000-frame runs with illegal knob injection at
 max |du| = 5e-9; a 10,000-tick `outer_seq` lease replay covering HOLD → `SAFE_ZERO` and the
-zero-sequence corruption path stays within max |du| = 4.5e-8. The Level-2 S-Function replays 1,100
+zero-sequence corruption path stays within max |du| = 4.19e-8. The Level-2 S-Function replays 1,100
 frames with all seven outputs at max diff = 0.0.
-Object text measures 6,208 B at `-Os` and 7,252 B at `-O2` with GCC 4.9.2 TDM64 on x86-64.
+Object text measures 6,452 B at `-Os` and 7,608 B at `-O2` with GCC 4.9.2 TDM64 on x86-64.
 The ABI occupies 96/140/12/40/28 B for state/config/tuning/input/output, plus the 32 B probe.
 
 Porting order, multi-axis ownership and timeout behavior are specified in
