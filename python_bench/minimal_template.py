@@ -62,7 +62,7 @@ def auto_calibrate(samples, labels):
     level = lambda a: min(1.0, np.ceil((n + 1) * a) / n); gamma = 1 / max(float(np.quantile(first, level(.95))), 1e-6)
     confidence = (second - first) / (second + first + 1e-9) * np.exp(-gamma * first)
     threshold = .15 * float(np.quantile(confidence, level(.01)))
-    return prototypes, gamma, threshold, 1.25 * threshold
+    return prototypes, gamma, threshold, min(0.999, 1.05 * threshold)
 def auto_field_tune(evaluate, current=(1, 1, 1)):
     """Six bounded trials; device-side validity includes every operating regime."""
     best, score = current, float("inf")

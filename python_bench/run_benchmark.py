@@ -758,12 +758,12 @@ class Probe:
         self.retreat_s = self.stall_ticks = self.block_run = 0.0
         # Position-free release state: a 50 ms low-pass measured velocity gates
         # the "passed the remembered contact point under its own speed" test,
-        # pass_run times that sustained crossing, and blk blanks the reference-
-        # step inertial transient (250 ms) that would otherwise forge a resistive
-        # power charge.
+        # pass_run times that sustained crossing, and nsign is the sign of the
+        # tracking error that last accumulated contact evidence.  A released
+        # surface may only be re-armed by a command that still presses into it.
         self.vlp = self.pass_run = 0.0
         self.r_prev = x
-        self.blk = 0
+        self.nsign = 0.0
 
     def step(self, y, u, r):
         previous_position = self.y2
@@ -814,18 +814,18 @@ class Probe:
         #       tracking error.  Dry friction opposes the direction of motion and
         #       cancels in the signed average; a unilateral constraint does not,
         #       so the 0.5 s error mean separates S3 contact from S2 stiction.
-        # A reference step is inertial, not wall reaction: blank the effort
-        # channel for 250 ms so a commanded retreat cannot recharge the memory.
-        if abs(r - self.r_prev) > 0.02:
-            self.blk = 250
-        elif self.blk > 0:
-            self.blk -= 1
+        # A released but remembered surface may only be re-armed by a command
+        # that still pushes into it.  A reference moving away (or already on the
+        # inner side of the remembered contact) while the plant follows is a
+        # commanded unload at any speed: no single-step reference threshold.
+        apart = (self.nsign * (r - self.r_prev) < 0.0) or (self.nsign * (r - ym) < -0.02)
+        self.unload = self.free and apart and self.nsign * self.vlp <= 0.0
         stall = 1.0 / (1.0 + (self.vf / 0.05) ** 2)
         self.stall_ticks = self.stall_ticks + 1 if abs(self.vf) < 0.05 else 0
         track_err = abs(r - ym)
         lead = abs(self.errlp) - 0.03
         evidence = 0.0
-        if self.power > .10 and ratio > .03 and self.blk == 0:
+        if self.power > .10 and ratio > .03 and not self.unload:
             evidence = self.power - .10
         if lead > 0.0 and self.stall_ticks >= 20:
             # The one-signed-error term only counts after the measured velocity
@@ -839,6 +839,7 @@ class Probe:
         self.retreat_s = self.retreat_s + DT if max(ym, r) < self.cy - .08 else 0.0
         if blocked:
             self.cy = ym
+            self.nsign = 1.0 if r >= ym else -1.0
         # Release: a remembered contact point is abandoned when the measured state
         # passes it with position-independent speed, or after 3 s of clear
         # retreat.  The free-state decay is 0.1 s, so the 10 Hz classifier sees
@@ -850,8 +851,8 @@ class Probe:
             self.pass_run = 0
         if self.free:
             # A genuine resistive-effort blockage re-arms the surface; the
-            # 250 ms reference-step blanking above keeps an inertial command
-            # transient from doing so.
+            # commanded-unload rule above keeps an inertial reference transient
+            # from doing so.
             if blocked:
                 self.free = 0
         elif self.retreat_s > 3.0 or self.pass_run >= 100:
@@ -1925,6 +1926,21 @@ def selftest():
         wall_peaks.append(m['peak_N'])
     print(f'PASS: wall-position generalisation 0.30 / 0.43 / 0.55 rad (peaks {wall_peaks[0]:.2f} / '
           f'{wall_peaks[1]:.2f} / {wall_peaks[2]:.2f} N, R3 > 0.9, zero breaches)')
+    # A commanded smooth retreat is the same physical unload as a reference step:
+    # the directional rule must release it inside the 0.35 s contract without a
+    # re-latch (the retired 250 ms step blanking used to be the only guard).
+    ret = retreat_context()
+    q1 = ret['t'] >= 10.0
+    tau = np.clip((ret['t'][q1] - 10.0) / 0.6, 0.0, 1.0)
+    p5 = 10.0 * tau ** 3 - 15.0 * tau ** 4 + 6.0 * tau ** 5
+    dp5 = 30.0 * tau ** 2 - 60.0 * tau ** 3 + 30.0 * tau ** 4
+    ret['r'][q1], ret['rd'][q1], ret['rdd'][q1] = 0.5 * (1.0 - p5), -0.5 * dp5 / 0.6, 0.0
+    assert float(np.max(np.abs(np.diff(ret['r'][q1])))) < 0.003
+    a = simulate(ret, 'dynamic', clf=clf)['log']
+    r3 = np.flatnonzero((ret['stage'] == 0) & (a[:, 3] == REGIME_BOUNDARY))
+    smooth_release = float(ret['t'][r3[-1]] - 10.0) if len(r3) else 0.0
+    assert smooth_release < 0.35 and float(np.mean(a[ret['t'] >= 25.0, 3] == REGIME_BOUNDARY)) == 0.0, smooth_release
+    print(f'PASS: smooth quintic retreat releases in {smooth_release:.3f} s (< 0.35 s), no re-latch')
     # Off-manifold audit sanity: the same conformal detector must stay quiet on
     # independent NOMINAL runs while still detecting the coupled load bias.
     audit_trip, audit_clear, _ = off_manifold_threshold(clf)

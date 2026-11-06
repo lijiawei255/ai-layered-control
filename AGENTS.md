@@ -21,8 +21,9 @@ B1 has no bank-transfer smoother; B2 carries one clamped error-integral history 
 
 The benchmark grades five branches: B1, B2, B3, and the two gated baselines B1+C99 Gate and
 B2+C99 Gate, with the gate shell transparent (it changes only the safety arbitration, not the
-baseline control law). S3 enforces a 20 N contact budget. S4 has no injected first-tick spike; the
-contact evidence is position-free (no wall-coordinate test), and S4 exercises OOD withdrawal.
+baseline control law). S3 enforces a 20 N contact budget. S4 fires on the physical fault alone (the
+unmodelled flexible-mode residual plus the random glitch channel), and the contact evidence is
+position-free.
 Tuning validity uses two wall phases. The off-manifold audit uses a normal amplitude and
 commissioning noise, an in-box coupled constant load-torque bias, a 1 % per-frame split-conformal
 budget with 5-frame persistence, and an independent nominal control that must record zero false vetoes.
@@ -209,10 +210,12 @@ Measure target execution time separately from host ctypes call time.
 `auto_calibrate(samples, labels)` accepts finite normalized feature rows and labels 1, 2 or 3;
 supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_clear)`.
 The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
-windows into 15 classifier scalars (three 4-D prototypes, gamma, confidence trip and confidence
-clear). The main benchmark sets the trip level from the calibration-manifold lower bound times a
-0.15 conservative safety-margin coefficient; the off-manifold audit separately validates the
-finite-sample split-conformal lower-tail order statistic (1 %).
+windows into 15 statistical scalars (three 4-D prototypes, gamma, confidence trip and confidence
+clear). Both confidence thresholds come from one split-conformal rule: the 1 % lower-tail order statistic of
+the calibrated confidence, `q = min(1, ceil((N+1)(1-alpha))/N)`. The main benchmark applies a 0.15x
+working-point factor to that quantile, which keeps the 36-window archive from false abstention across
+the S1-S4 dynamic envelope; the off-manifold audit runs the 1 % quantile directly with 5-frame
+persistence (99.5 % detection, zero false vetoes on independent nominal probes).
 Freeze the resulting prototypes and confidence parameters before unit-to-unit adaptation.
 
 ### Step 4 — Tune the physical knobs

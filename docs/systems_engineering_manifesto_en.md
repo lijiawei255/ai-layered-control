@@ -32,7 +32,7 @@ forced veto from an independent physical residual probe.
 | L0 | Hardware safety channel: an independent safety PLC (ISO 13849 Cat.3/4, 1oo2D), dual-channel sensor cross-check, and hardware STO / IEC 60204-1 Stop 0. |
 | L1 | Deterministic fast inner loop: four-bank PID with full-branch reverse-tracking anti-windup plus nominal feedforward; DOB/ESO/ADRC or bounded adaptive compensation can be added in the control-law slot or via `u_ff`. |
 | L2 | Runtime safety arbitration and degradation chain: 96 B C99 Simplex state machine, 1D ZCBF signed envelope look-ahead, blanking hold, per-axis R4 → SAFE_ZERO → LATCHED_SAFE; multi-axis aggregation of `gate_state` plus a shared ack bus for Stop 1/2. (Under ISO/IEC TR 5469 the physical travel/torque/slew/timeout checks are exact a-priori inequalities, and the main-control AI plus the supervisory AI must not extrapolate blindly together out of distribution; this layer is therefore deterministic code, never a second black-box model.) |
-| L3 | Slow qualitative supervision and calibrated abstention: 10 Hz discrete regime advice plus manifold-distance confidence (split-conformal in the off-manifold audit). |
+| L3 | Slow qualitative supervision and calibrated abstention: 10 Hz discrete regime advice plus split-conformal manifold-distance confidence. |
 | L4 | Fleet lifecycle closure: frozen AI weights during operation, append-only 7-bit fault audit mask as trigger tags for OOD data capture, offline prototype supplementation and safety-case update. |
 
 ## Six field problems and the mechanisms that answer them
@@ -93,7 +93,7 @@ case runs at a normal amplitude and commissioning noise with an in-box coupled c
 once the operating point leaves the calibrated manifold, the loop must not keep applying a
 confident-looking command.
 
-**Where the alternatives fail:** The fixed-threshold rule tree compared in this benchmark, or a
+**Where the alternatives fail:** The fixed-threshold rule tree, or a
 fuzzy controller, encodes decision boundaries but - without an explicitly embedded
 manifold-distance or density model - carries no notion of distance from the calibrated
 distribution. The physical rule supervisor agrees with the prototype classifier on the main S1/S2
@@ -104,11 +104,7 @@ rule tree has none.
 **Mechanism:** The prototype model exposes `ai_confidence` as a distance-based measure. Outside the
 manifold the confidence collapses and triggers an active low-confidence abstention: the 1 kHz core
 registers GATE_VETO_LOW_CONFIDENCE and runs R4 with fixed damping until a normal regime is
-confidently reported again.
-A fixed rule tree or gain schedule carries no manifold-distance measure, so it must still emit its
-nearest regime and cannot distinguish low confidence from an unknown condition; the
-manifold-distance confidence here makes abstention an observable, adjudicable and deterministic
-event.
+confidently reported again — abstention becomes an observable, adjudicable and deterministic event.
 
 ### 4. Unit, batch and unit-to-unit drift without retraining compute
 
@@ -190,8 +186,8 @@ zero is the single documented exception.
 Safe fallback is an explicit control regime, and its reference behavior, damping and feedforward
 permissions must be defined for the target device. A stale slow mailbox with healthy fast sensors
 keeps the measured 1 kHz loop closed on the fixed R4 law; only an unusable fast input holds the last
-actuator command open-loop, and that held command is a command, not a mechanical position or a
-physiological state. The device adapter defines the physical consequence. The core's R4 regulates
+actuator command open-loop. A held command is a command; its physical consequence is defined by the
+device adapter. The core's R4 regulates
 toward a commissioned safe zero with fixed gains and no feedforward. When slow decisions are corrupt,
 that closed-loop law keeps running as long as valid fast measurements remain active.
 
@@ -207,8 +203,7 @@ This separation makes commissioning evidence directly readable: the record shows
 knobs changed, which trial constraints were checked and how tracking changed. A genuinely new
 physical domain first defines its signals, a nominal model and a controller bank, then builds its
 own semantic archive. Continuous-policy retraining remains a complementary comparison: after
-collecting target-unit action labels, measure nominal accuracy, frozen transfer and recovery
-separately.
+collecting target-unit action labels, measure nominal accuracy, frozen transfer and recovery.
 
 ## Experiments must isolate causes
 

@@ -38,11 +38,12 @@ level=@(a) min(1,ceil((n+1)*a)/n);
 gamma=1/max(linear_quantile(d(:,1),level(.95)),1e-6);
 score=(d(:,2)-d(:,1))./(d(:,2)+d(:,1)+1e-9).*exp(-gamma*d(:,1));
 % The Python supervisor's auto_calibrate() returns the raw 0.15x quantile trip
-% and 1.25x trip clear, with no extra scale factor and no caps; the MATLAB
-% mirror must publish exactly the same pair so both engines veto on the same
-% confidence level.
+% (the dynamic-envelope working-point factor on the split-conformal 1 % order
+% statistic) and the same capped 1.05x clear rule the off-manifold audit uses;
+% the MATLAB mirror must publish exactly the same pair so both engines veto on
+% the same confidence level.
 trip=0.15*linear_quantile(score,level(.01));
-clear=1.25*trip;
+clear=min(0.999,1.05*trip);
 classifier=struct('prototypes',prototypes,'gamma',gamma,'trip',trip,'clear',clear);
 end
 

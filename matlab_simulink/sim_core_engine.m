@@ -196,7 +196,7 @@ pr=struct('xh',x,'vh',0.,'lp',0.,'lp2',0.,'errlp',0.,'buf',[],'yf',x,'vf',0., ..
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
     'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0, ...
     'stall_ticks',0,'block_run',0, ...
-    'vlp',0.,'pass_run',0,'r_prev',x,'blk',0);
+    'vlp',0.,'pass_run',0,'r_prev',x,'nsign',0.,'unload',0);
 end
 
 function f=probe_features(pr,P)
@@ -241,25 +241,24 @@ pr.load_energy=pr.load_energy+dt/.05*((p(1)*pr.alp)^2-pr.load_energy);
 %       counts after the measured velocity has stayed stalled for 20 ms, and it
 %       is capped at 0.02 so one transient can neither fake a contact nor keep
 %       the surface release engaged.
-% A reference step is inertial, not wall reaction: blank the effort channel for
-% 250 ms so a commanded retreat cannot recharge the memory.
+% A released but remembered surface may only be re-armed by a command that
+% still pushes into it: a reference moving away (or already on the inner side
+% of the remembered contact) while the plant follows is a commanded unload at
+% any speed.  No single-step reference threshold is used.
 % Release: a remembered contact point is abandoned when the measured state
 % passes it with position-independent speed (50 ms low-pass velocity), or after
 % 3 s of clear retreat.  The free-state decay is 0.1 s, so the 10 Hz classifier
 % sees the contact feature collapse within one frame; a genuine resistive
-% blockage re-arms the surface immediately, while the 250 ms reference-step
-% blanking keeps an inertial command transient from doing so.
-if abs(r-pr.r_prev)>.02
-    pr.blk=250;
-elseif pr.blk>0
-    pr.blk=pr.blk-1;
-end
+% blockage re-arms the surface immediately, while the commanded-unload rule
+% keeps an inertial reference transient from doing so.
+apart=(pr.nsign*(r-pr.r_prev)<0.) || (pr.nsign*(r-ym)<-.02);
+pr.unload=pr.free && apart && pr.nsign*pr.vlp<=0.;
 ratio=pr.power/(pr.load_energy+.25);
 stall_w=1./(1+(pr.vf/.05).^2);
 if abs(pr.vf)<.05, pr.stall_ticks=pr.stall_ticks+1; else, pr.stall_ticks=0; end
 lead_err=abs(pr.errlp)-.03;
 evidence=0.;
-if pr.power>.10 && ratio>.03 && pr.blk==0
+if pr.power>.10 && ratio>.03 && ~pr.unload
     evidence=pr.power-.10;
 end
 if lead_err>0 && pr.stall_ticks>=20
@@ -274,6 +273,7 @@ else
 end
 if blocked
     pr.cy=ym;
+    if r>=ym, pr.nsign=1.0; else, pr.nsign=-1.0; end
 end
 if ym>pr.cy+.04 && pr.vlp>.05
     pr.pass_run=pr.pass_run+1;
