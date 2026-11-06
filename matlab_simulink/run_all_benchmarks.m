@@ -80,6 +80,7 @@ fprintf('[5/6] Off-manifold abstention and S3 contact-memory audits\n');
 D.off_manifold=off_manifold_audit(P,calib_samples);
 D.reverse_s3_to_s1=contact_memory_audit(P,'reverse');
 D.retreat_s3_to_s1=contact_memory_audit(P,'retreat');
+D.repeated_contact=contact_memory_audit(P,'repeat');
 fprintf('[6/6] C99 input replay, acceptance and generated artifacts\n');
 replay=verify_core_equivalence(P);
 mailbox_replay=verify_core_equivalence(P,struct('corrupt_slow_at',22));
@@ -201,11 +202,14 @@ for j=1:numel(off.nominal_control)
     n=off.nominal_control(j);
     fprintf('  nominal control seed %d: %d low-conf / %d R4 ticks\n',n.seed,n.low_confidence_ticks,n.r4_ticks);
 end
-rv=D.reverse_s3_to_s1; rt=D.retreat_s3_to_s1;
+rv=D.reverse_s3_to_s1; rt=D.retreat_s3_to_s1; rp=D.repeated_contact;
 fprintf('  reverse S3->S1 (wall withdrawn): peak contact=%.2f N, S1 r3_rate=%.3f, release=%.3f s, last2 r3=%.3f\n', ...
     rv.s3_peak_N,rv.s1_r3_rate,rv.release_s,rv.last_r3_rate);
 fprintf('  retreat S3->interior (wall kept): S1 r3_rate=%.3f, release=%.3f s, last5 r3=%.3f, rmse=%.5f\n', ...
     rt.s1_r3_rate,rt.release_s,rt.last_r3_rate,rt.s1_rmse);
+fprintf(['  repeated S3->S1->S3 contact: first peak=%.2f N / R3=%.3f, second peak=%.2f N / R3=%.3f, ' ...
+    'release=%.3f s\n'], ...
+    rp.first_peak_N,rp.first_r3_rate,rp.second_peak_N,rp.second_r3_rate,rp.release_s);
 report=struct('main',M,'ablation',A,'efficiency',E,'holdout',H,'sensitivity',V,'diagnostics',D, ...
     'classifier',[P.classifier.gamma,P.classifier.trip,P.classifier.clear], ...
     'replay',replay,'mailbox_replay',mailbox_replay,'tuning_replays',tuning_replays);
@@ -305,15 +309,24 @@ r=struct('rmse',sqrt(mean((a(:,1)-z.r).^2)),'peak_error',max(abs(a(:,1)-z.r)), .
 end
 
 function R=contact_memory_audit(P,name)
-% Python reverse_context() / retreat_context(): 10 s of S3 wall contact followed
-% by S1 tracking.  'reverse' withdraws the wall (20 s fixture); 'retreat' keeps
-% the wall in place while the reference returns to zero (30 s fixture), so only
-% physical retreat can release the remembered contact.
+% Python reverse_context() / retreat_context() / repeated_context(): 10 s of S3
+% wall contact followed by S1 tracking.  'reverse' withdraws the wall (20 s
+% fixture); 'retreat' keeps the wall in place while the reference returns to
+% zero (30 s fixture), so only physical retreat can release the remembered
+% contact; 'repeat' returns to the S3 reference (30 s fixture), so a surface
+% released by the S1 retreat must re-arm and hold the 20 N budget again.
 if strcmp(name,'reverse')
     R=contact_memory_stats(P,name,20,18);
     assert(R.s3_peak_N<20,'Reverse S3->S1 peak contact exceeded the 20 N budget.');
     assert(R.release_s<0.35,'The compliant bank did not release within 0.35 s of wall withdrawal.');
     assert(R.last_r3_rate==0,'Late S1 tracking still routed the compliant bank.');
+elseif strcmp(name,'repeat')
+    R=contact_memory_stats(P,name,30,25);
+    assert(R.first_peak_N<20 && R.second_peak_N<20, ...
+        'Repeated contact re-arm exceeded the 20 N budget.');
+    assert(R.first_r3_rate>.90 && R.second_r3_rate>.90, ...
+        'Repeated contact did not route R3 on both contacts.');
+    assert(R.release_s<0.35,'The repeated-contact S1 release was not physical.');
 else
     R=contact_memory_stats(P,name,30,25);
     assert(R.release_s<0.50,'The contact memory did not release within 0.50 s of physical retreat.');
@@ -328,9 +341,15 @@ z=sim_core_engine(P,struct('branches',3,'duration',duration,'seed',5, ...
 a=z.b3.log; t=z.t; q2=z.stage==0; tail=t>=tail_start;
 r3=find(q2 & a(:,4)==3);
 R=struct('s1_r3_rate',mean(a(q2,4)==3),'last_r3_rate',mean(a(tail,4)==3), ...
-    's1_rmse',sqrt(mean((a(q2,1)-z.r(q2)).^2)),'s3_peak_N',0,'release_s',0);
+    's1_rmse',sqrt(mean((a(q2,1)-z.r(q2)).^2)),'s3_peak_N',0,'release_s',0, ...
+    'first_peak_N',0,'second_peak_N',0,'first_r3_rate',0,'second_r3_rate',0);
 if isempty(r3), R.release_s=0; else, R.release_s=t(r3(end))-10; end
 if strcmp(name,'reverse'), R.s3_peak_N=max(a(z.stage==2,5)); end
+if strcmp(name,'repeat')
+    q1=t<10; q3=t>=20;
+    R.first_peak_N=max(a(q1,5)); R.second_peak_N=max(a(q3,5));
+    R.first_r3_rate=mean(a(q1,4)==3); R.second_r3_rate=mean(a(q3,4)==3);
+end
 end
 
 function [reg,conf]=classify_feat(feat,clf)

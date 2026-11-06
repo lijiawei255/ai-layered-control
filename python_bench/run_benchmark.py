@@ -760,8 +760,10 @@ class Probe:
         # the "passed the remembered contact point under its own speed" test,
         # pass_run times that sustained crossing, and nsign is the sign of the
         # tracking error that last accumulated contact evidence.  A released
-        # surface may only be re-armed by a command that still presses into it.
+        # surface may only be re-armed by a command that still presses into it;
+        # press_run times the sustained force-domain re-arm evidence.
         self.vlp = self.pass_run = 0.0
+        self.press_run = 0
         self.r_prev = x
         self.nsign = 0.0
         self.unload = False
@@ -835,6 +837,32 @@ class Probe:
             # surface release engaged.
             evidence = max(evidence, min(0.02, lead * stall))
         blocked = evidence > 0.0
+        # A released surface also re-latches on a sustained force-domain
+        # blockage.  The effort/velocity product above is normalised by the load
+        # energy, and a hard press inflates that energy with the very model
+        # mismatch it creates, so a released surface can hide a second contact
+        # from signature (a); signature (b) needs a stalled velocity estimate,
+        # which a compliant press does not provide either.  The same physical
+        # event is therefore also read directly in force: a sustained model
+        # residual that pushes against the tracking error and against the
+        # measured innovation (1 N m at J = 0.01), while the 50 ms measured
+        # speed stays low.  The innovation sign rejects the catch-up transient
+        # that follows a commanded release, when the plant moves toward the
+        # reference faster than the predictor expects.  Re-arming only matters
+        # once the contact memory has actually decayed below the feature floor:
+        # a briefly released surface that still carries its memory is already
+        # routing R3, and the commanded-unload gate keeps the release from
+        # being undone.  Twenty milliseconds of agreement, the same run length
+        # the stalled-velocity term requires, re-arms the surface and restores
+        # the contact-memory floor, so the 10 Hz classifier routes the rebuilt
+        # memory to R3 on its next frame.
+        press = (self.alp * (r - ym) < 0.0 and self.lp * (r - ym) < 0.0
+                 and abs(self.alp) > 100.0 and abs(self.vlp) < 0.2
+                 and self.nsign != 0.0 and self.contact < .01)
+        self.press_run = self.press_run + 1 if (self.free and press and not self.unload) else 0
+        if self.press_run >= 20:
+            blocked = True
+            evidence = max(evidence, min(0.02, abs(self.alp) / 1e4))
         self.retreat_s = self.retreat_s + DT if max(ym, r) < self.cy - .08 else 0.0
         if blocked:
             self.cy = ym
@@ -1276,6 +1304,46 @@ def retreat_context(seed=5):
     c['wc'] = np.full(len(t), 300.0)
     return c
 
+def repeated_context(seed=5):
+    """S3 contact -> S1 retreat/release -> S3 contact again.
+
+    The unilateral surface only loads during the two S3 windows, exactly like
+    the main mission, and each entry re-engages it with the same smooth 0.24 rad
+    approach transient the fixture uses at t = 0.  The free S1 harmonic in
+    between leaves the probe's effort/velocity channel hot (load energy charged,
+    free flag lifted), which is the state that used to hide the second contact.
+    """
+    c = context(seed=seed, duration=30.0, scenario=0, ood=False)
+    t = c['t']
+    q1, q2, q3 = t < 10.0, (t >= 10.0) & (t < 20.0), t >= 20.0
+    c['stage'] = np.where(q1, 2, np.where(q2, 0, 2))
+    for q, spec, off in ((q1, STAGE_SPECS[2], 0.0), (q2, STAGE_SPECS[0], 10.0),
+                         (q3, STAGE_SPECS[2], 20.0)):
+        c['r'][q], c['rd'][q], c['rdd'][q] = _ref_arrays(spec, t[q] - off, 0.5)
+    osc = 0.025 * np.sin(2 * np.pi * 0.73 * t + 0.4)
+    rel = np.zeros_like(t)
+    rel[q1] = 0.24 * np.exp(-t[q1] / 0.25)
+    rel[q3] = 0.24 * np.exp(-(t[q3] - 20.0) / 0.25)
+    c['wall'] = 0.43 + osc + rel
+    c['wv'] = 0.025 * 2 * np.pi * 0.73 * np.cos(2 * np.pi * 0.73 * t + 0.4)
+    c['wv'][q1] -= 0.24 / 0.25 * np.exp(-t[q1] / 0.25)
+    c['wv'][q3] -= 0.24 / 0.25 * np.exp(-(t[q3] - 20.0) / 0.25)
+    c['wc'] = np.where(q2, 0.0, 300.0)
+    return c
+
+def repeated_contact_check(clf):
+    """Two-contact re-arm audit: every contact routes R3 inside the 20 N budget."""
+    c = repeated_context()
+    a = simulate(c, 'dynamic', clf=clf)['log']
+    t = c['t']
+    q1, q2, q3 = t < 10.0, (t >= 10.0) & (t < 20.0), t >= 20.0
+    r3 = np.flatnonzero(q2 & (a[:, 3] == REGIME_BOUNDARY))
+    return dict(seed=5, first_peak_N=round(float(np.max(a[q1, 4])), 2),
+                second_peak_N=round(float(np.max(a[q3, 4])), 2),
+                first_r3_rate=round(float(np.mean(a[q1, 3] == REGIME_BOUNDARY)), 3),
+                second_r3_rate=round(float(np.mean(a[q3, 3] == REGIME_BOUNDARY)), 3),
+                release_s=round(float(t[r3[-1]] - 10.0), 3) if len(r3) else 0.0)
+
 def audit_study(clf, c):
     low, no_wall, report = context(contact_noise=.0015), context(wallk=0), {}
     for name, fixture, mode in (('low_noise',low,'dynamic'), ('low_noise_rules',low,'rules'),
@@ -1382,6 +1450,12 @@ def audit_study(clf, c):
         s1_rmse=round(float(np.sqrt(np.mean((a[q2, 0] - ret['r'][q2]) ** 2))), 5))
     rv = report['retreat_s3_to_s1']
     assert rv['release_s'] < 0.50 and rv['last5_r3_rate'] == 0.0 and rv['s1_rmse'] < 0.05, rv
+    # ---- S3 -> S1 release -> S3 again: the released surface must re-arm ------
+    rc = repeated_contact_check(clf)
+    report['repeated_contact'] = rc
+    assert (rc['first_peak_N'] < 20.0 and rc['second_peak_N'] < 20.0
+            and rc['first_r3_rate'] > .90 and rc['second_r3_rate'] > .90
+            and rc['release_s'] < 0.35), rc
     return report
 
 def efficiency_study():
@@ -1940,6 +2014,16 @@ def selftest():
     smooth_release = float(ret['t'][r3[-1]] - 10.0) if len(r3) else 0.0
     assert smooth_release < 0.35 and float(np.mean(a[ret['t'] >= 25.0, 3] == REGIME_BOUNDARY)) == 0.0, smooth_release
     print(f'PASS: smooth quintic retreat releases in {smooth_release:.3f} s (< 0.35 s), no re-latch')
+    # Repeated contact: a surface released by an S1 retreat must re-arm when the
+    # S3 reference returns.  Both contacts route R3 and hold the 20 N budget; the
+    # second contact is the regression for the force-domain re-arm, because the
+    # effort/velocity channel stays normalised away by the S1 motion.
+    rr = repeated_contact_check(clf)
+    assert rr['first_peak_N'] < 20.0 and rr['second_peak_N'] < 20.0, rr
+    assert rr['first_r3_rate'] > .90 and rr['second_r3_rate'] > .90, rr
+    print(f'PASS: repeated contact re-arms R3 (first {rr["first_peak_N"]:.2f} N / R3 '
+          f'{rr["first_r3_rate"]:.3f}, second {rr["second_peak_N"]:.2f} N / R3 '
+          f'{rr["second_r3_rate"]:.3f}); release {rr["release_s"]:.3f} s')
     # Off-manifold audit sanity: the same conformal detector must stay quiet on
     # independent NOMINAL runs while still detecting the coupled load bias.
     audit_trip, audit_clear, _ = off_manifold_threshold(clf)
@@ -2086,6 +2170,9 @@ def main():
     rt = report['audit']['retreat_s3_to_s1']
     print(f"  reverse S3->S1 (wall withdrawn): peak contact={rv['s3_peak_N']} N, S1 r3_rate={rv['s1_r3_rate']}, release={rv['release_s']} s")
     print(f"  retreat S3->interior (wall kept): S1 r3_rate={rt['s1_r3_rate']}, release={rt['release_s']} s, last5 r3={rt['last5_r3_rate']}, rmse={rt['s1_rmse']}")
+    rp = report['audit']['repeated_contact']
+    print(f"  repeated S3->S1->S3 contact: first peak={rp['first_peak_N']} N / R3={rp['first_r3_rate']}, "
+          f"second peak={rp['second_peak_N']} N / R3={rp['second_r3_rate']}, release={rp['release_s']} s")
     print('\nSample efficiency (action labels)')
     for row in eff:
         print(json.dumps(row))

@@ -132,6 +132,22 @@ if ~isempty(o.contact_memory)
     if strcmp(o.contact_memory,'reverse')
         [r(~m1),rd(~m1),rdd(~m1)]=reference(0,t(~m1)-10,.5);
         wall(~m1)=9.0; wc=300*double(m1);
+    elseif strcmp(o.contact_memory,'repeat')
+        % Python repeated_context(): S3 contact -> S1 release -> S3 contact.
+        % The wall loads only in the two S3 windows (S1 is the benchmark's
+        % wall-free stage) and each S3 entry re-engages it with the same smooth
+        % 0.24 rad approach transient the nominal fixture applies at t = 0.
+        m2=t>=10 & t<20; m3=t>=20;
+        stage=2*double(m1)+2*double(m3);
+        [r(m2),rd(m2),rdd(m2)]=reference(0,t(m2)-10,.5);
+        [r(m3),rd(m3),rdd(m3)]=reference(2,t(m3)-20,.5);
+        osc=.025*sin(2*pi*.73*t+o.wallphase);
+        wall=o.wallx+osc; wv=.025*2*pi*.73*cos(2*pi*.73*t+o.wallphase);
+        wall(m1)=wall(m1)+.24*exp(-t(m1)/.25);
+        wv(m1)=wv(m1)-.24/.25*exp(-t(m1)/.25);
+        wall(m3)=wall(m3)+.24*exp(-(t(m3)-20)/.25);
+        wv(m3)=wv(m3)-.24/.25*exp(-(t(m3)-20)/.25);
+        wc=300*(double(m1)+double(m3));
     else
         wc=repmat(300,n,1);
     end
@@ -196,7 +212,7 @@ pr=struct('xh',x,'vh',0.,'lp',0.,'lp2',0.,'errlp',0.,'buf',[],'yf',x,'vf',0., ..
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
     'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0, ...
     'stall_ticks',0, ...
-    'vlp',0.,'pass_run',0,'r_prev',x,'nsign',0.,'unload',0);
+    'vlp',0.,'pass_run',0,'press_run',0,'r_prev',x,'nsign',0.,'unload',0);
 end
 
 function f=probe_features(pr,P)
@@ -265,6 +281,34 @@ if lead_err>0 && pr.stall_ticks>=20
     evidence=max(evidence,min(.02,lead_err*stall_w));
 end
 blocked=evidence>0;
+% A released surface also re-latches on a sustained force-domain blockage.
+% The effort/velocity product above is normalised by the load energy, and a
+% hard press inflates that energy with the very model mismatch it creates, so a
+% released surface can hide a second contact from signature (a); signature (b)
+% needs a stalled velocity estimate, which a compliant press does not provide
+% either.  The same physical event is therefore also read directly in force: a
+% sustained model residual that pushes against the tracking error and against
+% the measured innovation (1 N m at J = 0.01), while the 50 ms measured speed
+% stays low.  The innovation sign rejects the catch-up transient that follows a
+% commanded release, when the plant moves toward the reference faster than the
+% predictor expects.  Re-arming only matters once the contact memory has
+% actually decayed below the feature floor: a briefly released surface that
+% still carries its memory is already routing R3, and the commanded-unload gate
+% keeps the release from being undone.  Twenty milliseconds of agreement, the
+% same run length the stalled-velocity term requires, re-arms the surface and
+% restores the contact-memory floor, so the 10 Hz classifier routes the rebuilt
+% memory to R3 on its next frame.
+press=(pr.alp*(r-ym)<0) && (pr.lp*(r-ym)<0) && abs(pr.alp)>100 && abs(pr.vlp)<.2 ...
+    && pr.nsign~=0 && pr.contact<.01;
+if pr.free && press && ~pr.unload
+    pr.press_run=pr.press_run+1;
+else
+    pr.press_run=0;
+end
+if pr.press_run>=20
+    blocked=true;
+    evidence=max(evidence,min(.02,abs(pr.alp)/1e4));
+end
 if max(ym,r)<pr.cy-.08
     pr.retreat_s=pr.retreat_s+dt;
 else

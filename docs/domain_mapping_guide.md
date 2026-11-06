@@ -88,17 +88,19 @@ so emergency damping is not delayed by transfer smoothing.
 The two runtime-assurance layers a derived device must re-calibrate against its own reachable sets
 are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
 guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the abstention-threshold
-calibration in `auto_calibrate`: one finite-sample split-conformal 1 % lower-tail order statistic of
-the calibrated confidence, `q = min(1, ceil((N+1)*alpha)/N)`. The main benchmark applies a 0.15x
-working-point factor to that quantile, which suppresses false abstention across the wide dynamic
-envelope; the off-manifold audit runs that quantile itself with 5-frame persistence. Both layers
-remain device-specific: the envelope depends on the actuator's reachable set and detection delay, and
-the confidence threshold depends on the commissioning archive.
+calibration in `auto_calibrate`: it evaluates the calibration-confidence quantile at the finite-sample
+split-conformal level `q = min(1, ceil((N+1)*alpha)/N)` with `alpha = 0.01`, then multiplies it by the
+`0.15x` dynamic-envelope working-point factor, which suppresses false abstention across the wide dynamic
+envelope. The `off_manifold` audit instead takes the direct, non-interpolated 1 % lower-tail order
+statistic `sorted_conf[ceil(0.01*N)-1]` (the 2nd-smallest of 199 independent nominal frames) plus
+5-frame persistence. Both layers remain device-specific: the envelope depends on the actuator's
+reachable set and detection delay, and the confidence threshold depends on the commissioning archive.
 
 派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
 加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与 `auto_calibrate` 的
-弃权阈值标定：同一个 1% 有限样本分裂共形下尾顺序统计量 `q = min(1, ceil((N+1)α)/N)`。主基准
-再乘 0.15x 工作点系数，在宽动态包络下抑制虚警；流形外审计直接运行该分位数并叠加 5 帧持续性。
+弃权阈值标定：它按有限样本分裂共形水平 `q = min(1, ceil((N+1)α)/N)`（α = 0.01）取标定置信度分位数，
+再乘 `0.15x` 动态包络工作点系数，在宽动态包络下抑制虚警；流形外审计则直接取无插值的 1% 下尾顺序
+统计量 `sorted_conf[ceil(0.01*N)-1]`（199 个独立标称帧中的第 2 小样本），并叠加 5 帧持续性。
 两者都与设备相关：包络取决于执行器可达集与检测延迟，置信度阈值取决于标定档案。
 
 ## Three parallel examples / 三类并列实例
@@ -124,9 +126,10 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 1. Define the signals, units, nominal model, controller bank and explicit fallback.
 2. Collect labeled macro-feature windows for `auto_calibrate(samples, labels)`.
-3. Freeze prototypes, distance-decay coefficient and the confidence trip/clear levels (one
-   split-conformal 1 % lower-tail order statistic; the main benchmark applies a 0.15x working-point
-   factor, the off-manifold audit uses the quantile itself).
+3. Freeze prototypes, distance-decay coefficient and the confidence trip/clear levels (the main
+   benchmark uses `auto_calibrate`'s finite-sample split-conformal quantile
+   `q = min(1, ceil((N+1)*alpha)/N)` times the 0.15x working-point factor; the off-manifold audit uses
+   the direct order statistic `sorted_conf[ceil(0.01*N)-1]` instead).
 4. Run `auto_field_tune(evaluate, current)` with a device-side safe trial callback.
 
 The callback returns measured cost and constraint validity. Invalid candidates are rejected;
@@ -142,7 +145,7 @@ A new physical domain starts with a new interface and commissioning archive.
 
 1. 定义信号、单位、标称模型、控制器组与显式回退。
 2. 采集带标签的宏观特征窗口，调用 `auto_calibrate(samples, labels)`。
-3. 冻结原型、距离衰减系数与置信度触发/清除水平（同一个 1% 分裂共形下尾顺序统计量；主基准再乘 0.15x 工作点系数，流形外审计直接使用该分位数）。
+3. 冻结原型、距离衰减系数与置信度触发/清除水平（主基准使用 `auto_calibrate` 的有限样本分裂共形分位数 `q = min(1, ceil((N+1)α)/N)` 再乘 0.15x 工作点系数；流形外审计则直接使用顺序统计量 `sorted_conf[ceil(0.01*N)-1]`）。
 4. 挂上设备侧的安全试验回调，运行 `auto_field_tune(evaluate, current)`。
 
 回调返回实测代价与约束是否满足：约束不合格的候选直接淘汰；全部候选都不合格时，

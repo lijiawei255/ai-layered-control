@@ -211,11 +211,7 @@ Measure target execution time separately from host ctypes call time.
 supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_clear)`.
 The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
 windows into 15 statistical scalars (three 4-D prototypes, gamma, confidence trip and confidence
-clear). Both confidence thresholds come from one split-conformal rule: the 1 % lower-tail order statistic of
-the calibrated confidence, `q = min(1, ceil((N+1)*alpha)/N)`. The main benchmark applies a 0.15x
-working-point factor to that quantile, which keeps the 36-window archive from false abstention across
-the S1-S4 dynamic envelope; the off-manifold audit runs the 1 % quantile directly with 5-frame
-persistence (99.5 % detection, zero false vetoes on independent nominal probes).
+clear). Both confidence thresholds come from one calibration: `auto_calibrate` takes the calibrated-confidence quantile at the finite-sample split-conformal level `q = min(1, ceil((N+1)*alpha)/N)` with `alpha = 0.01`, then multiplies it by the `0.15x` dynamic-envelope working-point factor, which keeps the 36-window archive from false abstention across the S1-S4 dynamic envelope. The `off_manifold` audit instead takes, over its 199 independent nominal frames, the direct, non-interpolated 1 % lower-tail order statistic `sorted_conf[ceil(0.01*N)-1]` (the 2nd-smallest sample) and applies 5-frame persistence (99.5 % detection, zero false vetoes on independent nominal probes).
 Freeze the resulting prototypes and confidence parameters before unit-to-unit adaptation.
 
 ### Step 4 — Tune the physical knobs
@@ -234,9 +230,12 @@ veto fraction and R4 occupancy limits. Candidate validity is additionally checke
 Benchmark reproduction note: The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
 forward drift 0.50, cross mismatch (J +40%, b −30%) and reverse mismatch (J, b, fc, fs −25%) — and the
 accepted B3 tuples, together with their search and mission metrics, are identical in Python and MATLAB. The
-B2 and B2+C99-Gate rows can differ at the 5e-6 level in RMSE because each engine solves the RBF normal
-equations with its own linear-algebra backend; breach counts, feasibility verdicts and every B3 row are
-identical.
+B1, B3 and both gated S4 rows match at displayed precision. The ungated B2 row can differ in its last displayed
+digits because each engine solves the RBF normal equations with its own linear-algebra backend: its S4 row
+already differed at the previous revision (Python 926 vs MATLAB 927 envelope violation ticks), and after the
+contact re-arm the same fault-path amplification widens the gap to Python 824 vs MATLAB 821 ticks and
+RMSE 0.379105 vs 0.378658, while B2 S1–S3, both gated rows and every B3 row match. All feasibility verdicts
+are identical.
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
 Gain and damping must lie in [0.10,4.0] and safety margin in [0.10,1.0], so tuning can only tighten

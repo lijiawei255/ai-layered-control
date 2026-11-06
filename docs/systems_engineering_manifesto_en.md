@@ -213,7 +213,7 @@ fault-frequency input. Noise, context delay and contact stiffness should have in
 The comparison keeps the baselines at full strength. B1 and B3 share the identical nominal
 inverse-dynamics feedforward, anti-windup and limits, and B1's S2 result remains the lowest raw error
 in the table. B2 runs its action head at the full 1 kHz rate (40,000 inferences, zero fast-loop
-state delay); with its clamped error-integral history feature but no external deterministic PID stabilizer, and no physical gate, it carries larger S2 error, 65.61 N S3 contact and 680 S4 violation ticks. The rule tree and the prototype classifier agree on the main
+state delay); with its clamped error-integral history feature but no external deterministic PID stabilizer, and no physical gate, it carries larger S2 error, 65.71 N S3 contact and 824 S4 violation ticks. The rule tree and the prototype classifier agree on the main
 S1/S2/S3/S4 results, including the 19.9 N S3 contact peak, but in the off-manifold case the rule tree
 cannot abstain. The layered branch records S4 RMSE 0.534138 rad with TV 1528.1 N·m and zero S4
 violations, while B1 keeps the lower raw S2 error; these observations define the interpretation of
