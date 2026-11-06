@@ -755,7 +755,7 @@ class Probe:
         self.lp2 = self.errlp = self.biaslp = 0.0
         self.xh = self.y1 = self.y2 = self.yold = self.yolder = self.yf = x
         self.cy, self.free, self.buf, self.apbuf = 1.0, 0, [], []
-        self.retreat_s = self.stall_ticks = self.block_run = 0.0
+        self.retreat_s = self.stall_ticks = 0.0
         # Position-free release state: a 50 ms low-pass measured velocity gates
         # the "passed the remembered contact point under its own speed" test,
         # pass_run times that sustained crossing, and nsign is the sign of the
@@ -764,6 +764,7 @@ class Probe:
         self.vlp = self.pass_run = 0.0
         self.r_prev = x
         self.nsign = 0.0
+        self.unload = False
 
     def step(self, y, u, r):
         previous_position = self.y2
@@ -822,7 +823,6 @@ class Probe:
         self.unload = self.free and apart and self.nsign * self.vlp <= 0.0
         stall = 1.0 / (1.0 + (self.vf / 0.05) ** 2)
         self.stall_ticks = self.stall_ticks + 1 if abs(self.vf) < 0.05 else 0
-        track_err = abs(r - ym)
         lead = abs(self.errlp) - 0.03
         evidence = 0.0
         if self.power > .10 and ratio > .03 and not self.unload:
@@ -835,7 +835,6 @@ class Probe:
             # surface release engaged.
             evidence = max(evidence, min(0.02, lead * stall))
         blocked = evidence > 0.0
-        self.block_run = self.block_run + 1 if blocked else 0
         self.retreat_s = self.retreat_s + DT if max(ym, r) < self.cy - .08 else 0.0
         if blocked:
             self.cy = ym

@@ -21,11 +21,11 @@
  *
  * One step, in this order:
  *   0. split firewall             bad fast/config holds; bad mailbox/tuning runs R4
+ *   0b. local frame lease         outer_seq ages the slow frame on the L1 clock
  *   1. safety envelope veto       sticky signed look-ahead, latches ENVELOPE_BREACH
  *   2. OOD residual veto          sticky, latches OOD_RESIDUAL
  *   3. confidence / abstention    sticky latch, latches LOW_CONFIDENCE
- *   3b. local frame lease         outer_seq ages the slow frame on the L1 clock
- *   3c. cumulative fault latch    safety/OOD episode count -> permanent R4
+ *   3b. cumulative fault latch    safety/OOD episode count -> permanent R4
  *   4. heartbeat watchdog         bounded closed-loop R4 grace, then safe zero
  *   5. dwell timer + post-fault recovery cooldown for the normal AI regime
  *   6. controller bank (+ deterministic feedforward u_ff), tracking

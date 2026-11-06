@@ -47,7 +47,7 @@
 - **慢环盲区、瞬态、链路中断。** 10 Hz 环最多盲 100 ms，脉冲与换向边沿污染新息，现场总线可能卡死。32 B 1 kHz 探针、`blanking_active` 冻结保持、`outer_seq` 本地时钟租约与有界 HOLD → `GATE_SAFE_ZERO` 补齐。
 - **裸机资源与追责。** 固定 RAM、无分配器；事故需要因果证据。96 B 零堆 C99 内核保留 7 位粘滞审计掩码，三次严重故障后锁存 `GATE_LATCHED_SAFE`，直到显式确认。
 
-分工是标定出来的：慢环置信度阈值来自有限样本分裂共形 1% 下尾顺序统计量 `q = min(1, ceil((N+1)(1−α))/N)`；`auto_calibrate` 再乘 0.15x 动态包络工作点系数，把触发点压到本基准 S1–S4 宽包络所需的位置以抑制虚警；`off_manifold` 专项审计直接运行该分位数并叠加 5 帧持续性（99.5% 检出、独立标称数据 0 误否决）。25 ms 带符号前瞻即 `h = x_max − |x|` 的一维 ZCBF 边界条件 `h_dot + h/T >= 0`。16,000 条标签是仿真实验设置，用来量化密集采样的工程代价，不是实测机时。
+分工是标定出来的：慢环置信度阈值来自有限样本分裂共形 1% 下尾顺序统计量 `q = min(1, ceil((N+1)α)/N)`；`auto_calibrate` 再乘 0.15x 动态包络工作点系数，把触发点压到本基准 S1–S4 宽包络所需的位置以抑制虚警；`off_manifold` 专项审计直接运行该分位数并叠加 5 帧持续性（99.5% 检出、独立标称数据 0 误否决）。25 ms 带符号前瞻即 `h = x_max − |x|` 的一维 ZCBF 边界条件 `h_dot + h/T >= 0`。16,000 条标签是仿真实验设置，用来量化密集采样的工程代价，不是实测机时。
 
 **推理带宽不等于执行权限：** 每秒计算一千次动作（1 kHz 推理带宽）并不使学习策略安全到可以掌握执行器：其输出仍只是缺乏物理保障的动作提议。执行权限意味着每一毫秒守在执行器入口，维护反馈不变量、反向追踪抗积分饱和、硬幅值/斜率限幅与独立否决兜底。本仓库提供的正是这样一道设备侧 AI 控制权限软件网关：慢环只回答“哪个档位？”（`1..3`）或“弃权”（`4`）；独立探针从时间对齐的标称模型新息与测量尖峰中导出否决证据；**仅 96 字节状态、零动态分配的 ANSI C99 内核**掌握 1 kHz 指令、闭环兜底与物理整定旋钮。监督器可以更换，执行契约保持不变。这条网关对慢环 AI 实施**四重零信任防线**：**接口与数值零信任**——慢环不能触碰执行器指令 `u` 或确定性前馈 `u_ff`，只能提交档位建议 `1..4`，而分割式输入防火墙对慢环字段中的任何 `NaN/±Inf`、越界档位或序号异常置位 `corrupted = 1`，并强制闭环 R4；**时间零信任**——传输帧龄 `outer_age_s` 从不被盲信，启用 `outer_seq` 后 1 kHz 内核用自己的时钟计量帧租约，因此卡死或被伪造的帧龄无法掩盖通信停滞；**物理零信任**——哪怕慢环输出满分置信度（`1.0`），只要 32 B 独立物理残差探针或 25 ms 相平面包络前瞻越过阈值，就在当前 1 ms tick 内被否决并替换为 R4；**恢复零信任**——故障消除或人工 `Layered_AcknowledgeFaultLatch` 解锁后，AI 无法在下一 tick 立即重掌控制权，必须通过 300 ms 干净恢复冷却与 150 ms 驻留抗抖检验。
 
@@ -131,7 +131,7 @@ flowchart TB
 | 代码 | 门控状态 | 行为 |
 | :---: | :--- | :--- |
 | 0 | `GATE_NORMAL` | 接受 AI 档位；所选控制律库在整定增益与确定性前馈下运行。 |
-| 1 | `GATE_HOLD_LATENCY` | 慢环数据帧超时且快环传感器有效时，1 kHz 闭环按固定 **R4 阻尼律**退守；快环输入不可用子情形（`GATE_HOLD_SENSOR`）冻结并保持上一拍安全指令。保持的是执行器指令，而非机械位置。 |
+| 1 | `GATE_HOLD_LATENCY` | 慢环数据帧超时且快环传感器有效时，1 kHz 闭环按固定 **R4 阻尼律**退守；快环输入不可用子情形（仍报告 GATE_HOLD_LATENCY，同时置位 corrupted = 1 与 NAN_CORRUPTION）冻结并保持上一拍安全指令。保持的是执行器指令，而非机械位置。 |
 | 2 | `GATE_VETO_OOD_RESIDUAL` | 物理新息超过阈值；残差否决锁存，直到低于清除比例。 |
 | 3 | `GATE_VETO_LOW_CONFIDENCE` | 置信度低于阈值，或显式 `ai_regime = 4` 弃权；只能由可信的正常档位清除。 |
 | 4 | `GATE_VETO_SAFETY_ENVELOPE` | 实测或预测状态触及包络；持续保持直至状态与预测均低于清除比例。 |
@@ -475,9 +475,9 @@ python python_bench/run_benchmark.py
 python python_bench/run_benchmark.py --no-c
 python python_bench/run_benchmark.py --selftest
 python python_bench/minimal_template.py
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
 .\c99_layered_core\test_gatekeeper_standalone.exe
-gcc -std=c99 -pedantic -Wall -Wextra -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
 .\c99_layered_core\gate_template.exe
 ```
 

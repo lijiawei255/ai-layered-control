@@ -212,7 +212,7 @@ supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_
 The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
 windows into 15 statistical scalars (three 4-D prototypes, gamma, confidence trip and confidence
 clear). Both confidence thresholds come from one split-conformal rule: the 1 % lower-tail order statistic of
-the calibrated confidence, `q = min(1, ceil((N+1)(1-alpha))/N)`. The main benchmark applies a 0.15x
+the calibrated confidence, `q = min(1, ceil((N+1)*alpha)/N)`. The main benchmark applies a 0.15x
 working-point factor to that quantile, which keeps the 36-window archive from false abstention across
 the S1-S4 dynamic envelope; the off-manifold audit runs the 1 % quantile directly with 5-frame
 persistence (99.5 % detection, zero false vetoes on independent nominal probes).
@@ -274,10 +274,10 @@ a user's engineering changes on the grounds that they violate the reference arch
 
    | Orthogonal slice | Source location | State / ABI footprint | Standalone contract |
    | :--- | :--- | :--- | :--- |
-   | `outer_seq` local-clock frame lease | `layered_gatekeeper.c` Duty 4 | `last_outer_seq`, `lease_age_ticks` | Detects stalled/forged slow mailboxes and zero-sequence corruption on the 1 kHz clock |
+   | `outer_seq` local-clock frame lease | `layered_gatekeeper.c` Duty 4 | `last_outer_seq`, `outer_age_ticks` | Detects stalled/forged slow mailboxes and zero-sequence corruption on the 1 kHz clock |
    | `blanking_active` artifact-blanking probe | `gate_template.c` `LayeredProbe_Step` | 32 B `LayeredProbe_t` | Freezes median/high-pass states and holds the pre-blanking residual during stimulation/commutation pulses |
-   | Four-bank reverse tracking anti-windup | `layered_gatekeeper.c` Duty 7 | `integ[4]` | Active bank back-calculates before blend; inactive banks track applied `u_prev` for bumpless switching |
-   | Signed 1D ZCBF look-ahead + binary32 TwoSum slew limiter | `layered_gatekeeper.c` Duty 1 & 7 | stateless / `u_prev` | Direction-aware braking envelope `\|x + T*x_dot\| <= x_max` and 1-ULP monotone ramp-to-zero without `double` |
+   | Four-bank reverse tracking anti-windup | `layered_gatekeeper.c` Duty 7 | `integ[4]` | Active bank back-calculates before blend; inactive banks track applied `u_applied` for bumpless switching |
+   | Signed 1D ZCBF look-ahead + binary32 TwoSum slew limiter | `layered_gatekeeper.c` Duty 1 & 7 | stateless / `u_applied` | Direction-aware braking envelope `\|x + T*x_dot\| <= x_max` and 1-ULP monotone ramp-to-zero without `double` |
    | Three-episode ratchet latch & 7-bit fault audit | `layered_gatekeeper.c` Duty 8 & `Layered_AcknowledgeFaultLatch` | `latch_episode_count`, `fault_audit_bitmask` | Rising-edge episode counting into `GATE_LATCHED_SAFE` with cooldown re-arming |
 
 3. **The benchmark fixture does not constrain interface adaptation.** The 1-DOF rotary motor, the

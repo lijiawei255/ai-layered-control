@@ -195,7 +195,7 @@ pr=struct('xh',x,'vh',0.,'lp',0.,'lp2',0.,'errlp',0.,'buf',[],'yf',x,'vf',0., ..
     'me',0.,'mu',0.,'hf',0.,'sp',0.,'power',0.,'load_energy',0.,'contact',0., ...
     'slowenergy',0.,'veto',0.,'y1',x,'y2',x,'yold',x,'yolder',x, ...
     'a1',0.,'a2',0.,'alp',0.,'ae',0.,'apbuf',[],'cy',1.,'free',0,'retreat_s',0, ...
-    'stall_ticks',0,'block_run',0, ...
+    'stall_ticks',0, ...
     'vlp',0.,'pass_run',0,'r_prev',x,'nsign',0.,'unload',0);
 end
 
@@ -265,7 +265,6 @@ if lead_err>0 && pr.stall_ticks>=20
     evidence=max(evidence,min(.02,lead_err*stall_w));
 end
 blocked=evidence>0;
-if blocked, pr.block_run=pr.block_run+1; else, pr.block_run=0; end
 if max(ym,r)<pr.cy-.08
     pr.retreat_s=pr.retreat_s+dt;
 else

@@ -89,7 +89,7 @@ The two runtime-assurance layers a derived device must re-calibrate against its 
 are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
 guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the abstention-threshold
 calibration in `auto_calibrate`: one finite-sample split-conformal 1 % lower-tail order statistic of
-the calibrated confidence, `q = min(1, ceil((N+1)(1-alpha))/N)`. The main benchmark applies a 0.15x
+the calibrated confidence, `q = min(1, ceil((N+1)*alpha)/N)`. The main benchmark applies a 0.15x
 working-point factor to that quantile, which suppresses false abstention across the wide dynamic
 envelope; the off-manifold audit runs that quantile itself with 5-frame persistence. Both layers
 remain device-specific: the envelope depends on the actuator's reachable set and detection delay, and
@@ -97,7 +97,7 @@ the confidence threshold depends on the commissioning archive.
 
 派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
 加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与 `auto_calibrate` 的
-弃权阈值标定：同一个 1% 有限样本分裂共形下尾顺序统计量 `q = min(1, ceil((N+1)(1−α))/N)`。主基准
+弃权阈值标定：同一个 1% 有限样本分裂共形下尾顺序统计量 `q = min(1, ceil((N+1)α)/N)`。主基准
 再乘 0.15x 工作点系数，在宽动态包络下抑制虚警；流形外审计直接运行该分位数并叠加 5 帧持续性。
 两者都与设备相关：包络取决于执行器可达集与检测延迟，置信度阈值取决于标定档案。
 
