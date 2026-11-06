@@ -28,19 +28,19 @@ for j=1:3, prototypes(j,:)=mean(samples(labels==j,:),1); end
 d=zeros(size(samples,1),3);
 for j=1:3, d(:,j)=sqrt(sum((samples-prototypes(j,:)).^2,2)); end
 d=sort(d,2);
-% Finite-sample split-conformal order used by the Python supervisor:
+% Finite-sample split-conformal level used by the Python supervisor:
 %   level(a) = min(1, ceil((n+1)*a)/n)
-% so np.quantile(x, level(a)) reads an order statistic that a finite
-% calibration set can actually support.  linear_quantile() keeps numpy's linear
-% interpolation, so both engines read the same value.
+% np.quantile(x, level(a)) returns the linearly interpolated quantile at that
+% level, so a finite calibration set can support it.  linear_quantile() keeps
+% numpy's linear interpolation, so both engines read the same value.
 n=size(samples,1);
 level=@(a) min(1,ceil((n+1)*a)/n);
 gamma=1/max(linear_quantile(d(:,1),level(.95)),1e-6);
 score=(d(:,2)-d(:,1))./(d(:,2)+d(:,1)+1e-9).*exp(-gamma*d(:,1));
-% The Python supervisor's auto_calibrate() returns the raw 0.15x quantile trip
-% (the dynamic-envelope working-point factor on the split-conformal 1 % order
-% statistic) and the same capped 1.05x clear rule the off-manifold audit uses;
-% the MATLAB mirror must publish exactly the same pair so both engines veto on
+% The Python supervisor's auto_calibrate() returns trip = 0.15 * the linearly
+% interpolated confidence quantile at level(.01) (the dynamic-envelope
+% working-point factor) and the same capped 1.05x clear rule the off-manifold
+% audit uses; the MATLAB mirror publishes the same pair so both engines veto on
 % the same confidence level.
 trip=0.15*linear_quantile(score,level(.01));
 clear=min(0.999,1.05*trip);

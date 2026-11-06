@@ -41,8 +41,8 @@ for j=1:numel(conds)
     b1_valid=cellfun(@(a) a.valid,b1_candidates);
     b1_valid_candidates=sum(b1_valid);
     b1_costs=cellfun(@(a) a.score,b1_candidates); [~,best_b1]=min(b1_costs);
-    % The lowest-cost candidate overall is reported honestly: it is the Figure-2
-    % counterfactual, not an accepted tuning.  No expected knob value is baked in.
+    % Figure 2 reports the lowest-cost B1 candidate across the full search grid;
+    % candidate feasibility is reported separately.
     b1_knobs=b1_candidates{best_b1}.knobs;
     valid=struct('scenario',1,'duration',6,'seed',811,'drift',fx.drift, ...
         'ood',false,'amplitude',.43, ...
@@ -68,7 +68,7 @@ for j=1:numel(conds)
         'b1_best_mission',b1_mission.metrics,'b1_best_constraints',constraints(b1_mission,4), ...
         'candidates',{candidates},'b1_candidates',{b1_candidates}, ...
         'search_cost_before',candidates{2}.score,'search_cost_after',candidates{chosen}.score, ...
-        'search_seconds',240,'paired_validation_seconds',12,'mission_validation_seconds',40, ...
+        'search_seconds',300,'paired_validation_seconds',12,'mission_validation_seconds',40, ...
         'compute_seconds',toc(started));
 end
 p=P.policy; E.model_scalars=numel(p.mu)+numel(p.sd)+numel(p.centers)+numel(p.w)+1;
@@ -164,9 +164,8 @@ for j=1:numel(E.tuning), force(j,:)=[E.tuning(j).mission.peak_contact(3,3),E.tun
 hb=bar(force); hold on; yline(20,':r','Contact budget','HandleVisibility','off'); grid on;
 set(gca,'XTickLabel',labels); xlabel('Device mismatch condition');
 ylabel('S3 peak contact force [N]');
-% Cover the largest counterfactual bar instead of clipping it: the lowest-cost
-% gated-B1 candidate can exceed the regular 0..100 N band.  Bars above that band
-% carry their value, so a tall column can never be read as a clipped one.
+% Use a 220 N minimum axis ceiling and 10% headroom above peaks over 200 N.
+% Label bars above 100 N with their contact-force values.
 ylim([0 220]);
 peak=max(force(:));
 if peak>200, ylim([0 1.1*peak]); end

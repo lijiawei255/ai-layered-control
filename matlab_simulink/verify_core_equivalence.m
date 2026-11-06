@@ -25,9 +25,8 @@ infile=fullfile(tmp,'trace.txt'); outfile=fullfile(tmp,'output.txt');
 exe=fullfile(tmp,'replay'); if ispc, exe=[exe,'.exe']; end
 [status,msg]=system(sprintf('"%s" -std=c99 -O2 -o "%s" "%s" "%s"',compiler,exe,core,harness));
 assert(status==0,'verify_core_equivalence:compile','C replay compilation failed: %s',msg);
-% Primary replay: the full closed loop with the legacy (unsequenced) mailbox.
-% The header carries the commissioned max_hold_ticks / latch budget, so the
-% replay exercises the default 100-tick HOLD bound instead of a harness guess.
+% Primary replay uses transport-age mailbox timing.  The trace header carries
+% max_hold_ticks and the fault-latch budget from the commissioned configuration.
 opts.branches=3; opts.log_core=true; out=sim_core_engine(P,opts);
 report=replay_group(out,infile,outfile,exe);
 report.status='pass';

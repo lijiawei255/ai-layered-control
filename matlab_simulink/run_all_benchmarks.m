@@ -116,9 +116,8 @@ assert(all(isfinite(M.rmse(:))) && M.rmse(2,1)<.01,'Nominal B2 tracking failed.'
 assert(D.lcg_last==.16194512567017227,'LCG sequence differs.');
 assert(D.counter_bounds,'Counter saturation boundaries failed.');
 fprintf('[1] Equal 1 kHz action rate, nominal tracking and actuator bounds: PASS\n');
-% Physical safety of the deterministic layer: no envelope breach, contact within
-% budget and no permanent latch for B3 (functional/physical checks only; the
-% comparative outcome of every branch is reported, never asserted).
+% B3 mission acceptance requires zero envelope breaches, contact below 20 N and
+% no permanent latch during the four-stage mission.
 assert(all(M.violations(3,:)==0),'B3 state-envelope breach failed.');
 assert(M.peak_contact(3,3)<20,'B3 S3 contact budget failed.');
 assert(sum(main.b3.gate(main.stage==3)==6)==0,'B3 latched safe during the nominal mission.');
@@ -268,12 +267,12 @@ for seed=0:4
         'b3_detection_frames',det,'rules_retreat_rate',rr, ...
         'b3',off_row(z_b3),'no_conf',off_row(z_no),'rules',off_row(z_rules));
     rows(seed+1)=row;
-    % Honest in-box property: the coupled load bias keeps most single-dimension
-    % frames inside the data-derived box, so the range rule rarely retreats.
+    % At least 90% of feature frames must remain inside the empirical support
+    % box; the range-rule R4 occupancy must remain below 10%.
     assert(row.in_box_fraction>=.90,sprintf('Off-manifold frame %.3f is outside the empirical box.',row.in_box_fraction));
     assert(row.rules_retreat_rate<.10,'The range rule retreated inside its data-derived support box.');
     % The joint manifold detector must detect the coupled load bias at a far
-    % higher frame rate than the single-dimension range rule.
+    % higher detection fraction than the single-dimension range rule.
     assert(row.b3_detection_frames>.80,'The manifold detector missed the coupled load bias.');
     assert(row.b3_detection_frames>max(5*row.rules_retreat_rate,.50),'Manifold detection did not beat the range rule.');
     assert(row.b3.low_confidence_ticks>0,'The manifold detector never abstained on the off-manifold fixture.');
@@ -314,7 +313,7 @@ function R=contact_memory_audit(P,name)
 % fixture); 'retreat' keeps the wall in place while the reference returns to
 % zero (30 s fixture), so only physical retreat can release the remembered
 % contact; 'repeat' returns to the S3 reference (30 s fixture), so a surface
-% released by the S1 retreat must re-arm and hold the 20 N budget again.
+% released during the wall-free S1 interval must re-arm and hold the 20 N budget again.
 if strcmp(name,'reverse')
     R=contact_memory_stats(P,name,20,18);
     assert(R.s3_peak_N<20,'Reverse S3->S1 peak contact exceeded the 20 N budget.');
@@ -326,7 +325,7 @@ elseif strcmp(name,'repeat')
         'Repeated contact re-arm exceeded the 20 N budget.');
     assert(R.first_r3_rate>.90 && R.second_r3_rate>.90, ...
         'Repeated contact did not route R3 on both contacts.');
-    assert(R.release_s<0.35,'The repeated-contact S1 release was not physical.');
+    assert(R.release_s<0.35,'Repeated-contact S1 release exceeded 0.35 s.');
 else
     R=contact_memory_stats(P,name,30,25);
     assert(R.release_s<0.50,'The contact memory did not release within 0.50 s of physical retreat.');

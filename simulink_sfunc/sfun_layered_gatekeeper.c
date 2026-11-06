@@ -497,12 +497,12 @@ static real_T lg_sfun_sample_time(SimStruct *S)
 /* Simulink callbacks                                                        */
 /* ========================================================================= */
 
-/* MDL_CHECK_PARAMETERS must be defined unconditionally, before simulink.c is
- * included: the wrapper only registers the callback when the macro is defined,
- * and no standard mex build predefines it.  Guarding this #define with its own
- * #ifdef (as an earlier revision did) leaves the callback out of the build, so
- * the block parameters are then validated only at start instead of also on
- * model update. */
+/* Define MDL_CHECK_PARAMETERS before including simulink.c so the
+ * S-function registers the parameter-validation callback.
+ * The callback validates the block parameters during model update.
+ * mdlStart repeats the same validation before the first sample.
+ * Both entry points use the same parameter readers and acceptance rules.
+ */
 #define MDL_CHECK_PARAMETERS
 static void mdlCheckParameters(SimStruct *S)
 {

@@ -100,9 +100,9 @@ blend filter; inactive banks track the applied command.
 Dwell, latency and diagnostic counters saturate at UINT32_MAX; they never wrap.
 `blend_alpha` smooths the controller target on every control tick after initialization;
 it is not a switch-only filter. Magnitude limiting comes before hardware slew limiting.
-While a veto is active, or the permanent latch is set with the active regime at R4, the blend filter is
-bypassed: the target is the raw R4 output and `blend = 1.0`, so the emergency damping response carries no
-first-order phase lag. Magnitude and slew limits still apply.
+While a veto is active, or while `gate == GATE_HOLD_LATENCY` or the permanent latch is set with the
+active regime at R4, the blend filter is bypassed: the target is the raw R4 output and `blend = 1.0`, so
+the emergency damping response carries no first-order phase lag. Magnitude and slew limits still apply.
 Nominal feedforward is deterministic and is shared by the B1/B3 normal banks.
 R4 always uses a zero reference, fixed bank gains and no feedforward, independently of field tuning.
 Its integral and anti-windup act on the same zero-state error; `ff_scale[3]` is ignored.
@@ -211,7 +211,7 @@ Measure target execution time separately from host ctypes call time.
 supply every class. It returns `(prototypes, gamma, confidence_trip, confidence_clear)`.
 The reference calibration uses short measured closed-loop probes, then samples 36 labeled macro
 windows into 15 statistical scalars (three 4-D prototypes, gamma, confidence trip and confidence
-clear). Both confidence thresholds come from one calibration: `auto_calibrate` takes the calibrated-confidence quantile at the finite-sample split-conformal level `q = min(1, ceil((N+1)*alpha)/N)` with `alpha = 0.01`, then multiplies it by the `0.15x` dynamic-envelope working-point factor, which keeps the 36-window archive from false abstention across the S1-S4 dynamic envelope. The `off_manifold` audit instead takes, over its 199 independent nominal frames, the direct, non-interpolated 1 % lower-tail order statistic `sorted_conf[ceil(0.01*N)-1]` (the 2nd-smallest sample) and applies 5-frame persistence (99.5 % detection, zero false vetoes on independent nominal probes).
+clear). Both confidence thresholds come from one calibration: `auto_calibrate` scales the 1 % empirical lower-tail confidence quantile by the `0.15x` dynamic-envelope working-point factor, which suppresses false abstention across the S1-S4 dynamic envelope.
 Freeze the resulting prototypes and confidence parameters before unit-to-unit adaptation.
 
 ### Step 4 — Tune the physical knobs
@@ -224,18 +224,12 @@ Constrain contact force, gate-veto fraction and R4 occupancy, and repeat those c
 The helper rejects invalid or nonfinite scores and retains `current` when all candidates fail.
 Evaluate six fixed joint (gain, damping) candidates: (0.75,1), (1,1), (1.25,1), (2,1),
 (1.25,0.5), (1.25,0.75). Each pair is evaluated independently under the same constraints.
-The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
+The benchmark evaluates six full 40 s missions plus six 10 s wall-phased contact probes per branch/unit (300 s of search trajectories).
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
 veto fraction and R4 occupancy limits. Candidate validity is additionally checked on an independently wall-phased 10 s S3 contact probe, and independent validation adds two 6 s S2 runs and a 40 s mission. Device trajectory time and host simulation time are separate quantities.
-Benchmark reproduction note: The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
-forward drift 0.50, cross mismatch (J +40%, b −30%) and reverse mismatch (J, b, fc, fs −25%) — and the
-accepted B3 tuples, together with their search and mission metrics, are identical in Python and MATLAB. The
-B1, B3 and both gated S4 rows match at displayed precision. The ungated B2 row can differ in its last displayed
-digits because each engine solves the RBF normal equations with its own linear-algebra backend: its S4 row
-already differed at the previous revision (Python 926 vs MATLAB 927 envelope violation ticks), and after the
-contact re-arm the same fault-path amplification widens the gap to Python 824 vs MATLAB 821 ticks and
-RMSE 0.379105 vs 0.378658, while B2 S1–S3, both gated rows and every B3 row match. All feasibility verdicts
-are identical.
+Benchmark reproduction note: Python and MATLAB use the same four commissioned conditions and acceptance
+criteria; the accepted B3 tuples and all feasibility verdicts are identical. The single ungated-B2 S4
+numerical difference is documented in [README §3.3](README.md#33-frozen-ai-field-tuned-hardware).
 The safety-margin knob stays fixed during this search; its limit comes from the device contract.
 The three knobs remain `gain_scale / damping_scale / safety_margin_scale`.
 Gain and damping must lie in [0.10,4.0] and safety margin in [0.10,1.0], so tuning can only tighten
@@ -312,7 +306,8 @@ When porting to target hardware, resolve these three configuration points before
    logical lease; on a bare-metal MCU use double buffering, interrupt-disabled copy or atomic
    publication ordering so the 1 kHz interrupt cannot tear the slow-loop mailbox. When C-side struct
    fields are added or removed, update the Python `ctypes` binding, and re-verify the binary32
-   TwoSum slew-limiter rounding on single-precision FPU MCUs.
+   TwoSum slew-limiter rounding on single-precision FPU MCUs. The target compiler must disable FMA
+   contraction (`-ffp-contract=off`, `FLT_EVAL_METHOD == 0`).
 
 #### Bilingual terminology bridge for Chinese prompts
 
@@ -340,15 +335,13 @@ or a coordinated device fallback. In this reference benchmark, keep the single-a
 Compute `outer_age_s = now - source_timestamp` on every fast tick.
 A nonfinite or out-of-range regime, confidence or age marks the mailbox corrupt and runs R4;
 the envelope and residual checks retain priority, with valid sensors driving the closed loop.
-The reference timeout is 350 ms. Once stale, the adapter sends an explicit R4 with confidence zero
-while preserving the real age. This selects the deterministic fallback and also records latency.
-A fresh frame restores eligibility only after the core's clean recovery cooldown, 300 ms here.
-With a non-zero `outer_seq`, the core ages the frame on its own clock, so a stalled producer or a forged
-age cannot mask the timeout. A sequence that falls back to zero is treated as corruption, not as a
-fresh frame. A stale slow mailbox with healthy fast sensors reports `GATE_HOLD_LATENCY`, sets
-`LATENCY_TIMEOUT`, and keeps the measured 1 kHz loop closed on the fixed R4 law for up to
-`max_hold_ticks`; only an unusable fast input holds the last applied command open-loop. Do not
-describe a held torque, current or stimulation command as a held physical state.
+The reference timeout is 350 ms; the adapter forwards `outer_age_s` and `outer_seq` unchanged, and the
+1 kHz core executes the timeout. `GATE_HOLD_LATENCY` sets `LATENCY_TIMEOUT` and keeps the measured loop
+closed on the fixed R4 law for up to `max_hold_ticks`; only an unusable fast input holds the last applied
+command open-loop. A fresh frame restores eligibility only after the core's clean recovery cooldown,
+300 ms here. With a non-zero `outer_seq`, the core ages the frame on its own clock, so a stalled producer
+or a forged age cannot mask the timeout; a sequence that falls back to zero is treated as corruption, not
+a fresh frame. Do not describe a held torque, current or stimulation command as a held physical state.
 Past `max_hold_ticks` the core enters `GATE_SAFE_ZERO`: target and integrators clear, the command is
 ramped to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`, and 
 `HOLD_TIMEOUT` latches. The cumulative safety/OOD latch (`GATE_LATCHED_SAFE`) is separate and
@@ -381,9 +374,9 @@ python python_bench/minimal_template.py
 python python_bench/run_benchmark.py
 python python_bench/run_benchmark.py --no-c
 python python_bench/run_benchmark.py --selftest
-gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -ffp-contract=off -O2 -o c99_layered_core/test_gatekeeper_standalone.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/test_gatekeeper_standalone.c
 .\c99_layered_core\test_gatekeeper_standalone.exe
-gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
+gcc -std=c99 -pedantic -Wall -Wextra -Wdouble-promotion -ffp-contract=off -O2 -o c99_layered_core/gate_template.exe c99_layered_core/layered_gatekeeper.c c99_layered_core/gate_template.c
 .\c99_layered_core\gate_template.exe
 matlab -batch "cd('matlab_simulink'); verify_core_equivalence"
 matlab -batch "cd('matlab_simulink'); run_all_benchmarks"
@@ -411,7 +404,7 @@ Serialize writes to the generated model. Preserve unsaved user edits in any open
 Keep the core and templates small: the Python template is 119 lines (within 100–120), the MCU template is
 120 lines (within 110–130), and the S-Function is 685 lines, a thin adapter that never re-implements the
 control law.
-Keep both auto-adaptation helpers together within 20–30 lines.
+Keep both auto-adaptation helpers compact.
 Replace superseded mechanisms instead of retaining compatibility switches or unused branches.
 For maintenance of this compact reference, prefer the existing source, configuration and documents;
 keep additions to tooling, dependencies, weights or datasets focused on the change.

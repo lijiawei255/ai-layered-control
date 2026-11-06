@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you find this reference architecture or benchmark useful in your research or engineering projects, citation using the metadata below is welcome and optional."
 type: software
 title: "ai-layered-control: A Systems-Engineering Reference Architecture for Layered Closed-Loop AI Control"
-abstract: "A fast-slow reference architecture for layered closed-loop AI control, built on strict fast/slow authority decoupling: the slow-loop AI gets no actuator authority, and the deterministic fast loop alone writes the actuator command. A 10 Hz qualitative supervisor is commissioned from 36 labeled macro-windows, calibrates 15 statistical scalars (60 B: regime prototypes, distance scale and thresholds), exposes a split-conformal manifold-distance confidence and abstains explicitly outside its manifold. The frozen supervisor is paired with a 12 B three-knob physical tuning tuple for constrained on-site calibration, and with a 1 kHz 32 B blanking residual probe that rejects broadband innovation while freezing through stimulation and commutation artifacts. A 96 B zero-dynamic-memory ANSI C99 gatekeeper owns the 1 kHz command through four anti-windup control banks, seven observable gate states, cumulative severe-fault latching and a 7-bit audit mask. Python and MATLAB/Simulink C-MEX paths replay the same frozen core, with domain interface mappings for Industrial WAAM, Edge VLA, and Closed-Loop Neuromodulation."
+abstract: "A reference architecture for AI-in-the-loop control that separates slow qualitative supervision from deterministic actuator control. A 10 Hz supervisor selects regimes or abstains using calibrated distance-based confidence. A 1 kHz ANSI C99 core applies input validation, local-clock frame leases, a 32 B residual probe that suppresses the tracking trend while retaining broadband content, independent physical vetoes, tracking anti-windup and bounded fallback without dynamic allocation. The repository provides Python and MCU integration templates, a Simulink C-MEX adapter, and reproducible Python/MATLAB mirror benchmarks, with device-interface examples for robotics, wire-arc additive manufacturing and neuromodulation."
 authors:
   - family-names: "Li"
     given-names: "Jiawei"
@@ -14,13 +14,13 @@ version: 2.0.2
 doi: 10.5281/zenodo.23911915
 date-released: "2026-11-06"
 keywords:
-  - "control-systems"
-  - "simulink"
+  - "c99"
   - "embedded-c"
+  - "matlab"
+  - "robotics"
   - "runtime-assurance"
-  - "ood-detection"
   - "simplex-architecture"
+  - "simulink"
+  - "ood-detection"
   - "neuromodulation"
-  - "python"
-  - "fast-slow-decoupling"
   - "wire-arc-additive-manufacturing"

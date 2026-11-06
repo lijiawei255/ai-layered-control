@@ -10,8 +10,8 @@ vetoes independently of the slow loop.
 
 | Module | Size | Role |
 | :--- | :--- | :--- |
-| [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 statistical scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 20 lines for both helpers) and the SLOT 1..3 integration skeleton |
-| [gate_template.c](../c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU bare-metal ISR template: 32 B `LayeredProbe_t` (median glitch rejection + cascaded high-pass innovation envelope), `blanking_active` hardware blanking window and the `outer_seq` commit-marker pattern |
+| [minimal_template.py](minimal_template.py) | 119 lines | 10 Hz qualitative small-sample calibration (`auto_calibrate`, 36 windows / 15 statistical scalars / 60 B), low-confidence abstention, frozen-AI three-knob field tuning (`auto_field_tune`, 19 lines for both helpers) and the SLOT 1..3 integration skeleton |
+| [gate_template.c](../c99_layered_core/gate_template.c) | 120 lines | 1 kHz MCU bare-metal ISR template: 32 B `LayeredProbe_t` (model-free median + cascaded high-pass innovation envelope), `blanking_active` hardware blanking window and the `outer_seq` commit-marker pattern |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B state | 1 kHz zero-dependency ANSI C99 safety arbitration and four-bank anti-windup control micro-kernel; the ABI occupies 96/140/12/40/28 B for state/config/tuning/input/output |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 lines | Level-2 C-MEX S-Function: `DWork` holds the 96 B state, zero global variables, zero dynamic memory, 11 inputs (10-field ABI + ack rising edge) and 7 outputs |
 
@@ -50,7 +50,7 @@ RMSE below 0.02 state units; the frozen classifier also serves field tuning.
 
 The harness grades five branches on one 40 s, four-stage fixture (S1 nominal, S2 +35 % load/stiction, S3 unilateral contact, S4 unmodelled flexible mode): B1 (fixed-parameter white-box), B2 (10 Hz context + 1 kHz conditioned RBF action head whose policy input carries 10 features, including one clamped error-integral history feature normalized by the integrator limit), B3 (10 Hz qualitative routing + 1 kHz C99 gate), and the two fairness controls B1+C99 Gate / B2+C99 Gate, where the identical 96 B gate is mounted transparently on top of B1/B2 (zero normal-bank gains, unit feedforward, `blend_alpha = 1`, identical envelope/residual/latency/hold/R4/slew parameters). The comparison therefore separates the universal runtime-assurance shell from the slow qualitative layer.
 
-The contact probe is position-independent: it combines a resistive effort/velocity product with a 20 ms stalled-velocity one-signed tracking-error term and keeps an 8 s surface memory against real contact. Release is physical, not a slow tail: a commanded-unload directional rule (the contact-normal sign accumulated with the evidence plus the reference, tracking-error and measured-velocity directions) rejects inertial unload transients without any single-step reference threshold, so both a reference step and a smooth quintic retreat release in 0.219 s; the remembered contact point is abandoned once the measured position moves back past it with position-independent velocity, and the free-state memory clears within 0.1 s. A genuine resistive contact re-arms the probe immediately: a repeated S3→S1→S3 cycle shows the first contact peaking at 10.62 N (R3 occupancy 94.8 %) and the second at 9.92 N (95.8 %), with the S1 release still at 0.219 s. The `--selftest` includes a wall-position generalisation check at wall positions 0.30 / 0.43 / 0.55 rad with the reference amplitude shifted by the same 0.07 rad and every controller/probe parameter unchanged (all three positions peak at 13.74 N), plus a closed-loop `GATE_HOLD_LATENCY` parity test, an independent nominal control against false confidence vetoes, and a smooth-ramp release check (0.6 s quintic retreat, release < 0.35 s). S4 injects no fault-specific trigger: the OOD veto rests on the real unmodelled-flexible-mode residual and the random glitch process. The frozen-AI tuning study validates each candidate on two wall phases and grades B1 through the same C99 gate. The off-manifold audit runs at a normal amplitude and commissioning noise with an in-box coupled constant load-torque bias, a 1 % per-frame split-conformal budget plus 5-frame persistence, and a data-derived single-dimension support box: the empirical span of the 36 calibration windows plus a 25 % margin.
+The contact probe is position-independent: it combines a resistive effort/velocity product with a 20 ms stalled-velocity one-signed tracking-error term and keeps an 8 s surface memory against real contact. Release is physical, not a slow tail: a commanded-unload directional rule (the contact-normal sign accumulated with the evidence plus the reference, tracking-error and measured-velocity directions) rejects inertial unload transients without any single-step reference threshold; the remembered contact point is abandoned once the measured position moves back past it with position-independent velocity, and the free-state memory decays with a 0.10 s time constant. Re-enable requires the 20-sample sustained-blockage criterion. The `--selftest` covers contact release, repeated contact and wall-position changes, with results in [README §3.4](../README.md#34-mode-ablation-and-independent-protection); it also includes a closed-loop `GATE_HOLD_LATENCY` parity test, an independent nominal control against false confidence vetoes, and a smooth-ramp release check. S4 injects no fault-specific trigger: the OOD veto rests on the real unmodelled-flexible-mode residual and the random glitch process. The frozen-AI tuning study validates each candidate on two wall phases and grades B1 through the same C99 gate. The off-manifold audit runs at a normal amplitude and commissioning noise with an in-box coupled constant load-torque bias, a 1 % per-frame split-conformal budget plus 5-frame persistence, and a data-derived single-dimension support box: the empirical span of the 36 calibration windows plus a 25 % margin.
 
 ## Adapt three slots and the core API
 
@@ -92,14 +92,14 @@ references and feedforward; it uses fixed feedback toward the safe zero.
 
 Frame age advances every tick from the source timestamp. With `outer_seq` nonzero the core measures
 age on its own 1 kHz clock: a new sequence opens a fresh lease, an unchanged one ages by one tick,
-and a frozen or forged `outer_age_s` cannot mask a stalled mailbox; 0 selects the legacy age mode.
+and a frozen or forged `outer_age_s` cannot mask a stalled mailbox; `outer_seq = 0` keeps the transported-age mode from initialization, and a nonzero sequence falling back to zero is corruption.
 Native HOLD is reached only when the fast input itself is unusable: it retains the applied actuator
 command and is bounded by `max_hold_ticks`. A stale slow mailbox with healthy fast sensors instead
 keeps the 1 kHz loop closed on the fixed R4 law. After the bounded HOLD the core enters
 `GATE_SAFE_ZERO` and ramps the command to zero in steps of
 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` — the one-ULP floor applies only when the
 legal slew budget is below one representable step, so a sub-ULP budget still de-energises in finite
-time. On timeout the adapter sends R4 with zero confidence while retaining the real age; malformed
+time. Malformed
 slow mailbox fields or invalid field knobs run closed-loop R4 with `corrupted=1`. The
 `blanking_active` input of the probe template freezes every internal filter state and holds the
 pre-blanking residual (`return p->residual`) during a scheduled stimulation pulse or commutation
@@ -111,11 +111,10 @@ state, independently of gate activity.
 
 ## Verification summary
 
-The C99 standalone regression passes 265 checks with zero failures; Python/C `--selftest` replays
-6,000 frames bit-exact in binary32 with max |du| = 0; MATLAB/C equivalence replays 40,000 normal and
-40,000 corrupted-mailbox frames plus illegal-knob runs at max |du| = 5e-9, and a 10,000-tick
-`outer_seq` lease replay stays within max |du| = 3.6e-8 (binary32 values bit-identical after text round-trip); the Level-2 S-Function replays 1,100
-frames with all seven outputs at max diff = 0.0.
+The C99 standalone regression passes; Python/C `--selftest` is bit-exact in binary32; the MATLAB/C
+equivalence replay and the `outer_seq` lease replay match the frozen core; the Level-2 S-Function
+reproduces all seven outputs at zero difference. The complete replay ledger is in
+[README §3.6 Reproduce](../README.md#36-reproduce).
 
 For interface adaptation order, multi-axis ownership and timeout behavior, see [AGENTS.md](../AGENTS.md) and
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md). Full numerical evidence is maintained in
@@ -136,8 +135,8 @@ the root [README.md](../README.md) and [README_zh.md](../README_zh.md).
 
 | 模块 | 规模 | 职责 |
 | :--- | :--- | :--- |
-| [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 个统计标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 20 行），以及 SLOT 1..3 接入骨架 |
-| [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（中值抗毛刺 + 级联高通包络，提取标称模型预测残差（新息））、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
+| [minimal_template.py](minimal_template.py) | 119 行 | 10 Hz 定性小样本标定（`auto_calibrate`，36 窗口 / 15 个统计标量 / 60 B）、低置信度弃权、冻结 AI 的三旋钮现场整定（`auto_field_tune`，两个辅助函数合计 19 行），以及 SLOT 1..3 接入骨架 |
+| [gate_template.c](../c99_layered_core/gate_template.c) | 120 行 | 1 kHz MCU 裸机中断模板：32 B `LayeredProbe_t`（无模型中值 + 级联高通新息包络）、`blanking_active` 硬件消隐窗口与 `outer_seq` 提交标记写法 |
 | [layered_gatekeeper.h](../c99_layered_core/layered_gatekeeper.h) / [layered_gatekeeper.c](../c99_layered_core/layered_gatekeeper.c) | 96 B 状态 | 1 kHz 零依赖 ANSI C99 安全仲裁与四档控制律库抗饱和微内核；ABI 为 状态/配置/整定/输入/输出 96/140/12/40/28 B |
 | [sfun_layered_gatekeeper.c](../simulink_sfunc/sfun_layered_gatekeeper.c) | 685 行 | Level-2 C-MEX S-Function：`DWork` 持有 96 B 状态，零全局变量、零动态内存，11 输入（10 字段 ABI + 确认上升沿）/ 7 输出 |
 
@@ -174,7 +173,7 @@ python python_bench/run_benchmark.py --selftest
 
 测试框架在一条 40 s、四阶段测试台架（S1 标称、S2 +35 % 带载/静摩擦、S3 单边接触、S4 未建模柔性模态）上评估五个分支：B1（定参白盒）、B2（10 Hz 上下文 + 1 kHz 条件 RBF 动作头，其策略输入含 10 个特征，包括一个按积分器限幅归一化的钳位误差积分历史特征）、B3（10 Hz 定性路由 + 1 kHz C99 门控），以及两个公平性对照 B1+C99 Gate / B2+C99 Gate——同一 96 B 门控透明地叠加在 B1/B2 之上（零正常档增益、单位前馈、`blend_alpha = 1`，包络/残差/延迟/保持/R4/斜率参数完全一致）。因此该对比把通用运行时保障外壳与慢环定性层分开。
 
-接触探针与位置无关：它把阻性力矩/速度乘积与 20 ms 低速停滞下的单向跟踪误差项结合，对真实接触保持 8 s 表面记忆。释放是物理判据而非慢尾：有向卸载规则（把接触法向符号与证据累加，并结合参考、跟踪误差与实测速度的方向）拒绝惯性卸载瞬态，不依赖任何单步参考阈值，因此参考阶跃与五次多项式平滑撤退均在 0.219 s 内释放；一旦实测位置以超阈值速度越过记忆接触点，即解除该接触面记忆（不依赖绝对位置坐标），自由态记忆在 0.1 s 内清除。真实阻性受阻会立即重新激活接触保持：重复 S3→S1→S3 周期中第一次接触峰值 10.62 N（R3 占比 94.8%），第二次 9.92 N（95.8%），S1 释放仍为 0.219 s。`--selftest` 包含墙体位置泛化检查（墙体位置 0.30 / 0.43 / 0.55 rad，参考幅值同移 0.07 rad，所有控制器/探针参数不变，三个位置峰值均为 13.74 N）、闭环 `GATE_HOLD_LATENCY` 一致性回放测试、独立标称低误报校验，以及平滑斜坡释放检查（0.6 s 五次多项式撤退，释放 < 0.35 s）。S4 不注入故障专用触发：OOD 否决依赖真实的未建模柔性模态残差与随机毛刺过程。冻结 AI 现场整定实验在两个墙体相位上验证每个候选，并用同一 C99 门控给 B1 打分。流形外审计以正常幅值与建档噪声运行，叠加盒内耦合常值负载偏置、1% 逐帧分裂共形预算 + 5 帧持续性，以及数据导出的单维支撑盒：36 个标定窗口的经验跨度加 25% 裕量。
+接触探针与位置无关：它把阻性力矩/速度乘积与 20 ms 低速停滞下的单向跟踪误差项结合，对真实接触保持 8 s 表面记忆。释放是物理判据而非慢尾：有向卸载规则（把接触法向符号与证据累加，并结合参考、跟踪误差与实测速度的方向）拒绝惯性卸载瞬态，不依赖任何单步参考阈值；一旦实测位置越过记忆接触点，即解除该接触面记忆（不依赖绝对位置坐标），自由态记忆以 0.10 s 时间常数衰减。重新使能需满足连续 20 个控制采样的持续受阻判据。`--selftest` 覆盖接触释放、重复接触与墙体位置变化，结果见根目录 [README_zh §3.4](../README_zh.md#34-模态消融与独立保护)；另含闭环 `GATE_HOLD_LATENCY` 一致性回放测试、独立标称低误报校验，以及平滑斜坡释放检查。S4 不注入故障专用触发：OOD 否决依赖真实的未建模柔性模态残差与随机毛刺过程。冻结 AI 现场整定实验在两个墙体相位上验证每个候选，并用同一 C99 门控给 B1 打分。流形外审计以正常幅值与建档噪声运行，叠加盒内耦合常值负载偏置、1% 逐帧分裂共形预算 + 5 帧持续性，以及数据导出的单维支撑盒：36 个标定窗口的经验跨度加 25% 裕量。
 
 ## 三槽位接口适配与核心 API
 
@@ -208,11 +207,11 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 增益缩放、轨迹参考与前馈，只做指向安全零点的固定反馈。
 
 帧龄从源时间戳起每拍推进。`outer_seq` 非零时，内核用自己的 1 kHz 时钟测龄：新序号开启新租约，
-序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖慢环通信停滞；取 0 退回传统帧龄模式。
+序号不变则每拍老化一次，冻结或伪造的 `outer_age_s` 无法掩盖慢环通信停滞；从初始化起保持 `outer_seq=0` 使用传输帧龄模式，启用非零序号后回零按慢环通信损坏处理。
 慢环帧过期但快环传感器有效时，内核报告 `GATE_HOLD_LATENCY` 并继续按固定 R4 律闭环；只有快环输入不可用才开环保持上一条指令。超过 `max_hold_ticks` 后内核进入 `GATE_SAFE_ZERO`，
 按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令归零——单 ULP 保底步长
 只在合法斜率预算不足一个可表示步进时生效，因此亚 ULP 的预算也能在有限时间内完成能量泄放归零。
-超时后适配层发送零置信度的 R4，同时保留真实帧龄；慢环数据帧字段异常（或格式非法）或现场旋钮非法时，
+慢环数据帧字段异常（或格式非法）或现场旋钮非法时，
 以 `corrupted=1` 运行闭环 R4。探针模板的 `blanking_active` 输入在计划内刺激脉冲或换向边沿期间
 冻结全部内部滤波器状态并保持消隐前的残差（`return p->residual`）：正常周期性脉冲不会抬升残差；
 跨越多个消隐窗口的持续异常只计一次 OOD 锁存事件；消隐窗口之外，残差按释放包络自然衰减。安全/OOD 否决累计三次即
@@ -220,10 +219,9 @@ u_target)`。`acknowledge_fault_latch()` 内部调用 `Layered_AcknowledgeFaultL
 
 ## 基准验证摘要
 
-C99 独立回归 265 项全部通过、零失败；Python/C `--selftest` 回放 6,000 帧，binary32 下
-max |du| = 0 位级一致；MATLAB/C 等价性回放 40,000 帧正常帧与 40,000 帧慢环通信损坏帧，并叠加非法
-旋钮注入，max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 3.6e-8（文本往返后 binary32 值逐位一致）；Level-2
-S-Function 回放 1,100 帧，7 路输出 max diff = 0.0。
+C99 独立回归通过；Python/C `--selftest` 在 binary32 下逐位一致；MATLAB/C 等价回放与
+`outer_seq` 租约回放均与冻结内核一致；Level-2 S-Function 零误差复现全部 7 路输出。
+完整回放账本见 [README §3.6 Reproduce](../README.md#36-reproduce)。
 
 接口适配顺序、多轴归属与超时行为见 [AGENTS.md](../AGENTS.md) 与
 [domain_mapping_guide.md](../docs/domain_mapping_guide.md)。完整数值证据维护在根目录

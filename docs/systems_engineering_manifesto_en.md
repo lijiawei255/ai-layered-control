@@ -30,7 +30,7 @@ forced veto from an independent physical residual probe.
 | L0 | Hardware safety channel: an independent safety PLC (ISO 13849 Cat.3/4, 1oo2D), dual-channel sensor cross-check, and hardware STO / IEC 60204-1 Stop 0. |
 | L1 | Deterministic fast inner loop: four-bank PID with full-branch reverse-tracking anti-windup plus nominal feedforward; DOB/ESO/ADRC or bounded adaptive compensation can be added in the control-law slot or via `u_ff`. |
 | L2 | Runtime safety arbitration and degradation chain: 96 B C99 Simplex state machine, 1D ZCBF signed envelope look-ahead, blanking hold, per-axis R4 → SAFE_ZERO → LATCHED_SAFE; multi-axis aggregation of `gate_state` plus a shared ack bus for Stop 1/2. (Under ISO/IEC TR 5469 the physical travel/torque/slew/timeout checks are exact a-priori inequalities, and the main-control AI plus the supervisory AI must not extrapolate blindly together out of distribution; this layer is therefore deterministic code, never a second black-box model.) |
-| L3 | Slow qualitative supervision and calibrated abstention: 10 Hz discrete regime advice plus split-conformal manifold-distance confidence. |
+| L3 | Slow qualitative supervision and calibrated abstention: 10 Hz discrete regime advice plus calibrated distance-based confidence. |
 | L4 | Fleet lifecycle closure: frozen AI weights during operation, append-only 7-bit fault audit mask as trigger tags for OOD data capture, offline prototype supplementation and safety-case update. |
 
 ## Six field problems and the mechanisms that answer them
@@ -55,8 +55,8 @@ loop only has to perform coarse discrete regime classification and manifold-dist
 therefore needs only qualitative coverage: 36 labeled macro windows and 15 statistical scalars (60 bytes)
 calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime prototypes and the
 confidence thresholds. No GPU and no action labels are involved. The template's built-in 15-statistical-scalar
-nearest-centroid classifier and six-point constrained search (`auto_field_tune`) are a
-minimal zero-dependency implementation; in a real machine the same interface can host
+nearest-centroid classifier and six-point constrained search (`auto_field_tune`) are a compact
+NumPy implementation without a machine-learning framework; in a real machine the same interface can host
 a physical rule tree with an out-of-range fallback branch, safe Bayesian optimization, or another
 classification model. B2 serves as the comparison point that quantifies the data cost of the
 continuous route: it evaluates a continuous action head over **5,664 scalars / 22,656 B** on every
@@ -219,15 +219,7 @@ cannot abstain. The layered branch records S4 RMSE 0.534138 rad with TV 1528.1 N
 violations, while B1 keeps the lower raw S2 error; these observations define the interpretation of
 the benchmark.
 
-Cross-language replay closes the verification loop. The C99 standalone regression passes 265 checks
-with zero failures, and the 120-line `gate_template.c` self-check prints PASS. The Python/C
-`--selftest` replays 6,000 frames (R1 = 901, R2 = 900, R3 = 303, R4 = 3,896, including
-acknowledgement re-arming and the 7→5→3→1→0 ramp-down) with identical discrete outputs and
-max |du| = 0, bit-exact in binary32. The MATLAB/C `verify_core_equivalence` run covers 40,000 normal
-frames, 40,000 corrupted-mailbox frames and four 40,000-frame runs with illegal knob injection at
-max |du| = 5e-9. A 10,000-tick `outer_seq` lease replay adds native HOLD → `SAFE_ZERO`, the
-zero-sequence corruption path and cooldown recovery at max |du| = 3.6e-8 (the underlying binary32 command values are bit-identical after text round-trip). The Level-2 S-Function
-replays 1,100 frames with all seven outputs at max diff = 0.0.
+Replay and regression evidence is collected in [README §3.6 Reproduce](../README.md#36-reproduce).
 
 ## A generic interface for constrained devices
 

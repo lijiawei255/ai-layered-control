@@ -5,11 +5,10 @@
 % Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function policy = train_continuous_policy(P, nSamples, nCenters, unit)
 %TRAIN_CONTINUOUS_POLICY Conditional 1 kHz action head with 10 Hz context.
-% Mirrors the Python train_policy(): TEN input features -- the nine existing
-% kinematic/context features plus the clamped error-integral history state in
-% column 10, normalised by the 0.5 integrator limit -- and the same 10*nSamples
-% 32-bit LCG draws (the previous memoryless PD target structurally could not
-% represent integral action).
+% Mirrors the Python train_policy(): ten input features combine tracking
+% kinematics, slow context and the clamped error integral in column 10,
+% normalized by the 0.5 integrator limit; training consumes 10*nSamples draws
+% from the shared 32-bit LCG.
 if nargin<1, P=load_domain_profile(); end
 if nargin<2, nSamples=16000; end
 if nargin<3, nCenters=512; end

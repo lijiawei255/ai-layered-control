@@ -87,21 +87,16 @@ so emergency damping is not delayed by transfer smoothing.
 
 The two runtime-assurance layers a derived device must re-calibrate against its own reachable sets
 are the signed 1D ZCBF envelope look-ahead (`|x + T * x_dot|` plus the direction-blind instantaneous
-guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the abstention-threshold
-calibration in `auto_calibrate`: it evaluates the calibration-confidence quantile at the finite-sample
-split-conformal level `q = min(1, ceil((N+1)*alpha)/N)` with `alpha = 0.01`, then multiplies it by the
-`0.15x` dynamic-envelope working-point factor, which suppresses false abstention across the wide dynamic
-envelope. The `off_manifold` audit instead takes the direct, non-interpolated 1 % lower-tail order
-statistic `sorted_conf[ceil(0.01*N)-1]` (the 2nd-smallest of 199 independent nominal frames) plus
-5-frame persistence. Both layers remain device-specific: the envelope depends on the actuator's
-reachable set and detection delay, and the confidence threshold depends on the commissioning archive.
+guard, the boundary condition `h_dot + h/T >= 0` for `h = x_max - |x|`) and the abstention threshold
+in `auto_calibrate`, which scales the 1 % empirical lower-tail confidence quantile by the `0.15x`
+dynamic-envelope working-point factor. Both layers remain device-specific: the envelope depends on the
+actuator's reachable set and detection delay, and the confidence threshold depends on the
+commissioning archive.
 
 派生设备必须针对自身可达集重新标定的两层运行时保障是：有符号 1D ZCBF 包络前视（`|x + T * x_dot|`
-加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与 `auto_calibrate` 的
-弃权阈值标定：它按有限样本分裂共形水平 `q = min(1, ceil((N+1)α)/N)`（α = 0.01）取标定置信度分位数，
-再乘 `0.15x` 动态包络工作点系数，在宽动态包络下抑制虚警；流形外审计则直接取无插值的 1% 下尾顺序
-统计量 `sorted_conf[ceil(0.01*N)-1]`（199 个独立标称帧中的第 2 小样本），并叠加 5 帧持续性。
-两者都与设备相关：包络取决于执行器可达集与检测延迟，置信度阈值取决于标定档案。
+加方向无关的瞬时保护，即 `h = x_max - |x|` 下的边界条件 `h_dot + h/T >= 0`）与 `auto_calibrate`
+的弃权阈值：它把 1% 经验下尾置信分位数乘 `0.15x` 动态包络工作点系数。两者都与设备相关：包络
+取决于执行器可达集与检测延迟，置信度阈值取决于标定档案。
 
 ## Three parallel examples / 三类并列实例
 
@@ -126,10 +121,9 @@ mechanical PID gains and torque limits do not transfer by renaming variables.
 
 1. Define the signals, units, nominal model, controller bank and explicit fallback.
 2. Collect labeled macro-feature windows for `auto_calibrate(samples, labels)`.
-3. Freeze prototypes, distance-decay coefficient and the confidence trip/clear levels (the main
-   benchmark uses `auto_calibrate`'s finite-sample split-conformal quantile
-   `q = min(1, ceil((N+1)*alpha)/N)` times the 0.15x working-point factor; the off-manifold audit uses
-   the direct order statistic `sorted_conf[ceil(0.01*N)-1]` instead).
+3. Freeze prototypes, distance-decay coefficient and the confidence trip/clear levels
+   (`auto_calibrate` scales the 1 % empirical lower-tail confidence quantile by the `0.15x`
+   working-point factor).
 4. Run `auto_field_tune(evaluate, current)` with a device-side safe trial callback.
 
 The callback returns measured cost and constraint validity. Invalid candidates are rejected;
@@ -145,7 +139,7 @@ A new physical domain starts with a new interface and commissioning archive.
 
 1. 定义信号、单位、标称模型、控制器组与显式回退。
 2. 采集带标签的宏观特征窗口，调用 `auto_calibrate(samples, labels)`。
-3. 冻结原型、距离衰减系数与置信度触发/清除水平（主基准使用 `auto_calibrate` 的有限样本分裂共形分位数 `q = min(1, ceil((N+1)α)/N)` 再乘 0.15x 工作点系数；流形外审计则直接使用顺序统计量 `sorted_conf[ceil(0.01*N)-1]`）。
+3. 冻结原型、距离衰减系数与置信度触发/清除水平（`auto_calibrate` 把 1% 经验下尾置信分位数乘 `0.15x` 工作点系数）。
 4. 挂上设备侧的安全试验回调，运行 `auto_field_tune(evaluate, current)`。
 
 回调返回实测代价与约束是否满足：约束不合格的候选直接淘汰；全部候选都不合格时，
@@ -171,44 +165,38 @@ Share read-only configurations only for channels with identical units and contro
 The adapter evaluates coupled constraints and coordinates fallback.
 The core remains a single-axis API.
 
-On a stale frame, preserve the real age and send explicit R4 abstention.
-This keeps deterministic fallback running while the latency fault remains observable.
-A fresh frame restores normal decisions only after the recovery cooldown (350 ms timeout and 300 ms
-cooldown in the reference).
+The adapter forwards `outer_age_s` and `outer_seq` unchanged; the 1 kHz core executes the 350 ms
+timeout. It reports `GATE_HOLD_LATENCY`, keeps the measured loop closed on the fixed R4 law for up to
+`max_hold_ticks`, then enters `GATE_SAFE_ZERO` and ramps to zero in steps of
+`max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`. Only an unusable fast input holds the last
+applied command open-loop; a fresh frame restores normal decisions after the 300 ms recovery cooldown.
 Malformed slow fields also select closed-loop R4, preserving envelope/residual priority.
 With `outer_seq` nonzero, the core measures frame age on its own 1 kHz clock: a new sequence opens a
 fresh lease, an unchanged one ages it by one tick, and a frozen or forged `outer_age_s` cannot mask a
 stalled mailbox; a sequence falling back to zero is treated as corruption, not as a fresh frame.
-A stale slow mailbox with healthy fast sensors reports `GATE_HOLD_LATENCY` and keeps the measured 1 kHz
-loop closed on the fixed R4 law; only an unusable fast input holds the last applied command open-loop.
-Past `max_hold_ticks` the core enters `GATE_SAFE_ZERO` and ramps to zero in steps of `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))`.
 R4 uses fixed gains, zero-state error and no feedforward, independent of field tuning.
 
 每个通道各自持有状态、探针、整定参数与源时间戳。只有单位和控制定义完全相同的通道才允许
 共享只读配置。耦合约束的评估与各轴回退的协调由适配层负责，核心 C API 保持单轴形态。
 
-帧过期时，保留真实帧龄并显式发送 R4 弃权：确定性回退继续运行，延迟故障也依然可观测。
-新帧到达后，要经过恢复冷却期（本参考架构为 350 ms 超时加 300 ms 冷却）才恢复正常决策。
+适配层原样转发 `outer_age_s` 与 `outer_seq`；350 ms 超时由 1 kHz 内核执行（`GATE_HOLD_LATENCY`
+起闭环 R4 至 `max_hold_ticks`，随后 `GATE_SAFE_ZERO`）。只有快环输入不可用时才开环保持上一拍已施加指令。
+新帧到达后经 300 ms 恢复冷却期才恢复正常决策。
 慢环数据帧字段异常（或格式非法）同样切入闭环 R4，包络与残差的优先级不受影响。`outer_seq` 非零时，内核用自己的
 1 kHz 时钟测量帧龄：新序号开启一份新租约，序号不变则每拍老化一次；冻结或伪造的
 `outer_age_s` 无法掩盖慢环通信停滞，而序号回落到 0 会被视为数据损坏，而不是新帧。
-慢环帧过期但快环传感器有效时，内核报告 `GATE_HOLD_LATENCY` 并继续按固定 R4 律闭环运行；仅在快环输入不可用时才开环保持上一拍已施加指令。
-超过 `max_hold_ticks` 后内核进入 `GATE_SAFE_ZERO`，按 `max(u_slew_max_per_s * dt_s, 1 binary32 ULP(|u_prev|))` 的步长把指令
-严格单调地归零。R4 使用固定增益、零状态误差、零前馈，与现场整定无关。
+R4 使用固定增益、零状态误差、零前馈，与现场整定无关。
 
 ## Verification / 验证
 
-C99 standalone regression passes 265 checks with zero failures; `gate_template.c` prints PASS.
-Python/C `--selftest` replays 6,000 frames with max |du| = 0 in binary32, MATLAB/C equivalence
-keeps max |du| = 5e-9 across normal, corrupted-mailbox and illegal-knob runs, a 10,000-tick
-`outer_seq` lease replay stays within max |du| = 3.6e-8 (the underlying binary32 values are
-bit-identical after text round-trip), and the Level-2
-S-Function replays 1,100 frames with all seven outputs at max diff = 0.0.
+The C99 standalone regression and the `gate_template.c` self-check must pass. Python/C `--selftest`
+must stay bit-exact in binary32, the MATLAB/C and `outer_seq` lease replays must match the frozen core,
+and the Level-2 S-Function must reproduce all seven outputs at zero difference. Replay and regression
+evidence is collected in [README §3.6 Reproduce](../README.md#36-reproduce).
 
-C99 独立回归 265 项全部通过、零失败，`gate_template.c` 自检打印 PASS。Python/C `--selftest`
-回放 6,000 帧，binary32 下 max |du| = 0；MATLAB/C 等价性在正常帧、慢环通信损坏帧与非法旋钮
-注入下均保持 max |du| = 5e-9；10,000 拍的 `outer_seq` 租约回放 max |du| = 3.6e-8（文本往返后 binary32 值逐位一致）；
-Level-2 S-Function 回放 1,100 帧，全部 7 路输出 max diff = 0.0。
+C99 独立回归与 `gate_template.c` 自检必须通过；Python/C `--selftest` 需在 binary32 下逐位一致，
+MATLAB/C 与 `outer_seq` 租约回放需与冻结内核一致，Level-2 S-Function 需零误差复现全部 7 路输出。
+回放与回归证据汇总在 [README §3.6 Reproduce](../README.md#36-reproduce)。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).

@@ -41,6 +41,10 @@
 
 #include "layered_gatekeeper.h"
 
+#if defined(__clang__) /* GCC's C front end does not implement the STDC pragma */
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 /* Magnitudes above 3e38 are rejected along with NaN/Inf. The comparison-only
  * firewall leaves headroom below the float32 representable maximum. */
 #define LAYERED_FINITE_LIMIT 3.0e38f

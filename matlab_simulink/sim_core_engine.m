@@ -4,7 +4,7 @@
 % License: https://github.com/lijiawei255/ai-layered-control/blob/main/LICENSE
 % Citation (optional): https://github.com/lijiawei255/ai-layered-control/blob/main/CITATION.cff
 function [out, diagnostics] = sim_core_engine(P, opts)
-%SIM_CORE_ENGINE Three controllers on a shared four-stage physical fixture.
+%SIM_CORE_ENGINE Five benchmark branches on a shared four-stage physical fixture.
 if nargin < 1, P = load_domain_profile(); end
 if ischar(P) || isstring(P), P = load_domain_profile(char(P)); end
 if nargin < 2, opts = struct(); end
@@ -117,13 +117,12 @@ for i=1:nf
 end
 freq=o.fault_f(1)+diff(o.fault_f)*min(max((t-freqstart)/10,0),1);
 % Optional contact-memory audit fixtures (Python reverse_context /
-% retreat_context): 10 s of S3 wall contact followed by S1 free tracking.  In
-% 'reverse' the wall is withdrawn and the free harmonic reference resumes; in
-% 'retreat' the reference returns to the interior zero while the wall STAYS
-% physically in place, so only physical retreat can release the remembered
-% contact (there is no wall-coordinate shortcut).  The override is applied after
-% the fixture is generated, so noise/transport stay those of the nominal
-% scenario-0 context exactly as in the Python reference.
+% retreat_context): 10 s of S3 wall contact followed by S1 free tracking.
+% 'reverse' withdraws the wall and resumes the free harmonic reference;
+% 'retreat' keeps the wall fixed while the reference returns to zero, and the
+% contact memory then decays following measured retreat.  The override is
+% applied after the fixture is generated, so noise/transport stay those of the
+% nominal scenario-0 context exactly as in the Python reference.
 if ~isempty(o.contact_memory)
     m1=t<10;
     stage=2*double(m1);
@@ -281,23 +280,10 @@ if lead_err>0 && pr.stall_ticks>=20
     evidence=max(evidence,min(.02,lead_err*stall_w));
 end
 blocked=evidence>0;
-% A released surface also re-latches on a sustained force-domain blockage.
-% The effort/velocity product above is normalised by the load energy, and a
-% hard press inflates that energy with the very model mismatch it creates, so a
-% released surface can hide a second contact from signature (a); signature (b)
-% needs a stalled velocity estimate, which a compliant press does not provide
-% either.  The same physical event is therefore also read directly in force: a
-% sustained model residual that pushes against the tracking error and against
-% the measured innovation (1 N m at J = 0.01), while the 50 ms measured speed
-% stays low.  The innovation sign rejects the catch-up transient that follows a
-% commanded release, when the plant moves toward the reference faster than the
-% predictor expects.  Re-arming only matters once the contact memory has
-% actually decayed below the feature floor: a briefly released surface that
-% still carries its memory is already routing R3, and the commanded-unload gate
-% keeps the release from being undone.  Twenty milliseconds of agreement, the
-% same run length the stalled-velocity term requires, re-arms the surface and
-% restores the contact-memory floor, so the 10 Hz classifier routes the rebuilt
-% memory to R3 on its next frame.
+% Re-arm a released contact after 20 consecutive 1 ms samples with
+% alp*error < 0, lp*error < 0, |alp| > 100 rad/s^2 and |vlp| < 0.2 rad/s
+% (1 N m at J = 0.01 kg m^2), when a remembered normal exists,
+% contact < 0.01 and unload is false.
 press=(pr.alp*(r-ym)<0) && (pr.lp*(r-ym)<0) && abs(pr.alp)>100 && abs(pr.vlp)<.2 ...
     && pr.nsign~=0 && pr.contact<.01;
 if pr.free && press && ~pr.unload
@@ -441,9 +427,8 @@ for k=1:n
     uff=nom(1)*rdd+nom(2)*rd+nom(3)*r+friction(rd,nom);
     gate=0; reg=0;
     if strcmp(base_mode,'b2')
-        % B2 conditioning vector: tracking kinematics, 10 Hz context and the
-        % clamped error integral (the history state a memoryless PD regression
-        % structurally lacks).  Mirror of the Python fullfeat().
+        % B2 features combine tracking kinematics, 10 Hz context and the
+        % clamped error integral, matching Python fullfeat().
         feat=[e/.1,ed,r/.5,rd/2,rdd/6,ctx,integ/.5];
         z=(feat-P.policy.mu)./P.policy.sd;
         phi=exp(-sum((P.policy.centers-z).^2,2)/(2*P.policy.width^2));
@@ -502,17 +487,16 @@ for k=1:n
         if o.log_core, CI(k,:)=double(input); CO(k,:)=double(result); CT(k,:)=double(tune); end
     end
     if wrapped
-        % Transparent C99 gate shell around the baseline command: the SAME
+        % Transparent C99 gate shell around the baseline command: the same
         % commissioned config (only the normal banks are neutralised) sees the
         % real age, residual, measured state and sequence number, and its output
-        % is the applied command.  Gate/regime are not logged for the wrapped
-        % baselines, matching the Python reference.
+        % is the applied command.  The shell's real gate and regime are logged.
         shell_res=res; if ~o.ood_gate, shell_res=0.; end
         sh_in=[double(single([1,1,age(k),shell_res,ym,yd,r,rd,u])), double(seq)];
         if o.seq_mode && seq_drop(k), sh_in(10)=0; end
         [shell,sh_out]=core_step(shell,shell_cfg,tune_unit,sh_in);
         integrators_finite=integrators_finite && all(isfinite(shell.integ));
-        u=sh_out(1);
+        u=sh_out(1); gate=sh_out(3); reg=sh_out(4);
     end
     sx=x; sxm=xm; p=c.p(k,:); peak=0.; stuck=0;
     if c.fault(k) && ~wasflex, xm=x; vm=v; wasflex=true; end
@@ -558,8 +542,8 @@ function D=physical_probes(P)
 nom=[P.nominal.J,P.nominal.b,P.nominal.k,P.nominal.fc,P.nominal.fs];
 D.counter_bounds=counter_bounds(P.cfg);
 sequence=lcg(18,1000); D.lcg_last=sequence(end);
-% F3 boundary: a legal UINT32_MAX seed shifted by +11/+37 in the context must
-% wrap modulo 2^32 before the uint32 conversion, matching the Python mirror.
+% Context seeds (seed + 11 and seed + 37) are reduced modulo 2^32 before the
+% uint32 conversion and LCG initialization.
 assert(lcg(4294967295+11,1)==0.23994349723216146 && ...
     lcg(4294967295+37,1)==0.25001986033748835, ...
     'A UINT32_MAX context seed did not wrap modulo 2^32 at both offsets.');
@@ -640,10 +624,10 @@ assert(st.outer_age_ticks==uint32(0) && st.last_outer_seq==uint32(8),'A new sequ
 assert(out(3)==3 && out(4)==4 && st.conf,'A sequence falling back to zero did not request closed-loop R4.');
 assert(out(7)==1 && st.corrupted_frame_count==uint32(1) && ...
     bitand(st.fault,uint32(16))~=0,'A sequence falling back to zero was not audited as corruption.');
-% F2 boundary: the lease age is (float)ticks * dt, so 2^24+1 local ticks must
-% round the count to binary32 before the multiply and read 16777.216796875 s on
-% both engines; a double-precision product would read 16777.21875 s and trip a
-% timeout set exactly at the former value.
+% Lease age uses a binary32 tick count and binary32 multiplication.  2^24+1
+% local ticks therefore read 16777.216796875 s on both engines; a
+% double-precision product would read 16777.21875 s and trip a timeout set
+% exactly at the former value.
 q=c; q.min_dwell_ticks=dwell0; q.outer_timeout_s=single(16777.216796875);
 st=core_init(); st.last_outer_seq=uint32(7); st.outer_age_ticks=uint32(16777216);
 [st,out]=core_step(st,q,t,single([1 .95 0 0 0 0 0 0 0 7]));
@@ -1041,8 +1025,8 @@ if do_control
     idx=reg; if idx<1, idx=1; elseif idx>4, idx=4; end
     u_active=bank(idx);
     if snap
-        % Very first control step: take the target as-is so the command never
-        % has to ramp up from zero.
+        % Initialize the target directly from the selected bank; magnitude and
+        % slew limits still apply.
         st.u_target=u_active; st.blend=single(1);
     elseif (veto_active || st.permanent || gate==1) && reg==4
         % Emergency R4 entry (veto, permanent latch or stale mailbox)

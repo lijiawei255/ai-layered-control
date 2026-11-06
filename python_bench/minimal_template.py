@@ -31,7 +31,7 @@ def load_core():
     if not path.exists() or max(SOURCE.stat().st_mtime_ns, SOURCE.with_suffix(".h").stat().st_mtime_ns) > path.stat().st_mtime_ns:
         BUILD.mkdir(exist_ok=True)
         flags = ["-dynamiclib", "-fPIC"] if sys.platform == "darwin" else ["-shared"] + ([] if os.name == "nt" else ["-fPIC"])
-        subprocess.run([os.environ.get("CC", "gcc"), "-std=c99", "-O2", *flags, "-o", str(path), str(SOURCE)], check=True)
+        subprocess.run([os.environ.get("CC", "gcc"), "-std=c99", "-O2", "-ffp-contract=off", *flags, "-o", str(path), str(SOURCE)], check=True)
     lib = ctypes.CDLL(str(path))
     lib.Layered_Init.argtypes = [ctypes.POINTER(t) for t in (State, Config, Tuning)]
     lib.Layered_Init.restype = None

@@ -722,9 +722,8 @@ def context(seed=7, drift=0.35, scenario=None, duration=40.0, substeps=2, ood=Tr
     noise = white * np.where(stage == 2, contact_noise, 0.0015) * noise_scale
     fault = (stage == 3) & ood & (t >= (30.037 if scenario is None else 0.037))
     sfault = np.where(fault, 0.025, 0.0)
-    # S4 OOD detection must stand on the real unmodelled-flexible-mode residual
-    # and the random glitch process alone: no first-tick spike is injected, so
-    # the reported detection delay and the envelope counts are honest.
+    # S4 faults comprise the unmodelled flexible mode and random glitches.
+    # Detection delay is measured from physical fault onset.
     spike = np.where(fault & (ran[3] < 0.004), np.where(ran[4] > 0.5, 0.18, -0.18), 0.0)
     ct = np.maximum(t - (20 if scenario is None else 0.0), 0.0)
     approach = 0.24 * np.exp(-ct / 0.25)
@@ -761,7 +760,7 @@ class Probe:
         # pass_run times that sustained crossing, and nsign is the sign of the
         # tracking error that last accumulated contact evidence.  A released
         # surface may only be re-armed by a command that still presses into it;
-        # press_run times the sustained force-domain re-arm evidence.
+        # press_run counts consecutive force-domain re-arm samples.
         self.vlp = self.pass_run = 0.0
         self.press_run = 0
         self.r_prev = x
@@ -837,25 +836,10 @@ class Probe:
             # surface release engaged.
             evidence = max(evidence, min(0.02, lead * stall))
         blocked = evidence > 0.0
-        # A released surface also re-latches on a sustained force-domain
-        # blockage.  The effort/velocity product above is normalised by the load
-        # energy, and a hard press inflates that energy with the very model
-        # mismatch it creates, so a released surface can hide a second contact
-        # from signature (a); signature (b) needs a stalled velocity estimate,
-        # which a compliant press does not provide either.  The same physical
-        # event is therefore also read directly in force: a sustained model
-        # residual that pushes against the tracking error and against the
-        # measured innovation (1 N m at J = 0.01), while the 50 ms measured
-        # speed stays low.  The innovation sign rejects the catch-up transient
-        # that follows a commanded release, when the plant moves toward the
-        # reference faster than the predictor expects.  Re-arming only matters
-        # once the contact memory has actually decayed below the feature floor:
-        # a briefly released surface that still carries its memory is already
-        # routing R3, and the commanded-unload gate keeps the release from
-        # being undone.  Twenty milliseconds of agreement, the same run length
-        # the stalled-velocity term requires, re-arms the surface and restores
-        # the contact-memory floor, so the 10 Hz classifier routes the rebuilt
-        # memory to R3 on its next frame.
+        # Re-arm a released contact after 20 consecutive 1 ms samples with
+        # alp*error < 0, lp*error < 0, |alp| > 100 rad/s^2 and |vlp| < 0.2 rad/s
+        # (1 N m at J = 0.01 kg m^2), when a remembered normal exists,
+        # contact < 0.01 and unload is false.
         press = (self.alp * (r - ym) < 0.0 and self.lp * (r - ym) < 0.0
                  and abs(self.alp) > 100.0 and abs(self.vlp) < 0.2
                  and self.nsign != 0.0 and self.contact < .01)
@@ -901,16 +885,14 @@ class Probe:
 
 def fullfeat(x, v, r, rd, rdd, macro, integ):
     """B2 conditioning vector: tracking kinematics, 10 Hz context and the
-    clamped error integral (the history state a memoryless PD regression
-    structurally lacks)."""
+    clamped error integral."""
     return np.r_[(r - x) / 0.1, rd - v, r / 0.5, rd / 2.0, rdd / 6.0, macro, integ / 0.5]
 
-# Safety shell for the fair baseline comparison: the SAME 96 B C99 core is
-# mounted around the B1/B2 control law.  The normal banks are made transparent
-# (zero P/I/D, unit feedforward, blend_alpha = 1) so the shell never silently
-# re-tunes the graded baseline; every safety parameter -- state envelope,
-# residual OOD threshold, hold budget, recovery cooldown, R4 escape law and the
-# magnitude/slew limits -- is byte-identical to the B3 deployment.
+# Safety shell: the same 96 B C99 core is mounted around the B1/B2 control law.
+# The normal banks are transparent (zero P/I/D, unit feedforward, blend_alpha = 1);
+# every safety parameter -- state envelope, residual OOD threshold, hold budget,
+# recovery cooldown, R4 escape law and the magnitude/slew limits -- is
+# byte-identical to the B3 deployment.
 def gate_shell_cfg(cfg):
     return dict(cfg, kp=[0.0, 0.0, 0.0, cfg['kp'][3]], kd=[0.0, 0.0, 0.0, cfg['kd'][3]],
                 ki=[0.0, 0.0, 0.0, cfg['ki'][3]], ff_scale=[1.0, 1.0, 1.0, 0.0],
@@ -995,12 +977,9 @@ def simulate(c, mode='b1', policy=None, clf=None, tuning=(1, 1, 1), bank=None, o
                 ai = int(bank)
                 conf = 1.0
             if mode == 'rules':
-                # The hard rule tree is the fair single-dimension comparator: it
-                # classifies with the same three thresholds and now also
-                # retreats to R4 when any single feature leaves the data-derived
-                # [min,max] band.  It has no joint (multi-feature) manifold vote.
-                # Until the first real slow frame has arrived it stays nominal,
-                # so the silent startup sample cannot fake an out-of-box retreat.
+                # The rule tree applies three classification thresholds and
+                # retreats to R4 when any feature leaves its calibrated min/max
+                # band.  It remains nominal until the first slow frame arrives.
                 if ctx_ready:
                     ai = 3 if ctx[3] > 0.65 else 2 if ctx[2] > 0.25 or ctx[1] > 0.55 else 1
                     conf = 1.0
@@ -1021,9 +1000,10 @@ def simulate(c, mode='b1', policy=None, clf=None, tuning=(1, 1, 1), bank=None, o
         if shell is not None:
             # The baseline command is the feedforward term of a transparent
             # core: the same 96 B gate applies its envelope, residual, latency,
-            # magnitude, slew and R4-escape logic to it unchanged.
+            # magnitude, slew and R4-escape logic to it unchanged, and the log
+            # records the shell's real gate and regime.
             age = tk - last_stamp
-            u = shell.step(1.0, 1.0, age, res if ood_gate else 0.0, ym, yd, r, rd, u, outer_seq)[0]
+            u, gate, reg = shell.step(1.0, 1.0, age, res if ood_gate else 0.0, ym, yd, r, rd, u, outer_seq)[:3]
         sample_x, sample_xm = x, xm
         p = {key: float(a[k]) for key, a in c['p'].items()}
         # Unmodelled slow actuator: the real effort blends the commanded force
@@ -1184,11 +1164,8 @@ def train_policy(n=16000, centers=512, drift=0.0):
     X[:, 8] *= 1.4
     X[near, 5:8] *= [.03, .10, .06]
     X[near, 8] = 0.0
-    # Column 9 is the clamped error-integral history state, normalized by the
-    # integrator limit so the training support covers the full [integ_limit,
-    # +integ_limit] range.  The training target carries the same integral gain
-    # as the B1 baseline (300), so the action head can represent integral
-    # action; the previous memoryless PD target structurally could not.
+    # Column 9 stores the error integral normalized to [-1, 1].  The training
+    # target uses the B1 integral gain (300).
     h = np.clip((X[:, 8] - 0.65) / 0.35, 0, 1)
     kp = 60 * (1 - h) + 8 * h
     kd = 1.2 * (1 - h) + 0.8 * h
@@ -1245,9 +1222,8 @@ def tuning_study(clf):
             selected[mode] = auto_field_tune(evaluate, (1.,1.,1.))
             histories[mode] = candidates
         tuned = selected['dynamic']
-        # The gated single-stage baseline is graded on the same constraints.  If
-        # no candidate satisfies them, the frozen search keeps the commissioned
-        # knobs, which is reported as such instead of being asserted away.
+        # The gated baseline uses the same feasibility constraints; the tuning
+        # helper retains the commissioned knobs if no candidate is valid.
         b1_valid = [c for c in histories['b1g'] if c['valid']]
         b1_valid_candidates = len(b1_valid)
         b1_knobs = min(histories['b1g'], key=lambda c: c['cost'])['knobs']
@@ -1267,7 +1243,7 @@ def tuning_study(clf):
             search_cost_after=next(v['cost'] for v in histories['dynamic'] if v['knobs'] == list(tuned)),
             mission=check, mission_before=metrics(mission, simulate(mission, 'dynamic', clf=clf)),
             b1_mission=b1_check, candidates=histories,
-            search_seconds=240, validation_seconds=52, compute_seconds=time.perf_counter()-start))
+            search_seconds=300, validation_seconds=52, compute_seconds=time.perf_counter()-start))
     return rows
 
 def _off_row(c, z):
@@ -1293,9 +1269,8 @@ def reverse_context(seed=5):
     return c
 
 def retreat_context(seed=5):
-    """10 s of S3 wall contact, then the reference returns to the interior zero
-    while the wall STAYS physically in place: only physical retreat can release
-    the remembered contact (there is no wall-coordinate shortcut)."""
+    """10 s of S3 contact followed by a reference retreat to zero with the wall
+    fixed.  The probe releases contact memory from measured retreat."""
     c = context(seed=seed, duration=30.0, scenario=0, ood=False)
     t, m1 = c['t'], c['t'] < 10.0
     c['stage'] = np.where(m1, 2, 0)
@@ -1305,13 +1280,10 @@ def retreat_context(seed=5):
     return c
 
 def repeated_context(seed=5):
-    """S3 contact -> S1 retreat/release -> S3 contact again.
+    """S3 contact, S1 free motion, then renewed S3 contact, each lasting 10 s.
 
-    The unilateral surface only loads during the two S3 windows, exactly like
-    the main mission, and each entry re-engages it with the same smooth 0.24 rad
-    approach transient the fixture uses at t = 0.  The free S1 harmonic in
-    between leaves the probe's effort/velocity channel hot (load energy charged,
-    free flag lifted), which is the state that used to hide the second contact.
+    The intervening S1 motion releases contact memory while retaining
+    load-energy filter state.
     """
     c = context(seed=seed, duration=30.0, scenario=0, ood=False)
     t = c['t']
@@ -1332,7 +1304,7 @@ def repeated_context(seed=5):
     return c
 
 def repeated_contact_check(clf):
-    """Two-contact re-arm audit: every contact routes R3 inside the 20 N budget."""
+    """Measure peak force and R3 occupancy in both contact windows, plus release time."""
     c = repeated_context()
     a = simulate(c, 'dynamic', clf=clf)['log']
     t = c['t']
@@ -1368,9 +1340,8 @@ def audit_study(clf, c):
     #   * rules   : hard rule tree with data-derived single-dimension min/max
     #               retreat bands from the SAME calibration windows;
     #   * no_conf : the same b3 with the confidence veto disabled.
-    # The fixture is deliberately in-box per dimension: the honest comparison is
-    # the frame detection rate of the joint detector against the range rule, not
-    # a tautological in_box == 1.0.
+    # Measure joint-detector and per-feature detection rates while recording
+    # the fraction of frames inside the commissioning box.
     groups = [simulate(context(seed=101, drift=0.0, scenario=s, duration=10.0, ood=False), 'fixed', bank=s + 1)['macro'] for s in range(3)]
     bounds = feature_support(groups)
     lo, hi = bounds
@@ -1406,8 +1377,8 @@ def audit_study(clf, c):
         confidence_persistence_frames=CONF_PERSIST_FRAMES,
         band=[lo.tolist(), hi.tolist()], nominal_control=nominal_rows, seeds=rows)
     for row in rows:
-        # Honest in-box property: most single-dimension frames stay inside the
-        # data-derived commissioning box, so the range rule rarely retreats.
+        # Most frames remain inside the per-feature commissioning bounds;
+        # measure the range-rule retreat rate.
         assert row['in_box_fraction'] >= 0.90, (row['seed'], row['in_box_fraction'])
         assert row['rules_retreat_rate'] < 0.10, row['seed']
         # The joint manifold detector must detect the coupled load bias at a far
@@ -1565,8 +1536,7 @@ def selftest():
         a, b = c.step(*frame), p.step(*frame)
         assert a[1:3] == b[1:3] and a[4:6] == b[4:6]
         assert all(getattr(c.state,name) == getattr(p,name) for name in counters)
-    # The fault frame is veto-masked (envelope outranks the latency HOLD), so it
-    # no longer counts a native-HOLD entry: latency_hold_count stays at MAX-1.
+    # The envelope veto masks latency HOLD; latency_hold_count remains at MAX-1.
     assert c.state.latency_hold_count == p.latency_hold_count == maximum - 1
     saturated = [name for name in counters[1:] if name != 'latency_hold_count']
     assert all(getattr(c.state,name) == maximum for name in saturated) and a[4] == 31
@@ -1646,7 +1616,7 @@ def selftest():
     for _ in range(latched['ood_recovery_cooldown_ticks'] + 1):
         a, b = c.step(1,1,.005,.1,0.,0.,0.,0.,0.,0), p.step(1,1,.005,.1,0.,0.,0.,0.,0.,0)
     assert a[1:3] == b[1:3] == (GATE_NORMAL, REGIME_NOMINAL)
-    # Fix 1 mirror parity: the acknowledge restores the episode quota only.
+    # Acknowledgement restores the episode quota and preserves lifetime counters.
     assert c.state.latch_episode_count == p.latch_episode_count == 0
     for episode in (1, 2, 3):
         for _ in range(5):
@@ -1743,8 +1713,8 @@ def selftest():
     assert c.state.latency_hold_count == p.latency_hold_count == 1
     assert c.state.hold_ticks == p.hold_ticks == 3
     # A8: signed envelope look-ahead.  The same velocity magnitude must trip
-    # outward and stay clear inward, and the reported x=0.97 / x_dot=-1.14
-    # retreat must not charge a latch episode.
+    # outward and stay clear inward, and the x=0.97 / x_dot=-1.14 retreat must
+    # not charge a latch episode.
     look_cfg = dict(cfg, safety_trip_ratio=0.99, safety_predict_s=0.06)
     look_tuning = dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.)
     c = Core(look_cfg); p = PythonGatekeeper(look_cfg, look_tuning)
@@ -1763,7 +1733,7 @@ def selftest():
     assert a[1] == b[1] == GATE_NORMAL
     assert c.state.safety_veto_count == p.safety_veto_count == 0
     assert c.state.latch_episode_count == p.latch_episode_count == 0
-    print('PASS: A8 signed envelope look-ahead (outward trip, inward retreat, reported 0.97/-1.14 case)')
+    print('PASS: A8 signed envelope look-ahead (outward trip, inward retreat, 0.97/-1.14 case)')
     # A9: a stale slow mailbox with healthy fast sensors keeps the loop closed
     # on the fixed R4 bank during the whole grace, then de-energises.
     lat_tuning = dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.)
@@ -1802,7 +1772,7 @@ def selftest():
     assert a[1] == b[1] == GATE_SAFE_ZERO and a[0] == b[0] == 0.0
     assert list(c.state.integ) == p.integ == [0.0, 0.0, 0.0, 0.0]
     assert a[4] & FAULT_HOLD_TIMEOUT and c.state.permanent_latched == p.permanent_latched == 1
-    # Fix 2 mirror parity: a corrupt configuration holds for 100 ticks then stops.
+    # A corrupt configuration uses a fixed 100-tick HOLD budget, then enters SAFE_ZERO.
     held_frame = (1., 1., .005, .1, .2, 0., .4, 0., 0., 0)
     c = Core(latched)
     p = PythonGatekeeper(latched, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
@@ -1821,7 +1791,7 @@ def selftest():
     assert c.state.permanent_latched == p.permanent_latched == 1
     assert c.state.hold_ticks == p.hold_ticks == 101
     assert a[4] & (FAULT_HOLD_TIMEOUT | FAULT_PERMANENT_LATCH)
-    # Fix 2 mirror parity: UINT32_MAX can never time out and is rejected.
+    # UINT32_MAX is rejected as a HOLD budget because the saturating counter cannot exceed it.
     saturated = dict(latched, max_hold_ticks=4294967295)
     c = Core(saturated)
     p = PythonGatekeeper(saturated, dict(gain_scale=1., damping_scale=1., safety_margin_scale=1.))
@@ -1885,7 +1855,7 @@ def selftest():
     assert c_stale == p_stale
     print('PASS: 1 kHz SAFE_ZERO ramp 7->5->3->1->0 on the corrupt-sensor path and the '
           'closed-loop fallback ramp on the stale-mailbox path')
-    # F1 reachable case: a held command of 1.5 with a 0.1 binary32 budget.  The
+    # SAFE_ZERO rounding boundary: u_prev = 1.5f, du_max = 0.1f.  The
     # rounded bound 1.5f - 0.1f is 1.3999999762f, a 0.100000024 step that
     # exceeds the budget, so the de-energise must pull the bound one ULP back
     # toward the held command and step to 1.4000000953674316, bit-exact on both
@@ -1911,7 +1881,7 @@ def selftest():
     assert a == b and a[1] == b[1] == GATE_SAFE_ZERO
     assert a[0] == b[0] == 1.4000000953674316, (a[0], b[0])
     assert abs(a[0] - 1.5) <= inward_du
-    print('PASS: F1 SAFE_ZERO inward rounding 1.5 -> 1.4000000953674316 within the 0.1 budget')
+    print('PASS: SAFE_ZERO inward rounding 1.5 -> 1.4000000953674316 within the 0.1 budget')
     # Normal-path slew-bound regression: the two bounds are rounded inward.  With
     # a binary32 budget of 7.0e-8 between 0.5 ULP and 1 ULP of 1.0f, the rounded
     # upper bound 1.0000001192f would allow a 1.1920929e-7 step; the limiter must
@@ -1944,7 +1914,7 @@ def selftest():
     assert trials == [(.75,1.,.7), (1.,1.,.7), (1.25,1.,.7), (2.,1.,.7), (1.25,.5,.7), (1.25,.75,.7)]
     assert auto_field_tune(lambda _: (math.nan, False), (.9,.8,.7)) == (.9,.8,.7)
     assert auto_field_tune(lambda _: (math.inf, True), (.9,.8,.7)) == (.9,.8,.7)
-    # F2 boundary: the local lease age is (float)ticks * dt in the C core, so a
+    # Lease-age rounding boundary: the C core evaluates (float)ticks * dt, so a
     # lease count of 2^24+1 must round to 16777216 before the multiply.  Both
     # engines therefore read 16777.216796875 s and stay below a timeout equal to
     # that value; a double-precision product would read 16777.21875 s and trip.
@@ -1956,13 +1926,12 @@ def selftest():
     a, b = c.step(1, .95, 0., 0., 0., 0., 0., 0., 0., 7), p.step(1, .95, 0., 0., 0., 0., 0., 0., 0., 7)
     assert a == b and a[1] == GATE_NORMAL and a[5] == 0, (a, b)
     assert c.state.outer_age_ticks == p.outer_age_ticks == 16777217
-    print('PASS: F2 lease boundary 2^24+1 ticks rounds the uint32 count to binary32 first')
-    # F3 boundary: a legal UINT32_MAX seed shifts by +11/+37 in the context, so
-    # the offset must wrap modulo 2^32 before the uint32 conversion, exactly as
-    # the MATLAB mirror does.
+    print('PASS: lease boundary 2^24+1 ticks rounds the uint32 count to binary32 first')
+    # LCG seed boundary: offsets +11 and +37 wrap modulo 2^32 before the uint32
+    # conversion in both engines.
     assert lcg(4294967295 + 11, 1)[0] == 0.23994349723216146
     assert lcg(4294967295 + 37, 1)[0] == 0.25001986033748835
-    print('PASS: F3 LCG seed 4294967295 wraps modulo 2^32 at both context offsets')
+    print('PASS: LCG seed 4294967295 wraps modulo 2^32 at both context offsets')
     # The ctypes boundary carries binary32 only: a raw float64 residual a hair
     # above the trip threshold must round to the same frame on both backends.
     c0 = Core(cfg)
@@ -1999,9 +1968,8 @@ def selftest():
         wall_peaks.append(m['peak_N'])
     print(f'PASS: wall-position generalisation 0.30 / 0.43 / 0.55 rad (peaks {wall_peaks[0]:.2f} / '
           f'{wall_peaks[1]:.2f} / {wall_peaks[2]:.2f} N, R3 > 0.9, zero breaches)')
-    # A commanded smooth retreat is the same physical unload as a reference step:
-    # the directional rule must release it inside the 0.35 s contract without a
-    # re-latch (the retired 250 ms step blanking used to be the only guard).
+    # A smooth commanded retreat releases contact memory within 0.35 s without
+    # re-latching; the directional unload rule applies throughout the trajectory.
     ret = retreat_context()
     q1 = ret['t'] >= 10.0
     tau = np.clip((ret['t'][q1] - 10.0) / 0.6, 0.0, 1.0)
@@ -2014,10 +1982,8 @@ def selftest():
     smooth_release = float(ret['t'][r3[-1]] - 10.0) if len(r3) else 0.0
     assert smooth_release < 0.35 and float(np.mean(a[ret['t'] >= 25.0, 3] == REGIME_BOUNDARY)) == 0.0, smooth_release
     print(f'PASS: smooth quintic retreat releases in {smooth_release:.3f} s (< 0.35 s), no re-latch')
-    # Repeated contact: a surface released by an S1 retreat must re-arm when the
-    # S3 reference returns.  Both contacts route R3 and hold the 20 N budget; the
-    # second contact is the regression for the force-domain re-arm, because the
-    # effort/velocity channel stays normalised away by the S1 motion.
+    # Both S3 contact windows must route R3 and remain below 20 N after the
+    # intervening S1 motion releases contact memory.
     rr = repeated_contact_check(clf)
     assert rr['first_peak_N'] < 20.0 and rr['second_peak_N'] < 20.0, rr
     assert rr['first_r3_rate'] > .90 and rr['second_r3_rate'] > .90, rr
@@ -2119,9 +2085,8 @@ def main():
     eff = efficiency_study()
     report = dict(version='2.0.2', metrics={k: metrics(c, v) for k, v in results.items()}, ablation=ablation, tuning=tune, efficiency=eff, classifier=[clf[0].tolist(), *map(float, clf[1:])], calls=results['B2']['calls'], resources=resource_study(policy), audit=audit_study(clf,c))
     m = report['metrics']
-    # Functional and physical-safety assertions only.  The comparative outcome
-    # of every branch is measured and reported, never asserted: no threshold
-    # here may encode "B3 must beat Bx", so the tables cannot be pre-shaped.
+    # Assert call counts, device limits and branch-specific functional contracts.
+    # Record comparative metrics in the result tables.
     assert results['B2']['calls'] == 40000
     assert all(m['B3'][stage]['breach'] == 0 for stage in m['B3'])
     assert m['B3']['S3']['peak_N'] < 20

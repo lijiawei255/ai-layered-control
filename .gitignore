@@ -1,12 +1,6 @@
-# ---------------------------------------------------------------------------
-# ai-layered-control -- repository hygiene
-# ---------------------------------------------------------------------------
-# This repository is a *reference architecture*: the tracked content is plain
-# text plus three PNG figures and one .slx model.  Everything a build, an IDE
-# or a local AI agent produces must stay out of Git.
-# ---------------------------------------------------------------------------
+# Ignore generated build products, caches and local tooling files.
 
-# --- Python (tooling only) -------------------------------------------------
+# --- Python -----------------------------------------------------------------
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -16,36 +10,25 @@ __pycache__/
 .venv/
 venv/
 ENV/
-# Python benchmark: generated shared library, build cache and output figure
-python_bench/build/
 python_bench/*.png
-python_bench/*.so
-python_bench/*.dll
-python_bench/*.dylib
 
-# --- MATLAB / Simulink temporary and build artefacts -----------------------
+# --- MATLAB / Simulink ------------------------------------------------------
 slprj/
 *.slxc
 *.slx.r*
 *.mdl.r*
 *.autosave
-*.slx.autosave
-*.mdl.autosave
 *.asv
 *.mex*
 *.mat
 *.fig
 *.mlp
-*.m~
 codegen/
 build/
-# Simulink crash recovery / editor backups
-*.slx~
-*.mdl~
 *.bak
 matlab_crash_dump*
 
-# --- C / native build artefacts -------------------------------------------
+# --- C / native build products ---------------------------------------------
 *.exe
 *.out
 *.o
@@ -61,9 +44,8 @@ matlab_crash_dump*
 *.ilk
 *.stackdump
 *.dSYM/
-a.out
 
-# --- Cross-platform test / equivalence / scratch artefacts ----------------
+# --- Test, equivalence and scratch artefacts --------------------------------
 c99_layered_core/test_gatekeeper_standalone
 c99_layered_core/verify_core_equivalence
 c99_layered_core/gate_template
@@ -71,18 +53,11 @@ c99_layered_core/*.bin
 c99_layered_core/*.csv
 matlab_simulink/*.bin
 matlab_simulink/*.csv
-# Benchmark result JSON and run logs
-*.json
+python_bench/*.json
+matlab_simulink/*.json
 *.log
-# Simulink S-Function build products (suffix-less on Windows is *.mexw64)
-simulink_sfunc/*.mex*
-simulink_sfunc/*.obj
-simulink_sfunc/*.o
-simulink_sfunc/*.lib
-simulink_sfunc/*.exp
-simulink_sfunc/*.pdb
 
-# --- Local IDE / AI-agent / OS files ---------------------------------------
+# --- IDE / OS ---------------------------------------------------------------
 .vscode/
 .idea/
 .cursor/
@@ -95,17 +70,11 @@ desktop.ini
 *.swp
 *~
 
-# --- Intermediates produced while rebuilding the Simulink package ----------
-*.slx.zip
+# --- Archives and temporaries ----------------------------------------------
 *.zip
-*.zip.tmp
 *.tmp
-
-# --- Local scratch space used while iterating on the benchmark -------------
 _scratch/
 
-# --- Deliverables that must NEVER be swallowed by a broad ignore pattern ---
-# The generated Simulink benchmark and the publication figures are the
-# artefacts this repository exists to ship.
+# --- Tracked deliverables ---------------------------------------------------
 !matlab_simulink/*.slx
 !assets/*.png

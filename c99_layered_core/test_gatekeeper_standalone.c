@@ -624,7 +624,7 @@ static void test_mission(void)
             }
         }
 
-        /* keep the compiler honest about the counter snapshots */
+        /* Verify that the mission includes safe-fallback cooldown ticks. */
         if (k == MISSION_STEPS - 1) {
             if (cooldown_ticks <= 0) {
                 cooldown_bad++;
@@ -2199,10 +2199,8 @@ static void test_counter_boundaries(void)
           "counter boundary: maximum dwell threshold accepts a saturated count");
 
     build_config(&cfg); cfg.ood_recovery_cooldown_ticks = 0u;
-    /* This block exercises saturating audit counters and the original gate
-     * priority chain; the cumulative permanent latch has its own dedicated
-     * regression below, so it is disabled here to keep the counters/bitmask
-     * expectations focused on saturation arithmetic. */
+    /* Exercise counter saturation and gate priority with the cumulative latch
+     * disabled; test the latch independently below. */
     cfg.max_fault_vetoes_before_latch = 0u;
     in.ai_regime = 1.0f; bad = in;
     bad.ai_regime = make_nan(); bad.x = 1.1f; bad.physics_residual = 2.0f;
@@ -2219,8 +2217,8 @@ static void test_counter_boundaries(void)
           st.safety_veto_count == UINT32_MAX && st.ood_veto_count == UINT32_MAX &&
           st.low_confidence_veto_count == UINT32_MAX,
           "counter boundary: repeated fault episodes saturate all diagnostic counters");
-    /* The fault frame is veto-masked (envelope outranks the latency HOLD), so
-     * it must not count a native-HOLD entry any more. */
+    /* The envelope veto masks latency HOLD, so this frame does not increment
+     * the native-HOLD entry counter. */
     check(st.latency_hold_count == UINT32_MAX - 1u,
           "counter boundary: a veto-masked stale frame does not count a HOLD episode");
     check(out.gate == GATE_VETO_SAFETY_ENVELOPE && out.regime == REGIME_SAFE_FALLBACK &&
@@ -2415,12 +2413,10 @@ static void test_hold_timeout(void)
           "(corrupted=%d, gate=%s, hold_ticks=%u)",
           out.corrupted, Layered_GateName(out.gate), (unsigned)st.hold_ticks);
 
-    /* A1c: a stale slow mailbox with healthy fast sensors must keep the 1 kHz
-     * loop closed on the fixed R4 law for the whole grace window, report
-     * GATE_HOLD_LATENCY, and only then de-energise WITHOUT the permanent latch
-     * and without breaking the commissioned slew limit.  Freezing the last
-     * torque while valid feedback exists is exactly the defect this contract
-     * removes. */
+    /* A1c: a stale slow mailbox with healthy fast sensors keeps the 1 kHz
+     * loop closed on the fixed R4 law for the whole grace window, reports
+     * GATE_HOLD_LATENCY, and then enters GATE_SAFE_ZERO without arming the
+     * permanent latch and without breaking the commissioned slew limit. */
     Layered_Init(&st, &cfg, &tun);
     in.x = 0.20f;
     in.x_dot = 0.0f;
@@ -2826,8 +2822,8 @@ static void test_antiwindup_underflow(void)
             finite = 0;
         }
     }
-    /* Without the guard the integral would have pinned at the clamp; the pure
-     * accumulator only sees dt * e = 1e-4 per tick. */
+    /* With the underflowed back-calculation term disabled, the accumulator
+     * advances by dt * e = 1e-4 per tick. */
     check(finite != 0 && t_absf(st.integ[0] - 0.02f) < 1.0e-3f,
           "A5 underflow: an underflowed ki*windup_tau_s skips the back-calculation "
           "(integ[0]=%.6f, all states finite)",
@@ -3164,10 +3160,9 @@ static void test_normal_slew_rounding(void)
           "A6 slew rounding: every tick honours |du| <= du_max strictly (worst |du|=%.9g, budget=%.9g)",
           (double)inv.worst_abs_du, du_max);
 
-    /* Direct frame of the counterexample: previous command 1.0f, target
-     * above it.  The rounded upper bound is 1.0000001192f, so the earlier
-     * limiter published |du| = 1.19e-7 against a 7.0e-8 budget; the
-     * inward-rounded bound must instead hold 1.0f. */
+    /* At u_prev = 1.0f and du_max = 7.0e-8f, the next representable value
+     * 1.0000001192f exceeds the exact slew budget, so inward rounding holds
+     * 1.0f. */
     Layered_Init(&st, &cfg, &tun);
     for (k = 0; k < 20; ++k) {
         out = Layered_Step(&st, &cfg, &tun, &in);
@@ -3195,16 +3190,14 @@ static void test_normal_slew_rounding(void)
 /* Phase A7: GATE_SAFE_ZERO de-energise budget rounded inward                */
 /* ========================================================================= */
 
-/* Reachable counterexample from the cold-start audit: dt = 0.001 s and
- * u_slew_max_per_s = 100 /s give the binary32 per-tick budget
- * 0.10000000149011612, which is larger than one ULP of the 1.5f command
- * (1.1920928955078125e-7).  Nearest-even rounding of 1.5f - 0.1f lands on
- * 1.3999999761581421f, an exact double difference of 0.10000002384185791 --
- * 2.235174179e-8 over the declared bound -- so a de-energise walk that clamps
- * to the rounded value publishes a step wider than the budget it claims to
- * honour.  The walk must round inward exactly like the normal path and step to
- * 1.4000000953674316f (0.09999990463256836) instead, while the sub-ULP case
- * keeps its documented one-ULP floor. */
+/* SAFE_ZERO rounding boundary: dt = 0.001 s and u_slew_max_per_s = 100 /s
+ * give a binary32 per-tick budget 0.10000000149011612, larger than one ULP of
+ * the 1.5f command (1.1920928955078125e-7).  Nearest-even rounding of
+ * 1.5f - 0.1f lands on 1.3999999761581421f, an exact double difference of
+ * 0.10000002384185791, which is 2.235174179e-8 over the declared bound.  The
+ * de-energise walk must therefore round inward exactly like the normal path
+ * and step to 1.4000000953674316f (0.09999990463256836), while the sub-ULP
+ * case keeps its documented one-ULP floor. */
 static void test_safe_zero_rounding(void)
 {
     LayeredConfig_t cfg;
@@ -3319,13 +3312,11 @@ static void test_safe_zero_rounding(void)
 /* Phase A8: signed envelope look-ahead                                      */
 /* ========================================================================= */
 
-/* The predictive envelope term projects the measured state ALONG its own
- * velocity: |x + T*x_dot|.  The old direction-blind |x| + T*|x_dot| treated a
- * state that was already inside the band and retreating toward zero as if it
- * were still approaching the boundary, which vetoed the safest possible
- * recovery motion and charged a permanent-latch episode for it.  An outward
- * sprint must still trip ahead of the instantaneous guard, and the
- * instantaneous guard itself stays deliberately direction-blind. */
+/* The predictive envelope term projects the measured state along its own
+ * velocity: |x + T*x_dot|.  It distinguishes outward motion toward the
+ * boundary from inward recovery toward zero, so a retreat inside the band is
+ * not vetoed.  An outward sprint still trips ahead of the separate
+ * instantaneous guard, which depends only on |x| and stays direction-blind. */
 static void test_envelope_lookahead(void)
 {
     LayeredState_t st;
@@ -3361,8 +3352,7 @@ static void test_envelope_lookahead(void)
 
     /* (b) The same velocity magnitude pointing back toward zero: the projected
      * position 0.88 - 0.15 = 0.73 is inside every limit, so no veto and no
-     * episode may be charged.  The direction-blind expression still reads
-     * 1.030 and would have vetoed. */
+     * episode is charged. */
     Layered_Init(&st, &cfg, &tun);
     in.x = 0.88f;
     in.x_dot = -2.5f;
@@ -3376,10 +3366,9 @@ static void test_envelope_lookahead(void)
           "(signed |x+T*v|=0.730 vs direction-blind %.3f; gate=%s)",
           (double)blind_prediction, Layered_GateName(out.gate));
 
-    /* (c) Cold-start report reproduction: x = 0.97, x_dot = -1.14 with the
-     * instantaneous trip ratio at 0.99.  The direction-blind prediction is
-     * 0.97 + 0.06*1.14 = 1.038 and vetoes; the signed prediction is 0.9016 and
-     * must not charge an episode for a recovery motion. */
+    /* (c) Inward-recovery boundary: x = 0.97 and x_dot = -1.14 with the
+     * instantaneous trip ratio at 0.99.  The signed prediction is 0.9016 and
+     * stays clear of both guards, so no episode is charged. */
     cfg.safety_trip_ratio = 0.99f;
     Layered_Init(&st, &cfg, &tun);
     in.x = 0.97f;
@@ -3392,7 +3381,7 @@ static void test_envelope_lookahead(void)
     check(blind_prediction > cfg.state_safety_limit &&
           out.gate == GATE_NORMAL && st.safety_veto_count == 0u &&
           st.latch_episode_count == 0u,
-          "A8 look-ahead: the reported x=0.970 / x_dot=-1.14 retreat charges no envelope episode "
+          "A8 look-ahead: the x=0.970 / x_dot=-1.14 retreat charges no envelope episode "
           "(signed |x+T*v|=0.902 vs direction-blind %.3f, gate=%s)",
           (double)blind_prediction, Layered_GateName(out.gate));
 
