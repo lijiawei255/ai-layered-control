@@ -9,7 +9,7 @@
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent guide](AGENTS.md)
 
-**Let AI identify the situation. Let deterministic control own the actuator:** A portable **zero-trust fast-slow reference architecture** — 10 Hz qualitative supervision with active abstention, a 1 kHz C99 zero-trust safety gatekeeper, and field knob tuning after the AI is frozen. Gain scheduling or a fixed-threshold rule tree that does not explicitly configure a feature-distance metric and an out-of-range fallback branch still emits the nearest regime's control law when it encounters unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance. This architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: the 10 Hz slow loop performs manifold-distance low-confidence abstention and retreats to R4 damping, and the 1 kHz fast loop executes a millisecond-scale forced veto from an independent physical residual probe.
+**Let AI identify the situation. Let deterministic control own the actuator:** A portable **zero-trust fast-slow reference architecture** — 10 Hz qualitative supervision with active abstention, a 1 kHz C99 zero-trust safety gatekeeper, and field knob tuning after the AI is frozen. Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit the nearest regime's control law. This architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: the 10 Hz slow loop performs manifold-distance low-confidence abstention and retreats to R4 damping, and the 1 kHz fast loop executes a millisecond-scale forced veto from an independent physical residual probe.
 
 ## Why This Architecture & Quick Navigation
 
@@ -304,7 +304,7 @@ The classifier stays frozen. "+35% / +50% unit drift" means **inertia change plu
 | cross J +40%, b −30% | (1.0, 1.0, 1.0) | 0.004754 | 0.004754 | 13.91 | 0 | (2.0, 1.0, 1.0) | 0.002961 | 75.53 |
 | reverse J/b/fc/fs −25% | (0.75, 1.0, 1.0) | 0.002602 | 0.003733 | 12.86 | 0 | (2.0, 1.0, 1.0) | 0.001398 | 104.54 |
 
-The search takes **6 candidates × 40 s commissioning trial + 6 × 10 s independently wall-phased contact probe + 6 s S2 validation runs** per case; device trajectory seconds and host computation seconds are separate. Accepted B3 tuning keeps zero normal-stage veto/R4 occupancy on every condition. In the drift and reverse conditions the helper preserves contact compliance by lowering gain; the RMSE increase is the price of the 20 N contract, not a search failure.
+The search takes **6 candidates × 40 s commissioning trial + 6 × 10 s independently wall-phased contact probe + 6 s S2 validation runs** per case; device trajectory seconds and host computation seconds are separate. Accepted B3 tuning keeps zero normal-stage veto/R4 occupancy on every condition. In the drift and reverse conditions the helper downshifts gain, trading S2 tracking stiffness to satisfy the 20 N contact contract across all four cases.
 
 ![Sample budgets, field tuning, contact constraints and storage](assets/efficiency_and_generalization.png)
 

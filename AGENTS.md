@@ -231,7 +231,7 @@ Evaluate six fixed joint (gain, damping) candidates: (0.75,1), (1,1), (1.25,1), 
 The benchmark evaluates six full 40 s missions per branch/unit (240 s of search trajectories).
 Candidate validity requires zero breaches throughout, nominal tracking, and normal-stage force,
 veto fraction and R4 occupancy limits. Candidate validity is additionally checked on an independently wall-phased 10 s S3 contact probe, and independent validation adds two 6 s S2 runs and a 40 s mission. Device trajectory time and host simulation time are separate quantities.
-The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
+Benchmark reproduction note: The reference benchmark runs the same four commissioned conditions in both engines — forward drift 0.35,
 forward drift 0.50, cross mismatch (J +40%, b −30%) and reverse mismatch (J, b, fc, fs −25%) — and the
 accepted B3 tuples, together with their search and mission metrics, are identical in Python and MATLAB. The
 B2 and B2+C99-Gate rows can differ at the 5e-6 level in RMSE because each engine solves the RBF normal
@@ -271,6 +271,15 @@ a user's engineering changes on the grounds that they violate the reference arch
    timeout), the `blanking_active` artefact-blanking probe, the per-bank tracking anti-windup, and the
    three-episode permanent latch with its `Layered_AcknowledgeFaultLatch()` release state machine.
    Each slice keeps its own contract and can be validated on its own.
+
+   | Orthogonal slice | Source location | State / ABI footprint | Standalone contract |
+   | :--- | :--- | :--- | :--- |
+   | `outer_seq` local-clock frame lease | `layered_gatekeeper.c` Duty 4 | `last_outer_seq`, `lease_age_ticks` | Detects stalled/forged slow mailboxes and zero-sequence corruption on the 1 kHz clock |
+   | `blanking_active` artifact-blanking probe | `gate_template.c` `LayeredProbe_Step` | 32 B `LayeredProbe_t` | Freezes median/high-pass states and holds the pre-blanking residual during stimulation/commutation pulses |
+   | Four-bank reverse tracking anti-windup | `layered_gatekeeper.c` Duty 7 | `integ[4]` | Active bank back-calculates before blend; inactive banks track applied `u_prev` for bumpless switching |
+   | Signed 1D ZCBF look-ahead + binary32 TwoSum slew limiter | `layered_gatekeeper.c` Duty 1 & 7 | stateless / `u_prev` | Direction-aware braking envelope `\|x + T*x_dot\| <= x_max` and 1-ULP monotone ramp-to-zero without `double` |
+   | Three-episode ratchet latch & 7-bit fault audit | `layered_gatekeeper.c` Duty 8 & `Layered_AcknowledgeFaultLatch` | `latch_episode_count`, `fault_audit_bitmask` | Rising-edge episode counting into `GATE_LATCHED_SAFE` with cooldown re-arming |
+
 3. **The benchmark fixture does not constrain interface adaptation.** The 1-DOF rotary motor, the
    unilateral spring wall and the four fixed bank parameter sets inside `python_bench/run_benchmark.py`
    and `matlab_simulink/sim_core_engine.m` exist only to reproduce this repository's own benchmark runs.

@@ -17,9 +17,7 @@ quantitative feedback to a deterministic bank: integral states absorb persistent
 knobs remain available after deployment, and a residual probe can reject unfamiliar operation. The
 slow interface is model-agnostic. A prototype classifier, a rule supervisor or a VLM can all
 implement the same contract.
-Gain scheduling or a fixed-threshold rule tree that does not explicitly configure a feature-distance
-metric and an out-of-range fallback branch still emits the nearest regime's control law when it
-encounters unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance. This
+Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit the nearest regime's control law. This
 architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that
 boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: 10 Hz
 manifold-distance low-confidence abstention retreats to R4 damping, and a 1 kHz millisecond-scale
@@ -54,7 +52,7 @@ stall at the same point.
 **Mechanism:** Continuous quantitative feedback and trajectory tracking are already carried by the
 four pre-commissioned deterministic controller banks and the nominal feedforward, so the 10 Hz slow
 loop only has to perform coarse discrete regime classification and manifold-distance abstention. It
-therefore needs only qualitative coverage: 36 labeled macro windows and 15 statistical scalars (60 bytes), built on the prior four-bank deterministic laws and kinematic filter structure,
+therefore needs only qualitative coverage: 36 labeled macro windows and 15 statistical scalars (60 bytes)
 calibrated by `auto_calibrate()` on a CPU. The archive establishes the regime prototypes and the
 confidence thresholds. No GPU and no action labels are involved. The template's built-in 15-statistical-scalar
 nearest-centroid classifier and six-point constrained search (`auto_field_tune`) are a
