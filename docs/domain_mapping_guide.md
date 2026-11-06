@@ -196,7 +196,7 @@ evidence is collected in [README §3.6 Reproduce](../README.md#36-reproduce).
 
 C99 独立回归与 `gate_template.c` 自检必须通过；Python/C `--selftest` 需在 binary32 下逐位一致，
 MATLAB/C 与 `outer_seq` 租约回放需与冻结内核一致，Level-2 S-Function 需零误差复现全部 7 路输出。
-回放与回归证据汇总在 [README §3.6 Reproduce](../README.md#36-reproduce)。
+回放与回归证据汇总在 [README_zh.md §3.6 复现](../README_zh.md#36-复现)。
 
 Commands and exact API semantics are in [AGENTS.md](../AGENTS.md).
 Numerical evidence is maintained in [README.md](../README.md) / [README_zh.md](../README_zh.md).

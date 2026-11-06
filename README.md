@@ -9,7 +9,7 @@
 
 [English](README.md) | [简体中文](README_zh.md) · [Agent guide](AGENTS.md)
 
-**Let AI identify the situation. Let deterministic control own the actuator:** A portable **zero-trust fast-slow reference architecture** — 10 Hz qualitative supervision with active abstention, a 1 kHz C99 zero-trust safety gatekeeper, and field knob tuning after the AI is frozen. Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit the nearest regime's control law. This architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: the 10 Hz slow loop performs manifold-distance low-confidence abstention and retreats to R4 damping, and the 1 kHz fast loop executes a millisecond-scale forced veto from an independent physical residual probe.
+**Let AI identify the situation. Let deterministic control own the actuator:** A portable **zero-trust fast-slow reference architecture** — 10 Hz qualitative supervision with active abstention, a 1 kHz C99 zero-trust safety gatekeeper, and field knob tuning after the AI is frozen. Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit the nearest regime's control law. Unlike a traditional Simplex / runtime assurance (RTA) wrapper that only intercepts a continuous AI command at the safety boundary, this architecture strips continuous actuation from the slow loop altogether and fixes the authority boundary as a cross-loop contract via fast-slow dual-layer active abstention: the 10 Hz slow loop performs manifold-distance low-confidence abstention and retreats to R4 damping, and the 1 kHz fast loop executes a millisecond-scale forced veto from an independent physical residual probe.
 
 ## Why This Architecture & Quick Navigation
 
@@ -492,10 +492,12 @@ The `.slx` is a self-contained architectural sketch; the numerical engines and t
 
 ### Design lineage and references
 
-1. **Simplex architecture / runtime assurance:** Sha, L. (2001), "Using Simplicity to Control Complexity," *IEEE Software* 18(4); [AFRL RTA](https://github.com/act3-ace/run-time-assurance).
-2. **Safety-related AI:** [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html).
-3. **Zeroing control barrier function:** Ames, A. D. et al. (2019), "Control Barrier Functions: Theory and Applications," *ECC 2019* (the `h_dot + h/T >= 0` boundary).
-4. **Split conformal prediction:** Lei, G'Sell, Rinaldo, Tibshirani and Wasserman (2018), "Distribution-Free Predictive Inference for Regression," *JASA* 113(523).
+Putting four-bank tracking anti-windup and zero-trust arbitration inside the 96 B 1 kHz core is what lets the 10 Hz slow loop stay a 60 B (15-scalar) qualitative router and lets unit-to-unit adaptation stay a 12 B three-knob tuple. Each mechanism implements an established control or numerical primitive:
+
+- **Simplex and runtime assurance (RTA):** Sha (2001), *IEEE Software* 18(4), [AFRL RTA](https://github.com/act3-ace/run-time-assurance) and [ISO/IEC TR 5469:2024](https://www.iso.org/standard/81283.html) — extended here with `outer_seq` local-clock leases and split degradation (closed-loop R4 damping on stale slow frames vs. open-loop command hold on unusable fast sensors).
+- **Bumpless supervisory switching:** Åström & Hägglund back-calculation tracking anti-windup — active bank back-calculated before `blend_alpha`, inactive banks tracking `u_applied`, and `blend = 1.0` phase-free bypass on emergency R4 entry.
+- **Kinematic safety envelope and binary32 slew rounding:** Ames et al. (2019), *ECC* Zeroing Control Barrier Functions (1D ZCBF signed look-ahead `|x + T*x_dot| <= x_max`) and Knuth / Dekker `TwoSum` error-free transformation for inward binary32 slew-bound rounding.
+- **Calibrated abstention and artifact blanking:** Vovk et al. and Lei et al. (2018), *JASA* finite-sample split-conformal prediction for manifold-distance OOD abstention, and clinical ECAP-SCS / aDBS pulse-artifact blanking (`blanking_active` filter-state freeze and residual hold in the 32 B probe).
 
 ## License and citation
 

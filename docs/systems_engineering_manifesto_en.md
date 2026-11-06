@@ -17,11 +17,14 @@ quantitative feedback to a deterministic bank: integral states absorb persistent
 knobs remain available after deployment, and a residual probe can reject unfamiliar operation. The
 slow interface is model-agnostic. A prototype classifier, a rule supervisor or a VLM can all
 implement the same contract.
-Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit the nearest regime's control law. This
-architecture follows the Simplex / runtime assurance (RTA) division of responsibility and fixes that
-boundary as a cross-loop interface contract via fast-slow dual-layer active abstention: 10 Hz
-manifold-distance low-confidence abstention retreats to R4 damping, and a 1 kHz millisecond-scale
-forced veto from an independent physical residual probe.
+Traditional gain scheduling or fixed-threshold rule trees only partition known regimes; when they
+encounter unmodeled mechanical resonance or an out-of-distribution (OOD) disturbance, they still emit
+the nearest regime's control law. Unlike a traditional Simplex / runtime assurance (RTA) wrapper that
+only intercepts a continuous AI command at the safety boundary, this architecture strips continuous
+actuation from the slow loop altogether and fixes the authority boundary as a cross-loop contract via
+fast-slow dual-layer active abstention: the 10 Hz slow loop performs manifold-distance low-confidence
+abstention and retreats to R4 damping, and the 1 kHz fast loop executes a millisecond-scale forced veto
+from an independent physical residual probe.
 
 ## Layered system boundaries (L0–L4)
 
